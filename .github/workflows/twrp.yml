@@ -51,6 +51,8 @@ jobs:
           # Android 7.1 needs JDK 8 (tools.jar); runner defaults to JDK 11
           sudo apt-get install -y openjdk-8-jdk
           echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> "$GITHUB_ENV"
+          # Old prebuilt clang needs ncurses5/tinfo5 (jammy ships 6)
+          sudo apt-get install -y libncurses5 libtinfo5 || true
           # Packages that may be absent - don't fail the build
           sudo apt-get install -y libghc-bzlib-dev maven || true
 
