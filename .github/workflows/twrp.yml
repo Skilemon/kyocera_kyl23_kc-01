@@ -15,6 +15,11 @@ jobs:
     timeout-minutes: 720
 
     steps:
+      - name: Checkout local trees (early, before workspace gets dirty)
+        uses: actions/checkout@v4
+        with:
+          path: local
+
       - name: Cleanup runner workspace
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -45,28 +50,25 @@ jobs:
 
       - name: Sync TWRP source (minimal omni 7.1)
         run: |
-          # Runner root fs has ~100G+ free; build directly in workspace.
-          echo "Workspace: ${GITHUB_WORKSPACE}"
-          df -h "${GITHUB_WORKSPACE}"
-          cd "${GITHUB_WORKSPACE}"
+          # Build in ~/rom, keep workspace clean for the checkout copy.
+          export ROM=~/rom
+          mkdir -p ${ROM}
+          df -h ~
+          cd ${ROM}
           repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git -b twrp-7.1
           repo sync -c --no-clone-bundle --no-tags --no-repo-verify -j8
 
-      - name: Checkout local trees
-        uses: actions/checkout@v4
-        with:
-          path: local
-
       - name: Apply local trees
         run: |
-          rm -rf "${GITHUB_WORKSPACE}/device/kyocera/kc01" "${GITHUB_WORKSPACE}/kernel/kyocera/kc01"
-          mkdir -p "${GITHUB_WORKSPACE}/device/kyocera" "${GITHUB_WORKSPACE}/kernel/kyocera"
-          cp -r "${GITHUB_WORKSPACE}/local/device/kyocera/kc01" "${GITHUB_WORKSPACE}/device/kyocera/kc01"
-          cp -r "${GITHUB_WORKSPACE}/local/kernel/kyocera/kc01" "${GITHUB_WORKSPACE}/kernel/kyocera/kc01"
-          ls -la "${GITHUB_WORKSPACE}/kernel/kyocera/kc01/Makefile"
+          export ROM=~/rom
+          rm -rf ${ROM}/device/kyocera/kc01 ${ROM}/kernel/kyocera/kc01
+          mkdir -p ${ROM}/device/kyocera ${ROM}/kernel/kyocera
+          cp -r "${GITHUB_WORKSPACE}/local/device/kyocera/kc01" ${ROM}/device/kyocera/kc01
+          cp -r "${GITHUB_WORKSPACE}/local/kernel/kyocera/kc01" ${ROM}/kernel/kyocera/kc01
+          ls -la ${ROM}/kernel/kyocera/kc01/Makefile
 
       - name: Build TWRP
-        working-directory: ${{ github.workspace }}
+        working-directory: /home/runner/rom
         run: |
           export ALLOW_MISSING_DEPENDENCIES=true
           export TW_DEVICE_VERSION=1
@@ -78,5 +80,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: twrp-kc01
-          path: ${{ github.workspace }}/out/target/product/kc01/recovery.img
+          path: /home/runner/rom/out/target/product/kc01/recovery.img
           if-no-files-found: error
