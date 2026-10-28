@@ -1,0 +1,22 @@
+# Android fstab file for Kyocera KC-01 / miraie KYL23 (MSM8926)
+# Partition paths verified from live device
+
+# mount point    fstype    device                                                                  flags
+
+/boot           emmc      /dev/block/platform/msm_sdcc.1/by-name/boot                             flags=backup=1
+/recovery       emmc      /dev/block/platform/msm_sdcc.1/by-name/recovery                         flags=backup=1
+/modem          vfat      /dev/block/platform/msm_sdcc.1/by-name/modem                            flags=backup=1;mounttodecrypt;fsflags=utf8;display="Firmware"
+/bluetooth      auto      /dev/block/platform/msm_sdcc.1/by-name/misc                             flags=backup=1;display="Misc"
+
+/system         ext4      /dev/block/platform/msm_sdcc.1/by-name/system                           flags=backup=1
+/cache          ext4      /dev/block/platform/msm_sdcc.1/by-name/cache                            flags=backup=1
+/data           ext4      /dev/block/platform/msm_sdcc.1/by-name/userdata                         flags=encryptable=/dev/block/platform/msm_sdcc.1/by-name/metadata
+/persist        ext4      /dev/block/platform/msm_sdcc.1/by-name/persist                          flags=backup=1
+/carrier        ext4      /dev/block/platform/msm_sdcc.1/by-name/carrier                          flags=backup=1;display="Carrier"
+/radio          ext4      /dev/block/platform/msm_sdcc.1/by-name/system                           flags=display="Radio";removable
+
+# External SD card
+/external_sd    vfat      /dev/block/mmcblk1p1                                                    flags=display="SDCard";removable;storage;wipeingui
+
+# USB OTG
+/usb-otg        auto      /dev/block/sda1                                                         flags=display="USB-OTG";removable;storage

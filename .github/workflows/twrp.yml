@@ -1,0 +1,82 @@
+name: Build TWRP for KC-01/KYL23
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'device/**'
+      - 'kernel/**'
+      - '.github/workflows/twrp.yml'
+
+jobs:
+  twrp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+
+    steps:
+      - name: Cleanup runner workspace
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Maximize disk space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          temp-reserve-mb: 128
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git ccache automake lzop bison gperf build-essential zip curl zlib1g-dev zlib1g-dev:i386 g++-multilib python3-networkx libxml2-utils bzip2 libbz2-dev libbz2-1.0 libghc-bzlib-dev squashfs-tools pngcrush schedtool dpkg-dev liblz4-tool make optipng maven libssl-dev pwgen libswitch-perl policycoreutils python3-minimal libxml-simple-perl bc imagemagick binutils wget cpio python3-pip
+
+      - name: Install repo tool
+        run: |
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+          git config --global user.name "Builder"
+          git config --global user.email "builder@example.com"
+
+      - name: Sync TWRP source (minimal omni 7.1)
+        run: |
+          sudo mkdir -p /mnt/rom
+          sudo chown -R runner:runner /mnt/rom
+          cd /mnt/rom
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git -b twrp-7.1
+          repo sync -c --no-clone-bundle --no-tags --no-repo-verify -j8
+
+      - name: Checkout local trees
+        uses: actions/checkout@v4
+        with:
+          path: local
+
+      - name: Apply local trees
+        run: |
+          sudo mkdir -p /mnt/rom/device/kyocera /mnt/rom/kernel/kyocera
+          sudo rm -rf /mnt/rom/device/kyocera/kc01 /mnt/rom/kernel/kyocera/kc01
+          sudo cp -r local/device/kyocera/kc01 /mnt/rom/device/kyocera/kc01
+          sudo cp -r local/kernel/kyocera/kc01 /mnt/rom/kernel/kyocera/kc01
+          sudo chown -R runner:runner /mnt/rom/device/kyocera /mnt/rom/kernel/kyocera
+          ls -la /mnt/rom/kernel/kyocera/kc01/Makefile
+
+      - name: Build TWRP
+        working-directory: /mnt/rom
+        run: |
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export TW_DEVICE_VERSION=1
+          source build/envsetup.sh
+          lunch omni_kc01-eng
+          mka adbd recoveryimage -j$(nproc --all)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-kc01
+          path: /mnt/rom/out/target/product/kc01/recovery.img
+          if-no-files-found: error

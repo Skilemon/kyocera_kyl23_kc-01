@@ -1,0 +1,8 @@
+# Reference trees (not part of the port)
+device_motorola_thea/
+device_motorola_msm8226-common/
+
+# OS junk
+Thumbs.db
+.DS_Store
+device_kyocera_kc01/
