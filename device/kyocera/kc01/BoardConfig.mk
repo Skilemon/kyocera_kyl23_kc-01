@@ -24,11 +24,13 @@ TARGET_NO_BOOTLOADER := true
 # Kernel
 TARGET_KERNEL_SOURCE := kernel/kyocera/kc01
 TARGET_KERNEL_CONFIG := kc01_defconfig
-# Omni kernel.mk: use the arm-eabi-4.8 toolchain shipped in the tree
+# Omni kernel.mk: arm-linux-androideabi-4.9 (GCC 4.9 supports
+# -fstack-protector-strong which titan/thea defconfigs enable;
+# arm-eabi-4.8 does not)
 TARGET_KERNEL_ARCH := arm
 TARGET_KERNEL_HEADER_ARCH := arm
-TARGET_KERNEL_CROSS_COMPILE_PREFIX := arm-eabi-
-KERNEL_TOOLCHAIN := $(shell pwd)/prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin
+TARGET_KERNEL_CROSS_COMPILE_PREFIX := arm-linux-androideabi-
+KERNEL_TOOLCHAIN := prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9
 BOARD_KERNEL_BASE := 0x00000000
 BOARD_KERNEL_PAGESIZE := 2048
 BOARD_KERNEL_CMDLINE := console=ttyHSL0,115200,n8 no_console_suspend=1 androidboot.console=ttyHSL0 androidboot.hardware=qcom user_debug=31 msm_rtb.filter=0x37

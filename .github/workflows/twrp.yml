@@ -98,6 +98,12 @@ jobs:
         run: |
           export ALLOW_MISSING_DEPENDENCIES=true
           export TW_DEVICE_VERSION=1
+          # Belt & suspenders: put the kernel toolchains on PATH so any
+          # CROSS_COMPILE prefix resolves even if kernel.mk vars miss
+          export PATH=$PATH:${PWD}/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/bin
+          export PATH=$PATH:${PWD}/prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin
+          # Old host gcc for the 3.4 kernel's host tools (dtc etc.)
+          export HOSTCC=gcc-9
           source build/envsetup.sh
           lunch omni_kc01-eng
           mka adbd recoveryimage -j$(nproc --all)
