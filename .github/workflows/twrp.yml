@@ -80,6 +80,12 @@ jobs:
           mkdir -p ${ROM}/device/kyocera ${ROM}/kernel/kyocera
           cp -r "${GITHUB_WORKSPACE}/local/device/kyocera/kc01" ${ROM}/device/kyocera/kc01
           cp -r "${GITHUB_WORKSPACE}/local/kernel/kyocera/kc01" ${ROM}/kernel/kyocera/kc01
+          # dtbToolCM is not in the minimal TWRP manifest; ship our own
+          # prebuilt (from CyanogenMod device/qcom/common dtbtool) and put
+          # it where the build system expects it.
+          mkdir -p ${ROM}/out/host/linux-x86/bin
+          cp "${GITHUB_WORKSPACE}/local/tools/dtbToolCM" ${ROM}/out/host/linux-x86/bin/dtbToolCM
+          chmod +x ${ROM}/out/host/linux-x86/bin/dtbToolCM
           ls -la ${ROM}/kernel/kyocera/kc01/Makefile
 
       - name: Build TWRP
