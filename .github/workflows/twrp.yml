@@ -6,7 +6,7 @@ on:
     branches: [ main ]
     paths:
       - 'device/**'
-      - 'kernel/**'
+      - 'kernel-overlay/**'
       - '.github/workflows/twrp.yml'
 
 jobs:
@@ -77,16 +77,21 @@ jobs:
         run: |
           export ROM=~/rom
           rm -rf ${ROM}/device/kyocera/kc01 ${ROM}/kernel/kyocera/kc01
-          mkdir -p ${ROM}/device/kyocera ${ROM}/kernel/kyocera
+          mkdir -p ${ROM}/device/kyocera
           cp -r "${GITHUB_WORKSPACE}/local/device/kyocera/kc01" ${ROM}/device/kyocera/kc01
-          cp -r "${GITHUB_WORKSPACE}/local/kernel/kyocera/kc01" ${ROM}/kernel/kyocera/kc01
+          # Kernel: clone the clean thea (LineageOS msm8226) source on the
+          # case-sensitive Linux FS, then graft our Kyocera overlay on top.
+          # (The full tree can't be shipped in-repo: it was unpacked on
+          # Windows and case-collision files like xt_MARK.h were lost.)
+          git clone --depth 1 -b cm-14.1 https://github.com/LineageOS/android_kernel_motorola_msm8226.git ${ROM}/kernel/kyocera/kc01
+          cp -r "${GITHUB_WORKSPACE}/local/kernel-overlay/." ${ROM}/kernel/kyocera/kc01/
+          ls ${ROM}/kernel/kyocera/kc01/arch/arm/configs/kc01_defconfig
           # dtbToolCM is not in the minimal TWRP manifest; ship our own
           # prebuilt (from CyanogenMod device/qcom/common dtbtool) and put
           # it where the build system expects it.
           mkdir -p ${ROM}/out/host/linux-x86/bin
           cp "${GITHUB_WORKSPACE}/local/tools/dtbToolCM" ${ROM}/out/host/linux-x86/bin/dtbToolCM
           chmod +x ${ROM}/out/host/linux-x86/bin/dtbToolCM
-          ls -la ${ROM}/kernel/kyocera/kc01/Makefile
 
       - name: Build TWRP
         working-directory: /home/runner/rom
