@@ -1716,7 +1716,7 @@ static int mxt_interrupt(struct kc_ts_data *data)
 	struct mxt_message message;
 	struct mxt_object *object;
 	int id;
-	u8 reportid, selftest_id, anti_id = 0;
+	u8 reportid, selftest_id = 0, anti_id = 0;
 	u8 max_reportid;
 	u8 min_reportid;
 	int err = 0, timeout = 0;

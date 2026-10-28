@@ -34,3 +34,12 @@ obj-$(CONFIG_INPUT_YAS_FUSION_SENSOR) += yas_gravity_kernel_driver.o
 obj-$(CONFIG_INPUT_YAS_FUSION_SENSOR) += yas_linear_acceleration_kernel_driver.o
 obj-$(CONFIG_INPUT_YAS_FUSION_SENSOR) += yas_rotation_vector_kernel_driver.o
 
+
+# YAS/Kyocera vendor code: relax fatal warnings
+CFLAGS_yas_acc_kernel_driver.o += -Wno-error=maybe-uninitialized -Wno-error=unused-variable -Wno-error=unused-function
+CFLAGS_yas_mag_kernel_driver.o += -Wno-error=maybe-uninitialized -Wno-error=unused-variable -Wno-error=unused-function
+CFLAGS_yas_ori_kernel_driver.o += -Wno-error=maybe-uninitialized -Wno-error=unused-variable
+CFLAGS_yas_gravity_kernel_driver.o += -Wno-error=maybe-uninitialized -Wno-error=unused-variable
+CFLAGS_yas_linear_acceleration_kernel_driver.o += -Wno-error=maybe-uninitialized -Wno-error=unused-variable
+CFLAGS_yas_rotation_vector_kernel_driver.o += -Wno-error=maybe-uninitialized -Wno-error=unused-variable
+CFLAGS_sfh7776.o += -Wno-error=maybe-uninitialized -Wno-error=unused-variable

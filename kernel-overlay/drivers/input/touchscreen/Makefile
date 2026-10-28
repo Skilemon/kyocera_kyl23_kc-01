@@ -101,3 +101,7 @@ obj-$(CONFIG_TOUCHSCREEN_TOUCHX)        += touchx.o
 # Kyocera maXTouch touchscreen
 obj-$(CONFIG_TOUCHSCREEN_ATMEL_MXT_KC) += atmel_mxt_kc.o
 obj-$(CONFIG_TOUCHSCREEN_KC_TS) += kc_ts.o
+
+# Kyocera drivers: vendor code predates -Werror; relax fatal warnings
+CFLAGS_atmel_mxt_kc.o += -Wno-error=maybe-uninitialized -Wno-error=unused-variable -Wno-error=unused-function -Wno-error=implicit-function-declaration
+CFLAGS_kc_ts.o += -Wno-error=maybe-uninitialized -Wno-error=unused-variable -Wno-error=unused-function
