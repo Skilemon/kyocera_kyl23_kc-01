@@ -8,7 +8,7 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-$(call inherit-product, $(LOCAL_DIR)/device.mk)
+$(call inherit-product, device/kyocera/kc01/device.mk)
 
 # Discard inherited values and use our own anyway
 PRODUCT_NAME := lineage_kc01
