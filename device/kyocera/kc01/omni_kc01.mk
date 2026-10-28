@@ -8,8 +8,8 @@ PRODUCT_BRAND := Kyocera
 PRODUCT_MODEL := KC-01 (miraie KYL23)
 PRODUCT_MANUFACTURER := Kyocera
 
-# Inherit device config
-$(call inherit-product, $(DEVICE_PATH)/device.mk)
+# Inherit device config (LOCAL_DIR is provided by the product loader)
+$(call inherit-product, $(LOCAL_DIR)/device.mk)
 
 # TWRP flags
 TW_THEME := portrait_hdpi
