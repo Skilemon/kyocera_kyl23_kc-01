@@ -37,13 +37,19 @@ jobs:
             optipng libssl-dev pwgen libswitch-perl policycoreutils \
             libxml-simple-perl bc imagemagick binutils wget cpio \
             python3-pip
-          # Python 2 for the Android 7.1 build system
-          sudo apt-get install -y python2 python-is-python2 || true
+          # Python 2 for the Android 7.1 build system (install separately:
+          # python-is-python2 doesn't exist on jammy and aborts the batch)
+          sudo apt-get install -y python2
+          sudo apt-get install -y python-is-python2 || true
+          # Make plain 'python' resolve to python2 for the build session
+          sudo ln -sf /usr/bin/python2 /usr/local/bin/python
+          sudo ln -sf /usr/bin/python2 /usr/local/bin/python2.7 2>/dev/null || true
+          python --version
+          python2 --version
           # Older toolchain for Nougat-era kernel build compatibility
           sudo apt-get install -y gcc-9 g++-9 || true
           # Packages that may be absent - don't fail the build
           sudo apt-get install -y libghc-bzlib-dev maven || true
-          python2 --version || true
 
       - name: Install repo tool
         run: |
