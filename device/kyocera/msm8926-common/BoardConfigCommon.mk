@@ -34,27 +34,17 @@ TARGET_CPU_MEMCPY_BASE_OPT_DISABLE := true
 
 # ------------------------------------------------------------------ kernel
 #
-# By default the image is built around the STOCK kernel taken out of the
-# factory recovery.img.  It is the only kernel that has been proven to boot
-# on this hardware - the whole recovery pipeline was validated on a real
-# device with it, so a build made from this repo works without first having
-# to make a kernel build succeed.
+# The image is built around prebuilt/kernel, a zImage compiled from Kyocera's
+# own GPL 3.4.0 source (see kernel-patches/); the factory zImage it replaced
+# is archived in prebuilt/stock/ for rollback.  Only the self-built one loads
+# modules, and the image needs exactly one of them (kc_wp.ko).
 #
-# Set KYOCERA_BUILD_KERNEL=true to compile the kernel from source instead.
-# That path is wired up (kernel-overlay/ + msm8926-kyocera_defconfig) but has
-# not yet been proven to boot; see docs/DEVICE_NOTES.md.
-KYOCERA_BUILD_KERNEL ?= false
-
-TARGET_KERNEL_ARCH := arm
-TARGET_KERNEL_HEADER_ARCH := arm
-TARGET_KERNEL_CROSS_COMPILE_PREFIX := arm-linux-androideabi-
-KERNEL_TOOLCHAIN := $(ANDROID_BUILD_TOP)/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/bin
-
-ifeq ($(KYOCERA_BUILD_KERNEL),true)
-# TARGET_KERNEL_SOURCE / TARGET_KERNEL_CONFIG come from the device makefile.
-else
+# Nothing here compiles a kernel, and nothing should: this repo carries no
+# kernel source, and the TWRP build tree has no rule that would consume one
+# (its build/core/tasks/kernel.mk is not included by main.mk), so a
+# TARGET_KERNEL_SOURCE would have no consumer.  Building a kernel is a manual
+# job, documented in README.md and docs/DEVICE_NOTES.md.
 TARGET_PREBUILT_KERNEL := $(DEVICE_COMMON_PATH)/prebuilt/kernel
-endif
 
 BOARD_KERNEL_BASE := 0x00000000
 BOARD_KERNEL_PAGESIZE := 2048

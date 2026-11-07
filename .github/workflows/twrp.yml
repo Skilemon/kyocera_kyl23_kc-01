@@ -9,17 +9,10 @@ on:
         default: 'all'
         type: choice
         options: [all, kyl23, kc01]
-      build_kernel:
-        description: 'Compile the kernel from source instead of using the stock one'
-        required: true
-        default: 'false'
-        type: choice
-        options: ['false', 'true']
   push:
     branches: [main]
     paths:
       - 'device/**'
-      - 'kernel-overlay/**'
       - 'tools/**'
       - '.github/workflows/twrp.yml'
 
@@ -58,7 +51,6 @@ jobs:
     timeout-minutes: 300
     env:
       DEVICE: ${{ matrix.device }}
-      BUILD_KERNEL: ${{ inputs.build_kernel || 'false' }}
       ROM: /home/runner/rom
 
     steps:
@@ -177,19 +169,6 @@ jobs:
           test -f "device/kyocera/$DEVICE/BoardConfig.mk"
           test -d device/kyocera/msm8926-common
 
-      - name: Fetch the kernel sources
-        if: env.BUILD_KERNEL == 'true'
-        run: |
-          set -ex
-          cd "$ROM"
-          sudo apt-get install -y gcc-9
-          rm -rf "kernel/kyocera/$DEVICE"
-          git clone --depth 1 -b cm-14.1 \
-            https://github.com/LineageOS/android_kernel_motorola_msm8226.git \
-            "kernel/kyocera/$DEVICE"
-          cp -r "$GITHUB_WORKSPACE/local/kernel-overlay/." "kernel/kyocera/$DEVICE"/
-          test -f "kernel/kyocera/$DEVICE/arch/arm/configs/msm8926-kyocera_defconfig"
-
       - name: Build TWRP
         working-directory: ${{ env.ROM }}
         run: |
@@ -197,10 +176,6 @@ jobs:
           export ALLOW_MISSING_DEPENDENCIES=true
           export PATH="$PATH:$PWD/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/bin"
           export PATH="$PATH:$PWD/prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin"
-          # Only the kernel build needs gcc-9 (3.4 host tools do not compile
-          # with gcc 11); it is installed by the step above when asked for.
-          if [ "$BUILD_KERNEL" = "true" ]; then export HOSTCC=gcc-9; fi
-          export KYOCERA_BUILD_KERNEL="$BUILD_KERNEL"
           source build/envsetup.sh
           lunch "omni_${DEVICE}-eng"
           mka recoveryimage -j"$(nproc --all)"
@@ -222,10 +197,6 @@ jobs:
           echo "device=$DEVICE  kernel=$C/kernel  dt=$C/stock/dtb-kyl23.img"
 
           KERNEL="$C/kernel"
-          if [ "$BUILD_KERNEL" = "true" ]; then
-            Z="$ROM/out/target/product/$DEVICE/obj/KERNEL_OBJ/arch/arm/boot/zImage"
-            if [ -f "$Z" ]; then KERNEL="$Z"; fi
-          fi
 
           python3 "$GITHUB_WORKSPACE/local/tools/image/mkhybrid.py" \
             --kernel   "$KERNEL" \

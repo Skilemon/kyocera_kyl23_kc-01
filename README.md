@@ -38,8 +38,8 @@ device/kyocera/
 ├── kc01/                    KC-01 专属
 └── kyl23/                   KYL23 专属
 
-kernel-overlay/             叠加到上游内核树上的京瓷驱动与配置（编译内核时用）
-kernel-patches/             让京瓷 3.4.0 用 gcc13 编过的补丁
+kernel-overlay/             京瓷驱动与配置，手工编内核时叠加到上游内核树
+kernel-patches/             让京瓷 3.4.0 用 gcc13 编过的补丁（prebuilt/kernel 的来源）
 
 tools/                      按「跑在哪一侧」分组，详见 tools/README.md
 ├── image/                  组装镜像、体检镜像（纯离线，python3 即可）
@@ -65,19 +65,17 @@ docs/
 这样预编译模块的 vermagic 才对得上。56 个文件的 gcc 13 适配补丁、以及两个
 `get_user`/`put_user` 的坑，都记在 [`kernel-patches/README.md`](kernel-patches/README.md)。
 
-构建**不编译内核**，直接用这份 `prebuilt/kernel`，CI 因此只需 30–60 分钟。
+构建**不编译内核**，直接用这份 `prebuilt/kernel`；单台 CI 实测约 5 分钟。
 
 原厂内核没有丢，存档在 `prebuilt/stock/kernel-stock.kyl23`
 （5,808,608 B，md5 `40aada0058c8b0aadd00f5a5bc75166a`）。要回滚原厂内核，把 `--kernel`
 指向它即可；它配合 `stock/ramdisk.gz` 就是一份完整可刷的组合。
 
-要改内核（后期 ROM 阶段）时把 `KYOCERA_BUILD_KERNEL=true` 传进去：
-
-```bash
-export KYOCERA_BUILD_KERNEL=true
-```
-
-此时会克隆 [LineageOS `android_kernel_motorola_msm8226`](https://github.com/LineageOS/android_kernel_motorola_msm8226)（cm-14.1，Linux 3.4.113），把 `kernel-overlay/` 覆盖上去，用 `msm8926-kyocera_defconfig` 编译。**这条路径尚未验证过能否启动**，见 `docs/DEVICE_NOTES.md`。
+要改内核（后期 ROM 阶段）只能手工编，CI 没有开关：TWRP 那棵构建树里
+`build/core/tasks/kernel.mk` 没有被 `main.mk` include，`TARGET_KERNEL_SOURCE`
+没有任何消费者——接着它也只会静默回落到 `prebuilt/kernel`，所以那条路已经拆掉。
+手工命令见「为什么需要 `mkhybrid.py`」一节末尾；**这条路径尚未验证过能否启动**，
+见 `docs/DEVICE_NOTES.md`。
 
 仓库里曾经有一份 480 MB 的内核树，构建时被 `rm -rf` 后重新克隆，从未被使用，已删除。
 
@@ -115,9 +113,8 @@ Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000100
 在 GitHub Actions 里手动触发 `Build TWRP`：
 
 - `device`：`all`（默认，一次出两台）、`kyl23` 或 `kc01`
-- `build_kernel`：`false`（默认，用 prebuilt 内核）或 `true`（从源码编译）
 
-`all` 会展开成两个并行的 job（`plan` → matrix），各出一份镜像，互不影响：一台编译失败不会连累另一台，日志和 artifact 也是分开的。用原厂内核时单台约 **10 分钟**，两台并行总耗时仍是约 10 分钟（runner 分钟数翻倍）。产物是 artifact `twrp-kyl23` / `twrp-kc01`，各含一个同名的 `.img`。
+`all` 会展开成两个并行的 job（`plan` → matrix），各出一份镜像，互不影响：一台编译失败不会连累另一台，日志和 artifact 也是分开的。单台实测约 **5 分钟**，两台并行总耗时仍是约 5 分钟（runner 分钟数翻倍）。产物是 artifact `twrp-kyl23` / `twrp-kc01`，各含一个同名的 `.img`。
 
 > 两个代号现在共用 `msm8926-common/prebuilt` 下的**同一份**原厂内核、ramdisk 和 QCDT blob，所以两份镜像除了 `ro.product.device`、型号串和 `TW_DEVICE_VERSION` 之外完全一致。如果 KYL23 是另一批次的硬件（2016 的 201.x 版本），要让它同样能开机，得把那一台的 `recovery.img` 解出来的 kernel/ramdisk 放进它自己的 `prebuilt/`，见 `docs/DEVICE_NOTES.md`。
 
@@ -225,10 +222,9 @@ autofix=0`。镜像里**不带** `wp_fix.sh`（CI 只注入 `kc_wp.ko`）；要�
 python3 <this-repo>/tools/image/mkhybrid.py ... --boot-trace --out twrp-kyl23-trace.img
 ```
 
-`dt.img` 由 `device/kyocera/msm8926-common/Android.mk` 从 `prebuilt/stock/dtb-kyl23.img` 复制而来，不需要 `dtbToolCM`，也不要用 `mkqcdt.py` 重新生成——那会把 40 条表塌成 1 份 DTB。默认不碰内核；要自己编内核时加上：
+`dt.img` 由 `device/kyocera/msm8926-common/Android.mk` 从 `prebuilt/stock/dtb-kyl23.img` 复制而来，不需要 `dtbToolCM`，也不要用 `mkqcdt.py` 重新生成——那会把 40 条表塌成 1 份 DTB。默认不碰内核。要自己编内核（手工，CI 不做这件事）：
 
 ```bash
-export KYOCERA_BUILD_KERNEL=true
 git clone --depth 1 -b cm-14.1 https://github.com/LineageOS/android_kernel_motorola_msm8226.git kernel/kyocera/kyl23
 cp -r <this-repo>/kernel-overlay/. kernel/kyocera/kyl23/
 

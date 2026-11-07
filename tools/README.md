@@ -40,8 +40,9 @@ tools/
 | `kc_wp/` | eMMC 写保护清除模块：`kc_wp.c` + `Makefile` + `README.md`（编译参数、调参、日志解读） |
 | `patch_modversions.py` | 改 `.ko` 的 `__versions` 名字前缀，绕开符号 CRC 不匹配（`err -22`） |
 
-内核源码本身不入库（480 MB），CI 从 LineageOS `android_kernel_motorola_msm8226` 的
-`cm-14.1` 分支 clone，再叠 `kernel-overlay/` + `kernel-patches/`。
+内核源码本身不入库（480 MB）。要重编内核时手工从 LineageOS
+`android_kernel_motorola_msm8226` 的 `cm-14.1` 分支 clone，再叠 `kernel-overlay/`
++ `kernel-patches/`；CI 不编内核，只用 `prebuilt/kernel`。
 
 模块编完的 `.ko` 不要留在这个目录里（`.gitignore` 挡得住，但别留着混淆）；
 真正发布的那份在 `device/kyocera/msm8926-common/prebuilt/kc_wp.ko`。

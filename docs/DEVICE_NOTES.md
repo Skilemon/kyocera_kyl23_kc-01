@@ -110,10 +110,11 @@ qcom,board-id = 8 0                                        # MTP
 model         = "Qualcomm MSM 8926 MTP"                    # 与 dmesg 的 Machine: 行一致
 ```
 
-从源码编内核（`KYOCERA_BUILD_KERNEL=true`）是留给 ROM 阶段的路，用 LineageOS 的
-msm8226 4.4.113 内核加 `kernel-overlay/`。**这条路还没有在任何真机上验证过**，
-尤其是 overlay 里的 `msm8926-720p-mtp.dts` 只是 QC 通用模板（没有京瓷的触摸屏、
-面板、传感器节点），编出来的 DTB 大概率能点亮但屏幕和触摸不工作。要投入这条路，
+从源码编内核（留给 ROM 阶段）只能用 LineageOS 的 msm8226 4.4.113 内核加
+`kernel-overlay/`，手工跑；CI 不再提供开关，因为 TWRP 的构建树里
+`build/core/tasks/kernel.mk` 压根没被 `main.mk` include。**这条路还没有在任何真机上
+验证过**，尤其是 overlay 里的 `msm8926-720p-mtp.dts` 只是 QC 通用模板（没有京瓷的
+触摸屏、面板、传感器节点），编出来的 DTB 大概率能点亮但屏幕和触摸不工作。要投入这条路，
 第一步应该是把原厂 DTB 反编译成 `dts` 作为基线，而不是从通用模板开始。
 
 ---
