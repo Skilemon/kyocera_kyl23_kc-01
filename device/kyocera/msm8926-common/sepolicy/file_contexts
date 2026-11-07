@@ -1,0 +1,8 @@
+#
+# Device specific file contexts - Kyocera msm8926
+#
+# Intentionally empty for now.  Everything the 4.4 blobs need is already
+# covered by device/qcom/sepolicy, which supplies the qmi, sensors, thermal
+# and adsprpcd types this platform uses.  Adding entries here before there is
+# a type to point them at makes checkpolicy fail on an undefined context, so
+# the file stays a placeholder until P3 identifies what is actually missing.

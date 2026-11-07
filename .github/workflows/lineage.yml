@@ -1,0 +1,258 @@
+name: Build LineageOS 14.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'Which codename(s) to build'
+        required: true
+        default: 'all'
+        type: choice
+        options: [all, kyl23, kc01]
+  push:
+    branches: [main]
+    paths:
+      - 'device/**'
+      - 'vendor/**'
+      - 'tools/blobs/**'
+      - '.github/workflows/lineage.yml'
+
+concurrency:
+  group: lineage-${{ github.ref }}-${{ inputs.device || 'all' }}
+  cancel-in-progress: true
+
+jobs:
+  # One job per codename, in parallel.  The two products share every makefile
+  # below device/kyocera/msm8926-common and differ only in the model string,
+  # so a single job could build both -- but the second build still costs half
+  # an hour and a full `repo sync` either way, and GitHub kills a job at six
+  # hours.  Two runners finish in the time of one, with no risk of losing the
+  # first product to a timeout on the second.
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      devices: ${{ steps.list.outputs.devices }}
+    steps:
+      - id: list
+        env:
+          PICK: ${{ inputs.device || 'all' }}
+        run: |
+          case "$PICK" in
+            kyl23|kc01) echo "devices=[\"$PICK\"]" >> "$GITHUB_OUTPUT" ;;
+            *)          echo 'devices=["kyl23","kc01"]' >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "building: $(grep devices "$GITHUB_OUTPUT")"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        device: ${{ fromJSON(needs.plan.outputs.devices) }}
+    runs-on: ubuntu-22.04
+    # GitHub terminates a job at 360 minutes regardless.  Stopping ten short of
+    # that leaves room for the artifact upload instead of losing the build.
+    timeout-minutes: 350
+    env:
+      DEVICE: ${{ matrix.device }}
+      ROM: /home/runner/rom
+      # A release asset on this same repository, so the workflow needs no
+      # secret and the blobs stay out of git history.  See tools/blobs/pack.sh.
+      BLOBS_URL: https://github.com/Skilemon/kyocera_kyl23_kc-01/releases/download/blobs-v1/proprietary.tar.gz
+
+    steps:
+      - name: Checkout device tree
+        uses: actions/checkout@v5
+        with:
+          path: local
+
+      - name: Report disk space
+        run: |
+          df -h /
+          # A 14.1 tree is roughly 35 GB of source and 30 GB of output.  The
+          # runner has about 65 GB free after the image; if that changes, the
+          # build fails three hours in with ENOSPC, so it is worth knowing now.
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "available: ${avail}G"
+          test "$avail" -gt 55 || { echo "not enough disk to start"; exit 1; }
+          # The android-22.04 image ships ~25 GB of preinstalled SDK, NDK and
+          # toolcache that a ROM build never touches.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # Everything below is needed by the 14.1 build itself, not by the
+          # device tree: soong wants go and bison, the kernel dtbtool wants
+          # flex, and the host tools are 32/64 bit mixed.
+          sudo apt-get install -y --no-install-recommends \
+            automake lzop bison gperf build-essential \
+            zlib1g-dev g++-multilib gcc-multilib lib32z1-dev lib32ncurses-dev \
+            libxml2-utils bzip2 libbz2-dev squashfs-tools pngcrush schedtool \
+            dpkg-dev liblz4-tool optipng libssl-dev pwgen libswitch-perl \
+            policycoreutils libxml-simple-perl bc imagemagick binutils cpio \
+            rsync zip unzip ccache git curl \
+            python2 libncurses5 libtinfo5
+          # JDK 8 is required by the 14.1 build (soong and the java toolchain
+          # both assume it).  Installed separately because --no-install-recommends
+          # skips ca-certificates-java, and java then cannot open its trust store.
+          sudo apt-get install -y openjdk-8-jdk
+          echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> "$GITHUB_ENV"
+          # Ubuntu 22.04 makes `python` point at python3; the 14.1 tree still
+          # has python2 scripts that are invoked as plain `python`.
+          sudo ln -sf /usr/bin/python2 /usr/local/bin/python
+          python --version
+          python3 --version
+
+      - name: Install repo
+        run: |
+          curl -sL https://storage.googleapis.com/git-repo-downloads/repo -o /tmp/repo
+          sudo install -m 755 /tmp/repo /usr/local/bin/repo
+          git config --global user.name  "Lineage Builder"
+          git config --global user.email "builder@users.noreply.github.com"
+          # repo aborts on a checkout whose colour settings it cannot read.
+          git config --global color.ui false
+
+      - name: Sync LineageOS 14.1
+        run: |
+          set -ex
+          mkdir -p "$ROM"
+          cd "$ROM"
+          repo init --depth=1 -u https://github.com/LineageOS/android -b cm-14.1
+          # device/qcom/common is not in the default manifest on cm-14.1: it is
+          # pulled in as a local addition.  device/qcom/sepolicy *is* in the
+          # manifest (snippets/cm.xml) and must not be listed twice.
+          mkdir -p .repo/local_manifests
+          cat > .repo/local_manifests/kyocera.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <project path="device/qcom/common"
+                     name="LineageOS/android_device_qcom_common"
+                     revision="cm-14.1" />
+          </manifest>
+          XML
+          repo sync -c --force-sync --no-clone-bundle --no-tags --no-repo-verify -j8
+          df -h "$ROM"
+
+      - name: Install device tree and blobs
+        run: |
+          set -ex
+          cd "$ROM"
+          rm -rf device/kyocera vendor/kyocera
+          mkdir -p device vendor
+          cp -r "$GITHUB_WORKSPACE/local/device/kyocera" device/
+          cp -r "$GITHUB_WORKSPACE/local/vendor/kyocera" vendor/
+
+          # The proprietary files are a release asset, not part of the repo:
+          # 74 MB of binaries would bloat every clone and are not ours to
+          # redistribute.
+          curl -fL --retry 3 "$BLOBS_URL" -o /tmp/proprietary.tar.gz
+          tar -xzf /tmp/proprietary.tar.gz -C vendor/kyocera/msm8926-common/
+          du -sh vendor/kyocera/msm8926-common/proprietary
+          find device/kyocera -maxdepth 2 -type f | sort
+
+      - name: Check the inputs
+        run: |
+          set -ex
+          cd "$ROM"
+          # Checked before lunch, not after: every one of these has produced a
+          # cryptic failure four hours into a build at some point.
+          test -f "device/kyocera/$DEVICE/lineage_$DEVICE.mk"
+          test -f "device/kyocera/$DEVICE/BoardConfig.mk"
+          test -f device/kyocera/msm8926-common/lineage-common.mk
+          test -f device/kyocera/msm8926-common/system.prop
+          test -f device/kyocera/msm8926-common/rootdir/etc/fstab.qcom
+          test -f device/kyocera/msm8926-common/bluetooth/bdroid_buildcfg.h
+
+          P=vendor/kyocera/msm8926-common/proprietary
+          test -f "$P/vendor/lib/libril-qc-qmi-1.so"
+          test -f "$P/vendor/lib/hw/camera.msm8226.so"
+          test -f "$P/vendor/lib/egl/libGLESv2_adreno.so"
+          test -f "$P/vendor/lib/modules/pronto/pronto_wlan.ko"
+          test -f "$P/system/etc/wifi/WCNSS_qcom_cfg.ini"
+          test -f "$P/system/etc/acdbdata/MTP/MTP_General_cal.acdb"
+
+          # The blobs are 4.4 binaries.  A 64-bit or x86 object in here would
+          # mean extract.py picked up the wrong tree.
+          file "$P/vendor/lib/libc2dcolorconvert.so" | grep -q "ARM"
+
+          # Every copy rule must point at a file that exists; a typo turns into
+          # "ninja: no rule to make target" long after lunch succeeded.
+          python3 - <<'PY'
+          import os, re, sys
+          mk = "vendor/kyocera/msm8926-common/msm8926-common-vendor.mk"
+          missing = []
+          for line in open(mk):
+              m = re.match(r"\s+(vendor/\S+):", line)
+              if m and not os.path.exists(m.group(1)):
+                  missing.append(m.group(1))
+          if missing:
+              print("%d copy rules point at missing files, first five:" % len(missing))
+              for p in missing[:5]:
+                  print("  " + p)
+              sys.exit(1)
+          print("all copy sources present")
+          PY
+
+      - name: Build
+        working-directory: ${{ env.ROM }}
+        run: |
+          set -ex
+          export CCACHE_DIR="$HOME/.ccache"
+          export USE_CCACHE=1
+          export CCACHE_COMPRESS=1
+          source build/envsetup.sh
+          lunch "lineage_${DEVICE}-userdebug"
+          # The build prints its own progress; -j is capped at the runner's
+          # core count by soong anyway.
+          mka bacon -j"$(nproc --all)"
+          ls -l "out/target/product/$DEVICE/"*.zip
+
+      - name: Verify the package
+        run: |
+          set -ex
+          cd "$ROM/out/target/product/$DEVICE"
+          ZIP=$(ls lineage-14.1-*.zip | head -1)
+          ls -l "$ZIP"
+          md5sum "$ZIP"
+          # A 14.1 package is a few hundred MB; anything under 150 MB means the
+          # build lost its system image and shipped a boot-only zip.
+          size=$(stat -c %s "$ZIP")
+          test "$size" -gt 157286400 || { echo "package is only $size bytes"; exit 1; }
+          unzip -l "$ZIP" | grep -E "boot.img|system.new.dat|system.transfer.list"
+          # The kernel inside boot.img must be the Kyocera 3.4.0 one, not an
+          # AOSP default: the 7.1 tree has no msm8226 defconfig for this board.
+          unzip -o -q "$ZIP" boot.img -d /tmp/bootcheck
+          python3 - <<'PY'
+          import struct, gzip, io, re
+          d = open("/tmp/bootcheck/boot.img", "rb").read()
+          assert d[:8] == b"ANDROID!", "boot.img has no Android header"
+          ksize = struct.unpack_from("<I", d, 8)[0]
+          page = struct.unpack_from("<I", d, 36)[0]
+          k = d[page:page + ksize]
+          print("kernel %d bytes, page %d" % (ksize, page))
+          # 3.4 ARM zImages carry the version string in the compressed payload.
+          for off in range(0, len(k), 1):
+              if k[off:off + 2] == b"\x1f\x8b":
+                  try:
+                      out = gzip.GzipFile(fileobj=io.BytesIO(k[off:])).read(1 << 22)
+                  except Exception:
+                      continue
+                  m = re.search(rb"Linux version [0-9.]+", out)
+                  if m:
+                      print("kernel version:", m.group().decode())
+                      assert m.group().decode().startswith("Linux version 3.4"), m.group()
+                      break
+          else:
+              print("could not decompress the kernel; skipping the version check")
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: lineage-14.1-${{ env.DEVICE }}
+          path: ${{ env.ROM }}/out/target/product/${{ env.DEVICE }}/lineage-14.1-*.zip
+          if-no-files-found: error
+          retention-days: 14

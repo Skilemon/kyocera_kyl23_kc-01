@@ -141,3 +141,83 @@ WIFI_DRIVER_MODULE_NAME := "wlan"
 WIFI_DRIVER_FW_PATH_AP := "apsta"
 WIFI_DRIVER_FW_PATH_STA := "sta"
 WIFI_DRIVER_FW_PATH_P2P := "p2p"
+
+
+# ============================================================ full-ROM build
+#
+# Everything above serves the TWRP build: it compiles bootable/recovery against
+# a prebuilt kernel and nothing else.  A LineageOS 14.1 build reads the same
+# file and needs a great deal more, which is what follows.
+#
+# None of it disturbs the recovery build.  The variables either have no
+# consumer in a recovery-only tree, or they are assigned here to the value the
+# ROM wants while recovery keeps the one it already had -- the few that overlap
+# are called out where they do.
+
+# --------------------------------------------------------------- identity
+# The seller flashed KC-01's system onto a KYL23, and the bootloader carries
+# no reliable model string, so the assert has to accept both codenames and
+# both marketing names.
+TARGET_OTA_ASSERT_DEVICE := kyl23,kc01,KYL23,KC01,KYV36
+
+TARGET_NO_BOOTLOADER := true
+BOARD_USES_QCOM_HARDWARE := true
+
+# device/qcom/common only builds anything when the platform appears in this
+# list -- its Android.mk is wrapped in a filter on QCOM_BOARD_PLATFORMS.  Left
+# unset, the power HAL, the qcom init scripts and the recovery extensions all
+# silently disappear, which looks like a dozen unrelated build failures later.
+QCOM_BOARD_PLATFORMS += msm8226
+
+# The device runs qcril from the stock image, which is the CAF flavour of RIL
+# rather than the AOSP reference implementation.
+TARGET_RIL_VARIANT := caf
+
+# --------------------------------------------------------------- properties
+TARGET_SYSTEM_PROP := $(DEVICE_COMMON_PATH)/system.prop
+
+# ------------------------------------------------------------------ kernel
+# Same prebuilt zImage as recovery (see the kernel section above): 3.4.0, built
+# from Kyocera's own GPL drop.  A ROM build would otherwise look for
+# TARGET_KERNEL_SOURCE and fail, because this tree has no kernel.
+BOARD_KERNEL_IMAGE_NAME := zImage
+
+# ---------------------------------------------------------------- bluetooth
+# bluedroid reads its build-time configuration from this header.
+BOARD_BLUETOOTH_BDROID_BUILDCFG_INCLUDE_DIR := $(DEVICE_COMMON_PATH)/bluetooth
+
+# --------------------------------------------------------------------- ANT
+BOARD_ANT_WIRELESS_DEVICE := "qualcomm-smd"
+
+# ---------------------------------------------------------------- sepolicy
+# device/qcom/sepolicy carries the Qualcomm-wide types (qmi, sensors, thermal)
+# that every msm device needs on top of what AOSP ships.
+-include device/qcom/sepolicy/sepolicy.mk
+BOARD_SEPOLICY_DIRS += $(DEVICE_COMMON_PATH)/sepolicy
+
+# ------------------------------------------------------- vendor partitions
+# The blobs were extracted from the 4.4.4 image by tools/blobs/extract.py into
+# vendor/kyocera/msm8926-common.  Inheriting the vendor makefile here is what
+# pulls in its copy rules; the directory itself is fetched by the workflow,
+# because 74 MB of proprietary binaries do not belong in this repository.
+-include vendor/kyocera/msm8926-common/BoardConfigVendor.mk
+
+# ---------------------------------------------------------------- wifi (rom)
+# In 4.4 the module sat behind a symlink at /system/lib/modules/wlan.ko.  In a
+# 7.1 tree the modules live under /vendor, and the symlink is gone, so the
+# path is the real file.
+WIFI_DRIVER_MODULE_PATH := "/vendor/lib/modules/pronto/pronto_wlan.ko"
+BOARD_HAS_QCOM_WLAN_SDK := true
+
+# -------------------------------------------------------------- dexpreopt
+# Boot-image-only dexpreopt keeps the first boot short without spending an
+# hour optimising every preinstalled app.
+ifeq ($(HOST_OS),linux)
+  ifneq ($(TARGET_BUILD_VARIANT),eng)
+    ifeq ($(WITH_DEXPREOPT),)
+      WITH_DEXPREOPT := true
+      WITH_DEXPREOPT_BOOT_IMG_ONLY := true
+    endif
+  endif
+endif
+

@@ -1,18 +1,18 @@
 #
-# LineageOS product - KYV36 / KC-01 (2015 stock, 102.x)
+# LineageOS 14.1 product - KYV36 / KC-01 (2015 stock, 102.x)
 #
-# This target is a placeholder for the planned ROM work. It is NOT
-# usable yet: no vendor blobs are wired up and no msm8926 device tree
-# (hardware/qcom, device/qcom/common) is pinned.
+# Same board, same blobs, same kernel as kyl23; the difference is the model
+# string and the key that the 2015 firmware maps to the camera.  Building both
+# from one tree is what makes it possible to flash either and still have a
+# phone that identifies itself correctly.
 #
 
-$(call inherit-product, device/kyocera/kc01/device.mk)
+$(call inherit-product, device/kyocera/msm8926-common/lineage-common.mk)
+$(call inherit-product, vendor/cm/config/common_full_phone.mk)
 
 PRODUCT_NAME := lineage_kc01
 PRODUCT_DEVICE := kc01
 PRODUCT_MODEL := KC-01
 
 PRODUCT_BUILD_PROP_OVERRIDES += \
-    TARGET_DEVICE=KC-01 \
-    BUILD_FINGERPRINT=Kyocera/KC-01/KC-01:4.4.4/102.0.1e20/102.0.1e20:user/release-keys
-PRIVATE_BUILD_DESC="KC-01-user 4.4.4 102.0.1e20 release-keys"
+    TARGET_DEVICE=KC-01

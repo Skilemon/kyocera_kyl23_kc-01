@@ -1,0 +1,25 @@
+#
+# Android fstab - Kyocera KC-01 / miraie KYL23 (msm8926)
+#
+# Taken from the stock 4.4.4 fstab.qcom, with three changes that 7.1 requires:
+#   * system and cache are listed so init can mount them by name rather than
+#     relying on the ramdisk having already done it
+#   * every entry that has a filesystem carries "check", which is what makes
+#     fs_mgr run e2fsck; 4.4 left it off /data with a TODO because the stock
+#     ramdisk had no e2fsck at all
+#   * the by-name links are used everywhere instead of the raw
+#     /dev/block/mmcblk0pN numbers the factory left commented out
+#
+# /sysprop and /pstore are Kyocera's own partitions: the first holds factory
+# calibration the radio reads, the second is where kernel panics land.  Both
+# have to be mounted or the modem stack comes up with empty calibration.
+#
+#<src>                                                  <mnt_point>  <type>  <mnt_flags and options>                          <fs_mgr_flags>
+/dev/block/platform/msm_sdcc.1/by-name/system           /system      ext4    ro,barrier=1                                     wait
+/dev/block/platform/msm_sdcc.1/by-name/userdata         /data        ext4    nosuid,nodev,barrier=1,noauto_da_alloc           wait,check,encryptable=/persist/udf
+/dev/block/platform/msm_sdcc.1/by-name/cache            /cache       ext4    nosuid,nodev,noatime,barrier=1,noauto_da_alloc   wait,check
+/dev/block/platform/msm_sdcc.1/by-name/persist          /persist     ext4    nosuid,nodev,barrier=1                           wait,check
+/dev/block/platform/msm_sdcc.1/by-name/sysprop2         /pstore      ext4    nosuid,nodev,barrier=1,noauto_da_alloc,data=journal  wait,check
+/dev/block/platform/msm_sdcc.1/by-name/sysprop          /sysprop     ext4    nosuid,nodev,barrier=1,noauto_da_alloc,data=journal  wait,check
+/dev/block/platform/msm_sdcc.1/by-name/modem            /firmware    vfat    ro,shortname=lower,uid=1000,gid=1026,dmask=0227,fmask=0337  wait
+/devices/msm_sdcc.2/mmc_host                            /storage/sdcard1  vfat  nosuid,nodev                                  wait,voldmanaged=sdcard1:auto
