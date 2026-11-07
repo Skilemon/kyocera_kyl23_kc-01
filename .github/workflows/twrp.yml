@@ -52,8 +52,8 @@ jobs:
       fail-fast: false
       matrix:
         device: ${{ fromJSON(needs.plan.outputs.devices) }}
-    # 22.04 is the last runner image that still packages python2, which the
-    # Android 7.1 build system needs.
+    # 22.04 is the last image that still ships python2, plus the ncurses5 the
+    # prebuilt clang links against.
     runs-on: ubuntu-22.04
     timeout-minutes: 300
     env:
