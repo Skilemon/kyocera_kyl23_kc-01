@@ -55,7 +55,7 @@ jobs:
     # 22.04 is the last runner image that still packages python2, which the
     # Android 7.1 build system needs.
     runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    timeout-minutes: 300
     env:
       DEVICE: ${{ matrix.device }}
       BUILD_KERNEL: ${{ inputs.build_kernel || 'false' }}
@@ -191,7 +191,7 @@ jobs:
           test -f "kernel/kyocera/$DEVICE/arch/arm/configs/msm8926-kyocera_defconfig"
 
       - name: Build TWRP
-        working-directory: /home/runner/rom
+        working-directory: ${{ env.ROM }}
         run: |
           set -ex
           export ALLOW_MISSING_DEPENDENCIES=true
@@ -212,6 +212,9 @@ jobs:
           test -d "$ROOT"
           ls "$ROOT/sbin/recovery" "$ROOT/etc/recovery.fstab"
           C="$GITHUB_WORKSPACE/local/device/kyocera/msm8926-common/prebuilt"
+          # Checked before the packer runs, not after: a missing module should
+          # stop the job before it spends time building an image without it.
+          test -f "$C/kc_wp.ko"
 
           # One kernel / ramdisk / QCDT blob serves both codenames - they are
           # the same msm8926 board.  ro.product.device and the build id are
@@ -251,7 +254,6 @@ jobs:
           # itself: a delayed work 4s after insmod, retried until
           # /dev/block/mmcblk0p12 shows up.  No init.rc exec needed -- /dev
           # nodes are late and TWRP remounts /tmp, which ate the log.
-          test -f "$C/kc_wp.ko"
 
       - name: Verify the image
         run: |
@@ -267,6 +269,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: twrp-${{ env.DEVICE }}
-          path: /home/runner/rom/twrp-${{ env.DEVICE }}.img
+          path: ${{ env.ROM }}/twrp-${{ env.DEVICE }}.img
           if-no-files-found: error
           retention-days: 14
