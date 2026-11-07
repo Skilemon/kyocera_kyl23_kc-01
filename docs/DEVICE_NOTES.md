@@ -1233,6 +1233,17 @@ CMD31 arg=0x05f00000  ->  ret=-110  R1=0x80000900
 回读逐字节一致，16 MiB 镜像 `dd` 后双 md5 相同。CI 产出的镜像里 `kc_wp.ko`
 是**唯一**的模块，`mmc_protect.ko` 的 `insmod` 行和文件都已删除。
 
+**仓库里的 `prebuilt/kc_wp.ko` 是 strip 过的**：原始产物带 DWARF 调试段，里面记着
+构建机的源码路径（`/workspace/kwp/kc_wp.c` 之类），不适合放进公开仓库。
+`arm-linux-gnueabi-strip --strip-debug` 只摘掉 14 个 `.debug_*` 段，`.text` 逐字节
+不变（`fc6dc43e4bc5b1539bd79e3ca5f6a853`），`__versions` 和 `vermagic` 都保留，
+体积 154,008 → 16,264 B（md5 `a79f5570…`）。
+
+> 因此：**真机上验证过的 wp6 用的是未 strip 的原件**，用现在的 `prebuilt/kc_wp.ko`
+> 重新构建，镜像 md5 会和 `f4ec23f8` 不同——差异只在这个模块的调试段，代码没动。
+> 注意 x86 的 `strip` 不认 ARM ELF，会报 `Unable to recognise the format`，
+> 得装 `binutils-arm-linux-gnueabi`。
+
 ### 12.7 `0xA1`/`0xA3` 的真实上限与错误码（2024 实测修正）
 
 早先 `serial_restore.py` 把单包定成 `0x3e00`（15872 B），依据是“对端实测上限”，
