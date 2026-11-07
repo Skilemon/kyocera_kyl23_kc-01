@@ -73,28 +73,25 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # Every package below ships in jammy, so a failure here is a real
+          # failure and must stop the job now rather than surface as a weird
+          # build error twenty minutes later.  No `|| true`.
           sudo apt-get install -y --no-install-recommends \
             automake lzop bison gperf build-essential \
             zlib1g-dev g++-multilib gcc-multilib \
             python3-networkx libxml2-utils bzip2 libbz2-dev \
-            squashfs-tools pngcrush schedtool dpkg-dev liblz4-tool make \
+            squashfs-tools pngcrush schedtool dpkg-dev liblz4-tool \
             optipng libssl-dev pwgen libswitch-perl policycoreutils \
-            libxml-simple-perl bc imagemagick binutils wget cpio
-          # The Android 7.1 build system - and build/tools/roomservice.py in
-          # particular - is python2.  'python-is-python2' has no candidate on
-          # 22.04, and asking for it in the same apt call aborts the whole
-          # transaction, so install python2 on its own and link it by hand.
-          sudo apt-get install -y python2 || true
-          if [ ! -x /usr/bin/python2 ]; then
-            echo "::error::python2 is required by the Android 7.1 build system"
-            exit 1
-          fi
-          sudo ln -sf /usr/bin/python2 /usr/local/bin/python
-          # JDK 8 is required (the build needs tools.jar)
+            libxml-simple-perl bc imagemagick binutils cpio \
+            python2 libncurses5 libtinfo5
+          # JDK 8 is required (the build needs tools.jar).  Installed apart
+          # from the list above because --no-install-recommends would skip
+          # ca-certificates-java, and java then fails to open its trust store.
           sudo apt-get install -y openjdk-8-jdk
           echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> "$GITHUB_ENV"
-          # The prebuilt clang wants ncurses5
-          sudo apt-get install -y libncurses5 libtinfo5 || true
+          # Ubuntu 22.04 ships python-is-python3, so `python` is python3; the
+          # 7.1 tree still has python2 scripts and expects `python` to be 2.7.
+          sudo ln -sf /usr/bin/python2 /usr/local/bin/python
           python --version
           python3 --version
 
