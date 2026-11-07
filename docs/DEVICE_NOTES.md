@@ -1234,7 +1234,7 @@ CMD31 arg=0x05f00000  ->  ret=-110  R1=0x80000900
 是**唯一**的模块，`mmc_protect.ko` 的 `insmod` 行和文件都已删除。
 
 **仓库里的 `prebuilt/kc_wp.ko` 是 strip 过的**：原始产物带 DWARF 调试段，里面记着
-构建机的源码路径（`/workspace/kwp/kc_wp.c` 之类），不适合放进公开仓库。
+构建机上的绝对源码路径（目录结构、用户名都会被写进去），不适合放进公开仓库。
 `arm-linux-gnueabi-strip --strip-debug` 只摘掉 14 个 `.debug_*` 段，`.text` 逐字节
 不变（`fc6dc43e4bc5b1539bd79e3ca5f6a853`），`__versions` 和 `vermagic` 都保留，
 体积 154,008 → 16,264 B（md5 `a79f5570…`）。
