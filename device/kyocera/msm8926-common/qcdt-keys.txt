@@ -1,0 +1,47 @@
+# QCDT key table for Kyocera KC-01 / miraie KYL23 (MSM8926)
+# Extracted verbatim from the stock recovery.img (201.1.0a20).
+# Order matters: aboot takes the first entry whose
+# (msm_id, board_id, soc_rev) triple matches the running SoC.
+#
+# board  variant  soc_rev     msm_id
+#                (hex)       (0x91=MSM8226 0xC8=MSM8926 0xE0=MSM8926v2)
+8       0        0x0         145
+8       0        0x20000     145
+8       2        0x20000     145
+8       0        0x0         158
+8       0        0x20000     158
+8       2        0x20000     158
+8       0        0x0         159
+8       0        0x20000     159
+8       2        0x20000     159
+8       0        0x0         198
+8       0        0x20000     198
+8       2        0x20000     198
+8       0        0x0         199
+8       0        0x20000     199
+8       2        0x20000     199
+8       0        0x0         200
+8       0        0x10001     200
+8       2        0x0         200
+8       2        0x10001     200
+8       0        0x0         205
+8       0        0x20000     205
+8       2        0x20000     205
+8       0        0x20000     219
+8       2        0x20000     219
+8       0        0x0         220
+8       0        0x20000     220
+8       2        0x20000     220
+8       0        0x0         221
+8       0        0x20000     221
+8       2        0x20000     221
+8       0        0x0         222
+8       0        0x20000     222
+8       2        0x20000     222
+8       0        0x0         223
+8       0        0x20000     223
+8       2        0x20000     223
+8       0        0x0         224
+8       0        0x10001     224
+8       2        0x0         224
+8       2        0x10001     224

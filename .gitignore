@@ -1,0 +1,86 @@
+# Build output
+out/
+*.img
+*.dtb
+!device/**/*.dtb
+# The stock boot artifacts we splice against are inputs, not build output.
+# ramdisk.gz supplies the 4.4.4 init ecosystem, dtb-kyl23.img is the QCDT blob
+# whose 40 board=8 entries point at eight distinct DTBs.
+!device/**/prebuilt/stock/*.img
+
+# Kernel trees are never committed - CI clones the base tree instead.
+# (A 480 MB copy used to live in this repo and was never used by the build.)
+# Anchored with a leading slash on purpose: an unanchored "kernel/" also
+# matches tools/kernel/, which is where the module sources live.
+/kernel/
+/kernel_*/
+# ...but the stock kernel image we build around is a file, not a tree.
+!device/**/prebuilt/kernel
+
+# Kernel module build output.  The sources live in tools/kernel/<mod>/, the
+# module we actually ship is the prebuilt binary under device/**/prebuilt/.
+*.o
+*.ko
+*.mod.c
+*.symvers
+.*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+!device/**/prebuilt/*.ko
+
+# Reference trees used during bring-up, not part of the port
+device_motorola_thea/
+device_motorola_msm8226-common/
+device_kyocera_kc01/
+
+# ---------------------------------------------------------------------------
+# Local-only material.  Nothing below belongs in a public repo: these are the
+# working copies, intermediate images and notes of whoever is doing the port.
+# ---------------------------------------------------------------------------
+
+# tools/repack/*.py read the intermediate images from KC_IMG_DIR, default
+# ./images.  Those are multi-MB byproducts of a local build, not sources.
+/images/
+/incoming/
+/downloads/
+
+# Device dumps: full eMMC backups, per-partition images, aboot/sbl1 binaries.
+# They are the recovery path for a bricked phone and stay on the operator's
+# disk, not here.
+/dumps/
+/backup/
+/stock/
+*.bin
+
+# Notes about the local environment - network quirks, proxy settings, tokens,
+# machine layout.  Keep them in the checkout if convenient, never publish them.
+/notes-local/
+/local/
+*.local
+*.secret
+.env
+.env.*
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+*.bak
+.Thumbs.db
+
+# Scratch
+*.log
+*.zip
+*.tar.gz
+*.tar
+Thumbs.db
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

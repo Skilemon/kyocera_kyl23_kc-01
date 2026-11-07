@@ -1,0 +1,8 @@
+# Android fstab (runtime) - Kyocera KC-01 / miraie KYL23
+
+/dev/block/platform/msm_sdcc.1/by-name/system    /system     ext4    ro,barrier=1                                                    wait
+/dev/block/platform/msm_sdcc.1/by-name/userdata  /data       ext4    rw,nosuid,nodev,noatime,nodelalloc,noauto_da_alloc,journal_async_commit,errors=panic    wait,encryptable=footer
+/dev/block/platform/msm_sdcc.1/by-name/cache     /cache      ext4    rw,nosuid,nodev,noatime,nodelalloc,noauto_da_alloc,journal_async_commit    wait
+/dev/block/platform/msm_sdcc.1/by-name/persist   /persist    ext4    rw,nosuid,nodev,noatime,nodelalloc,noauto_da_alloc    wait
+/dev/block/platform/msm_sdcc.1/by-name/carrier   /carrier    ext4    rw,nosuid,nodev,noatime,nodelalloc,noauto_da_alloc    wait
+/dev/block/platform/msm_sdcc.1/by-name/modem     /firmware   vfat    ro,shortname=lower,uid=1000,gid=1026,dmask=0227,fmask=0337    wait

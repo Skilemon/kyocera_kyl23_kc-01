@@ -1,0 +1,25 @@
+import init.kc01.usb.rc
+
+on init
+    # Platform
+    export RO BOOT_HWC
+
+on early-init
+    mount debugfs debugfs /sys/kernel/debug
+
+on fs
+    mount_all fstab.kc01
+    write /sys/devices/platform/msm_sdcc.3/polling 0
+
+on post-fs
+    # WiFi firmware loading
+    write /sys/module/wlan/parameters/fwpath "sta"
+
+on boot
+    # Touch firmware
+    chown system system /sys/devices/virtual/input/input0/enable
+
+service qcamerasvr /system/bin/mm-qcamera-daemon
+    class late_start
+    user camera
+    group camera system inet input graphics

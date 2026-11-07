@@ -1,0 +1,28 @@
+# TWRP recovery.fstab - Kyocera msm8926 family (KC-01 / KYL23)
+#
+# Derived from the fstab that ships inside the STOCK recovery ramdisk
+# (etc/recovery.fstab and fstab.qcom), plus /carrier which is present on
+# the device but missing from the stock recovery table.
+#
+# Device layout is <mount point> <fstype> <device> <flags>.
+#
+# WARNING: /persist, /modem, /carrier and /sysprop hold per-unit factory
+# data (RF calibration, IMEI-related blobs, carrier config).  They are
+# readable/backupable on purpose, but never format or restore them from
+# another unit.
+
+/boot           emmc    /dev/block/platform/msm_sdcc.1/by-name/boot         flags=backup=1;flashimg=1
+/recovery       emmc    /dev/block/platform/msm_sdcc.1/by-name/recovery     flags=backup=1;flashimg=1
+/misc           emmc    /dev/block/platform/msm_sdcc.1/by-name/misc         flags=backup=1;display="Misc"
+
+/system         ext4    /dev/block/platform/msm_sdcc.1/by-name/system       flags=backup=1;display="System"
+/cache          ext4    /dev/block/platform/msm_sdcc.1/by-name/cache        flags=backup=1;display="Cache"
+/data           ext4    /dev/block/platform/msm_sdcc.1/by-name/userdata     flags=backup=1;display="Data"
+
+/persist        ext4    /dev/block/platform/msm_sdcc.1/by-name/persist      flags=backup=1;display="Persist"
+/modem          emmc    /dev/block/platform/msm_sdcc.1/by-name/modem        flags=backup=1;display="Modem";flashimg=1
+/carrier        ext4    /dev/block/platform/msm_sdcc.1/by-name/carrier      flags=backup=1;display="Carrier"
+/sysprop        ext4    /dev/block/platform/msm_sdcc.1/by-name/sysprop      flags=display="Sysprop"
+
+/external_sd    vfat    /dev/block/mmcblk1p1                                flags=display="MicroSD";storage;wipeingui;removable
+/usb-otg        auto    /dev/block/sda1                                     flags=display="USB-OTG";storage;wipeingui;removable

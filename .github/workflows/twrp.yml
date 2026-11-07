@@ -1,0 +1,282 @@
+name: Build TWRP
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'Which codename(s) to build'
+        required: true
+        default: 'all'
+        type: choice
+        options: [all, kyl23, kc01]
+      build_kernel:
+        description: 'Compile the kernel from source instead of using the stock one'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+  push:
+    branches: [main]
+    paths:
+      - 'device/**'
+      - 'kernel-overlay/**'
+      - 'tools/**'
+      - '.github/workflows/twrp.yml'
+
+concurrency:
+  group: twrp-${{ github.ref }}-${{ inputs.device || 'all' }}
+  cancel-in-progress: true
+
+jobs:
+  # Both Kyocera msm8926 codenames share device/kyocera/msm8926-common, so a
+  # single run builds them in parallel; one job per device keeps the logs and
+  # the artifacts apart, and a failure on one does not take the other down.
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      devices: ${{ steps.list.outputs.devices }}
+    steps:
+      - id: list
+        env:
+          PICK: ${{ inputs.device || 'all' }}
+        run: |
+          case "$PICK" in
+            kyl23|kc01) echo "devices=[\"$PICK\"]" >> "$GITHUB_OUTPUT" ;;
+            *)          echo 'devices=["kyl23","kc01"]' >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "building: $(grep devices "$GITHUB_OUTPUT")"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        device: ${{ fromJSON(needs.plan.outputs.devices) }}
+    # 22.04 is the last runner image that still packages python2, which the
+    # Android 7.1 build system needs.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      DEVICE: ${{ matrix.device }}
+      BUILD_KERNEL: ${{ inputs.build_kernel || 'false' }}
+      ROM: /home/runner/rom
+
+    steps:
+      - name: Checkout device tree
+        uses: actions/checkout@v5
+        with:
+          path: local
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ccache automake lzop bison gperf build-essential zip curl \
+            zlib1g-dev g++-multilib gcc-multilib \
+            python3-networkx libxml2-utils bzip2 libbz2-dev \
+            squashfs-tools pngcrush schedtool dpkg-dev liblz4-tool make \
+            optipng libssl-dev pwgen libswitch-perl policycoreutils \
+            libxml-simple-perl bc imagemagick binutils wget cpio
+          # The Android 7.1 build system - and build/tools/roomservice.py in
+          # particular - is python2.  'python-is-python2' has no candidate on
+          # 22.04, and asking for it in the same apt call aborts the whole
+          # transaction, so install python2 on its own and link it by hand.
+          sudo apt-get install -y python2 || true
+          if [ ! -x /usr/bin/python2 ]; then
+            echo "::error::python2 is required by the Android 7.1 build system"
+            exit 1
+          fi
+          sudo ln -sf /usr/bin/python2 /usr/local/bin/python
+          # JDK 8 is required (the build needs tools.jar)
+          sudo apt-get install -y openjdk-8-jdk
+          echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> "$GITHUB_ENV"
+          # The prebuilt clang wants ncurses5
+          sudo apt-get install -y libncurses5 libtinfo5 || true
+          python --version
+          python3 --version
+
+      - name: Check the prebuilt inputs
+        run: |
+          set -ex
+          C=local/device/kyocera/msm8926-common/prebuilt
+          ls -l "$C" "$C/stock"
+          test -f "$C/kernel"
+          test -f "$C/stock/ramdisk.gz"
+          test -f "$C/stock/dtb-kyl23.img"
+          # Simplified Chinese is not in the minimal manifest's language set;
+          # it is carried here together with the CJK font its fontoverride
+          # points at, and laid over twres/ at assembly time.
+          test -f "$C/twres/languages/zh_CN.xml"
+          test -f "$C/twres/fonts/DroidSansFallback.ttf"
+          # The kernel in prebuilt/ is built from Kyocera's own 3.4.0 source
+          # (see kernel-patches/), not the factory zImage: the factory one
+          # carried a vendor LSM hook that refused every insmod from init.
+          # The self-built one loads modules normally, and the image needs
+          # exactly one of them -- kc_wp.ko, which lifts the card-level eMMC
+          # write protect (aboot re-arms it on every power-on) so that TWRP
+          # can actually write recovery.  Passed as --module below.
+          # The QCDT table decides whether the phone boots at all.  Entry layout
+          # is six 32-bit words: msm_id, board, variant, soc_rev, offset, size
+          # - msm_id comes first, and reading it as the board id shifts every
+          # field by one.  This device is (200, 8, 0, 0x10001) -> offset 0xec800.
+          python3 - <<'PY'
+          import struct
+          p = "local/device/kyocera/msm8926-common/prebuilt/stock/dtb-kyl23.img"
+          d = open(p, "rb").read()
+          assert d[:4] == b"QCDT", "not a QCDT blob"
+          ver, cnt = struct.unpack_from("<2I", d, 4)
+          assert ver == 2, "unexpected QCDT version %d" % ver
+          rows = [struct.unpack_from("<6I", d, 12 + k * 24) for k in range(cnt)]
+          key = [r for r in rows if r[:4] == (200, 8, 0, 0x10001)]
+          assert key, "no entry for (msm_id=200, board=8, variant=0, soc_rev=0x10001)"
+          assert key[0][4] == 0xec800, "device entry points at 0x%x, expected 0xec800" % key[0][4]
+          assert all(d[r[4]:r[4] + 4] == b"\xd0\x0d\xfe\xed" for r in rows), "entry does not point at an FDT"
+          print("QCDT OK: %d entries, %d distinct DTBs, device -> 0x%x"
+                % (cnt, len({r[4] for r in rows}), key[0][4]))
+          PY
+          python3 - <<'PY'
+          import gzip
+          p = "local/device/kyocera/msm8926-common/prebuilt/stock/ramdisk.gz"
+          d = open(p, "rb").read()
+          assert d[:2] == b"\x1f\x8b", "ramdisk is not gzip"
+          cpio = gzip.decompress(d)
+          assert cpio[:6] == b"070701", "ramdisk is not a newc archive"
+          assert b"TRAILER!!!" in cpio[-1024:], "ramdisk has no TRAILER"
+          print("ramdisk OK: %d bytes gzip -> %d bytes cpio, %d entries"
+                % (len(d), len(cpio), cpio.count(b"070701")))
+          PY
+
+      - name: Install repo
+        run: |
+          curl -sL https://storage.googleapis.com/git-repo-downloads/repo -o /tmp/repo
+          sudo install -m 755 /tmp/repo /usr/local/bin/repo
+          git config --global user.name  "TWRP Builder"
+          git config --global user.email "builder@users.noreply.github.com"
+
+      - name: Sync minimal TWRP manifest
+        run: |
+          set -ex
+          mkdir -p "$ROM"
+          cd "$ROM"
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git \
+                    -b twrp-7.1
+          repo sync -c --no-clone-bundle --no-tags --no-repo-verify -j8
+          df -h "$ROM"
+
+      - name: Install the device tree
+        run: |
+          set -ex
+          cd "$ROM"
+          rm -rf "device/kyocera"
+          mkdir -p device/kyocera
+          cp -r "$GITHUB_WORKSPACE/local/device/kyocera/." device/kyocera/
+          find device/kyocera -maxdepth 2 -type f | sort
+          # Both codenames must be present: the matrix build only differs in
+          # which product it lunches, everything else is shared.
+          test -f "device/kyocera/$DEVICE/omni_$DEVICE.mk"
+          test -f "device/kyocera/$DEVICE/BoardConfig.mk"
+          test -d device/kyocera/msm8926-common
+
+      - name: Fetch the kernel sources
+        if: env.BUILD_KERNEL == 'true'
+        run: |
+          set -ex
+          cd "$ROM"
+          rm -rf "kernel/kyocera/$DEVICE"
+          git clone --depth 1 -b cm-14.1 \
+            https://github.com/LineageOS/android_kernel_motorola_msm8226.git \
+            "kernel/kyocera/$DEVICE"
+          cp -r "$GITHUB_WORKSPACE/local/kernel-overlay/." "kernel/kyocera/$DEVICE"/
+          test -f "kernel/kyocera/$DEVICE/arch/arm/configs/msm8926-kyocera_defconfig"
+
+      - name: Build TWRP
+        working-directory: /home/runner/rom
+        run: |
+          set -ex
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export CCACHE_DIR=/home/runner/.ccache
+          export USE_CCACHE=1
+          export CCACHE_EXEC=/usr/bin/ccache
+          ccache -M 4G || true
+          export PATH="$PATH:$PWD/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/bin"
+          export PATH="$PATH:$PWD/prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin"
+          export HOSTCC=gcc-9
+          export KYOCERA_BUILD_KERNEL="$BUILD_KERNEL"
+          source build/envsetup.sh
+          # lunch() calls roomservice.py, which tries to clone device trees it
+          # thinks are missing.  Ours are already in place, and the script is a
+          # hard build breaker if python2 is absent, so neutralise it.
+          roomservice() { :; }
+          lunch "omni_${DEVICE}-eng"
+          mka recoveryimage -j"$(nproc --all)"
+
+      - name: Assemble the flashable image
+        run: |
+          set -ex
+          ROOT="$ROM/out/target/product/$DEVICE/recovery/root"
+          test -d "$ROOT"
+          ls "$ROOT/sbin/recovery" "$ROOT/etc/recovery.fstab"
+          C="$GITHUB_WORKSPACE/local/device/kyocera/msm8926-common/prebuilt"
+
+          # One kernel / ramdisk / QCDT blob serves both codenames - they are
+          # the same msm8926 board.  ro.product.device and the build id are
+          # the only things that differ between the two images.
+          echo "device=$DEVICE  kernel=$C/kernel  dt=$C/stock/dtb-kyl23.img"
+
+          KERNEL="$C/kernel"
+          if [ "$BUILD_KERNEL" = "true" ]; then
+            Z="$ROM/out/target/product/$DEVICE/obj/KERNEL_OBJ/arch/arm/boot/zImage"
+            if [ -f "$Z" ]; then KERNEL="$Z"; fi
+          fi
+
+          python3 "$GITHUB_WORKSPACE/local/tools/image/mkhybrid.py" \
+            --kernel   "$KERNEL" \
+            --ramdisk  "$C/stock/ramdisk.gz" \
+            --dt       "$C/stock/dtb-kyl23.img" \
+            --twrp-root "$ROOT" \
+            --twres-overlay "$C/twres" \
+            --languages "en,zh_CN" \
+            --single-font \
+            --module   "$C/kc_wp.ko" \
+            --out      "$ROM/twrp-$DEVICE.img"
+          # --single-font points every twres font reference at
+          # DroidSansFallback.ttf (full ASCII + 20,902 of 20,992 CJK) and drops
+          # the two latin faces: 233 KB of the 16 MiB slot for nothing.  It
+          # exits non-zero if the result would leave a dangling reference.
+          #
+          # --module kc_wp.ko only.  The write protect lives on the eMMC
+          # itself (WP groups armed by aboot at every boot), so it survives a
+          # kernel change.  The vendor mmc_protect.ko is not shipped any more:
+          # it issues CMD29 with start_sect<<9, i.e. a byte address, but this
+          # card is >2GB and JEDEC switches the WP address unit to sectors at
+          # 2GB, so every command came back OUT_OF_RANGE while the sysfs
+          # 'clear' still reported success.
+          # kc_wp.ko computes the offset from bd_part->start_sect and sweeps the
+          # whole partition in both units.  It also lifts the protection by
+          # itself: a delayed work 4s after insmod, retried until
+          # /dev/block/mmcblk0p12 shows up.  No init.rc exec needed -- /dev
+          # nodes are late and TWRP remounts /tmp, which ate the log.
+          test -f "$C/kc_wp.ko"
+
+      - name: Verify the image
+        run: |
+          set -ex
+          IMG="$ROM/twrp-$DEVICE.img"
+          ls -l "$IMG"
+          python3 "$GITHUB_WORKSPACE/local/tools/image/check_image.py" "$IMG" \
+            --max-size 16777216 --max-fonts 1 \
+            --require-module kc_wp.ko
+
+      - name: Upload recovery image
+        uses: actions/upload-artifact@v7
+        with:
+          name: twrp-${{ env.DEVICE }}
+          path: /home/runner/rom/twrp-${{ env.DEVICE }}.img
+          if-no-files-found: error
+          retention-days: 14
