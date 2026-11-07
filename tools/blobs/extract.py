@@ -125,8 +125,37 @@ init.ath3k.bt.sh init.crda.sh hsic.control.bt.sh qca6234-service.sh hcidump.sh
 """.split()
 
 # /vendor in the stock image is already vendor-only, minus the preinstalled
-# apps that the ROM replaces with its own.
+# apps that the ROM replaces with its own, and minus the libraries 14.1 builds
+# from source.  libbt-vendor is the one that matters: BOARD_HAVE_BLUETOOTH_QCOM
+# makes hardware/qcom/bt produce libbt-vendor.so, and the build then has two
+# rules for the same target.  The source-built one wins on include order, so
+# the 4.4 blob is dead weight - and a 4.4 blob driver talking to a 7.1
+# bluedroid is not something to leave lying around as a fallback.
 VENDOR_SKIP_DIRS = {"app", "media", "pittpatt"}
+VENDOR_SKIP_FILES = {"lib/libbt-vendor.so"}
+
+# Files the 7.1 tree installs at the same path, from its own sources.  Carrying
+# the 4.4 copy only earns a "warning: overriding commands for target" per file,
+# and for platform.xml it is worse than noise: that file is the
+# permission-to-group map, and the 4.4 map predates everything 6.0/7.0 added
+# (sdcard_rw vs sdcard_r/sdcard_all, the per-user range).  Which of the two
+# copies lands in the image depends on include order, so the safe move is not
+# to ship the loser at all.
+ETC_EXCLUDE = {
+    "audio_effects.conf",           # /vendor/etc has the one that is read
+    "clatd.conf",
+    "ethertypes",
+    "bluetooth/bt_did.conf",
+    "bluetooth/bt_stack.conf",
+    "dhcpcd/dhcpcd.conf",
+    "permissions/android.software.live_wallpaper.xml",
+    "permissions/android.software.sip.voip.xml",
+    "permissions/com.android.location.provider.xml",
+    "permissions/com.android.media.remotedisplay.xml",
+    "permissions/platform.xml",
+    "ppp/ip-up-vpn",
+    "wifi/wpa_supplicant.conf",
+}
 
 
 def is_elf(path):
@@ -243,6 +272,8 @@ def main():
         for fn in filenames:
             src_rel = os.path.join("vendor", rel, fn)
             dst_rel = os.path.join("vendor", rel, fn)
+            if os.path.join(rel, fn) in VENDOR_SKIP_FILES:
+                continue
             add(src_rel, dst_rel)
 
     # ------------------------------------------------------------------- /lib
@@ -299,8 +330,12 @@ def main():
         for dirpath, _, filenames in os.walk(src_dir):
             rel = os.path.relpath(dirpath, os.path.join(sysroot, "etc"))
             for fn in filenames:
+                if os.path.join(rel, fn) in ETC_EXCLUDE:
+                    continue
                 add(os.path.join("etc", rel, fn), os.path.join("system", "etc", rel, fn))
     for fn in ETC_FILES:
+        if fn in ETC_EXCLUDE:
+            continue
         add(os.path.join("etc", fn), os.path.join("system", "etc", fn))
 
     # ------------------------------------------------------------- write make
