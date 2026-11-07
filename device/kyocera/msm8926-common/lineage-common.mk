@@ -15,6 +15,13 @@
 # file".
 #
 
+# Set here rather than reused from BoardConfigCommon.mk: the build reads the
+# product makefiles *before* the board config (envsetup.mk includes
+# product_config.mk at line 131 and board_config.mk at line 157), so
+# DEVICE_COMMON_PATH does not exist yet at this point and a reference to it
+# would silently expand to the empty string.
+LINEAGE_COMMON_PATH := device/kyocera/msm8926-common
+
 # AOSP telephony base first, so vendor/cm/config/common_full_phone.mk
 # (inherited by the per-device product makefile) can override it.
 $(call inherit-product, $(SRC_TARGET_DIR)/product/aosp_base_telephony.mk)
@@ -28,12 +35,16 @@ PRODUCT_MANUFACTURER := Kyocera
 PRODUCT_PLATFORM := msm8226
 
 # ------------------------------------------------------------------ runtime
-# 7.1's first-stage init reads the fstab from /vendor/etc; the stock one sat in
-# the ramdisk root, which is why it is copied rather than imported.  The target
-# path is written out instead of using $(TARGET_COPY_OUT_VENDOR): that variable
-# is only guaranteed to be set later in the build than this file is evaluated.
+# 7.1's first-stage init mounts /system using the fstab, which it looks for as
+# /vendor/etc/fstab.<hardware> and, failing that, /fstab.<hardware> in the
+# ramdisk.  The stock image kept a copy in the ramdisk root for the same reason,
+# so both destinations are filled -- a missing fstab is not a warning, it stops
+# the boot before anything can be logged.  On a device with no vendor partition
+# TARGET_COPY_OUT_VENDOR resolves to system/vendor; writing "vendor/..." here
+# would put the file in out/.../vendor and leave it out of system.img entirely.
 PRODUCT_COPY_FILES += \
-    $(DEVICE_COMMON_PATH)/rootdir/etc/fstab.qcom:vendor/etc/fstab.qcom
+    $(LINEAGE_COMMON_PATH)/rootdir/etc/fstab.qcom:$(TARGET_COPY_OUT_VENDOR)/etc/fstab.qcom \
+    $(LINEAGE_COMMON_PATH)/rootdir/etc/fstab.qcom:root/fstab.qcom
 
 # Everything here mirrors the stock build.prop.  Duplicating a few of them in
 # system.prop would be harmless but confusing, so these stay in one place.

@@ -159,12 +159,18 @@ jobs:
           cd "$ROM"
           # Checked before lunch, not after: every one of these has produced a
           # cryptic failure four hours into a build at some point.
-          test -f "device/kyocera/$DEVICE/lineage_$DEVICE.mk"
+          test -f "device/kyocera/$DEVICE/lineage.mk"
           test -f "device/kyocera/$DEVICE/BoardConfig.mk"
           test -f device/kyocera/msm8926-common/lineage-common.mk
           test -f device/kyocera/msm8926-common/system.prop
           test -f device/kyocera/msm8926-common/rootdir/etc/fstab.qcom
           test -f device/kyocera/msm8926-common/bluetooth/bdroid_buildcfg.h
+          # cm-14.1's product_config.mk looks the product up by filename:
+          # brunch/lunch export CM_BUILD and it does
+          #   find device -path "*/$CM_BUILD/lineage.mk"
+          # so the name matters and a rename breaks lunch with "Can not locate
+          # config makefile", not with a missing-file error.
+          grep -q "lineage.mk" "device/kyocera/$DEVICE/AndroidProducts.mk"
 
           P=vendor/kyocera/msm8926-common/proprietary
           test -f "$P/vendor/lib/libril-qc-qmi-1.so"

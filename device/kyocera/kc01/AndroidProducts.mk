@@ -4,7 +4,7 @@
 
 PRODUCT_MAKEFILES := \
     $(LOCAL_DIR)/omni_kc01.mk \
-    $(LOCAL_DIR)/lineage_kc01.mk
+    $(LOCAL_DIR)/lineage.mk
 
 COMMON_LUNCH_CHOICES := \
     omni_kc01-eng \
