@@ -182,6 +182,7 @@ jobs:
         run: |
           set -ex
           cd "$ROM"
+          sudo apt-get install -y gcc-9
           rm -rf "kernel/kyocera/$DEVICE"
           git clone --depth 1 -b cm-14.1 \
             https://github.com/LineageOS/android_kernel_motorola_msm8226.git \
@@ -196,13 +197,11 @@ jobs:
           export ALLOW_MISSING_DEPENDENCIES=true
           export PATH="$PATH:$PWD/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/bin"
           export PATH="$PATH:$PWD/prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin"
-          export HOSTCC=gcc-9
+          # Only the kernel build needs gcc-9 (3.4 host tools do not compile
+          # with gcc 11); it is installed by the step above when asked for.
+          if [ "$BUILD_KERNEL" = "true" ]; then export HOSTCC=gcc-9; fi
           export KYOCERA_BUILD_KERNEL="$BUILD_KERNEL"
           source build/envsetup.sh
-          # lunch() calls roomservice.py, which tries to clone device trees it
-          # thinks are missing.  Ours are already in place, and the script is a
-          # hard build breaker if python2 is absent, so neutralise it.
-          roomservice() { :; }
           lunch "omni_${DEVICE}-eng"
           mka recoveryimage -j"$(nproc --all)"
 
