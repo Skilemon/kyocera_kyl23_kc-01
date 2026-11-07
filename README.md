@@ -43,11 +43,9 @@ kernel-patches/             让京瓷 3.4.0 用 gcc13 编过的补丁
 
 tools/                      按「跑在哪一侧」分组，详见 tools/README.md
 ├── image/                  组装镜像、体检镜像（纯离线，python3 即可）
-├── kernel/                 内核模块源码、DT 提取、aboot 反汇编
-├── device/                 真机操作：DL 串口通道、分区备份/写回、Windows 侧脚本
-├── flash/                  在 TWRP 里跑的小脚本（推 /sdcard 后 sh）
-├── repack/                 写保护镜像的逐版重打包链（wp2 → wp6）
-└── repo/                   仓库自身维护（走 REST 推送）
+├── kernel/                 内核模块：源码、编译、符号修补
+├── device/                 真机操作：DL 模式通道、分区备份/写回
+└── flash/                  在 TWRP 里跑的小脚本（推 /sdcard 后 sh）
 
 docs/
 ├── DEVICE_NOTES.md         实测数据与踩过的坑
@@ -221,7 +219,7 @@ autofix=0`。镜像里**不带** `wp_fix.sh`（CI 只注入 `kc_wp.ko`）；要�
 
 排查「进 recovery 后卡死被看门狗复位」时，加上 `--boot-trace`：它会在挂 `/system` 前后各往 `/cache` 写一份 dmesg，硬复位不丢。见 [docs/DEVICE_NOTES.md](docs/DEVICE_NOTES.md) 第 8 节。
 
-**物理键进不了 recovery，这不是手法问题。** 拆开 `aboot.img` 确认：fastboot 命令表整块没被链接进来，按键分支也是死的，三键只会进安全模式。能用的只有 `adb reboot recovery`，以及往 misc 写 `boot-recovery`（系统还能起来一次时的兜底）。证据链和判定表见 [docs/DEVICE_NOTES.md](docs/DEVICE_NOTES.md) 第 10 节；当初为定位这个问题写的 `tools/device/keytest.ps1 -Mode watch` 仍可用来观察 USB 时间线（`18D1` = recovery，`0482` = 系统，`05C6` = EDL）。
+**物理键进不了 recovery，这不是手法问题。** 拆开 `aboot.img` 确认：fastboot 命令表整块没被链接进来，按键分支也是死的，三键只会进安全模式。能用的只有 `adb reboot recovery`，以及往 misc 写 `boot-recovery`（系统还能起来一次时的兜底）。证据链和判定表见 [docs/DEVICE_NOTES.md](docs/DEVICE_NOTES.md) 第 10 节。
 
 ```bash
 python3 <this-repo>/tools/image/mkhybrid.py ... --boot-trace --out twrp-kyl23-trace.img
