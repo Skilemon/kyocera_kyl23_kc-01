@@ -67,11 +67,8 @@ jobs:
         with:
           path: local
 
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          df -h /
+      - name: Report disk space
+        run: df -h /
 
       - name: Install build dependencies
         run: |
