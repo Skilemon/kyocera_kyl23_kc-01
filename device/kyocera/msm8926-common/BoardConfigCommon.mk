@@ -61,8 +61,19 @@ BOARD_MKBOOTIMG_ARGS := --ramdisk_offset 0x01000000 --second_offset 0x00f00000 -
 # its own dt.img rule.  That rule shells out to $(HOST_OUT)/bin/dtbToolCM and
 # reads DTBs out of $(KERNEL_OUT)/arch/arm/boot - neither exists when we build
 # around a prebuilt kernel, and ninja fails with "missing and no known rule".
+#
+# The value is the *path* to the blob, not "true".  dt_image.mk tests it with
+# `ifeq ($(strip $(BOARD_KERNEL_PREBUILT_DT)),)` and, in the else branch, turns
+# it into a prerequisite:
+#
+#     $(INSTALLED_DTIMAGE_TARGET): $(BOARD_KERNEL_PREBUILT_DT) | $(ACP)
+#
+# so "true" becomes a dependency on a file named "true" and ninja reports
+# `ninja: error: 'true', needed by 'dt.img', missing and no known rule to make
+# it`.  A recovery-only tree never includes dt_image.mk, which is why the TWRP
+# build tolerated it.
 BOARD_KERNEL_SEPARATED_DT := true
-BOARD_KERNEL_PREBUILT_DT := true
+BOARD_KERNEL_PREBUILT_DT := $(DEVICE_COMMON_PATH)/prebuilt/stock/dtb-kyl23.img
 BOARD_DTBTOOL_ARGS :=
 
 # -------------------------------------------------------------- partitions

@@ -58,7 +58,7 @@ jobs:
       ROM: /home/runner/rom
       # A release asset on this same repository, so the workflow needs no
       # secret and the blobs stay out of git history.  See tools/blobs/pack.sh.
-      BLOBS_URL: https://github.com/Skilemon/kyocera_kyl23_kc-01/releases/download/blobs-v1/proprietary.tar.gz
+      BLOBS_URL: https://github.com/Skilemon/kyocera_kyl23_kc-01/releases/download/blobs-v2/proprietary-v2.tar.gz
 
     steps:
       - name: Checkout device tree

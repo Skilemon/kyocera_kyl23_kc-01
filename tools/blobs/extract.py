@@ -100,9 +100,17 @@ drmdiagapp
 # they load.  These stay in system/etc on purpose: the vendor libraries are
 # 4.4 binaries with 4.4 path assumptions baked in, and /system/etc is the one
 # location that means the same thing in both trees.
+#
+# "security" is deliberately absent.  It holds the 156 CA certificates, the
+# otacerts bundle and mac_permissions.xml from 4.4, and all three are generated
+# by the 7.1 tree from its own sources.  Copying the 4.4 versions over them
+# reinstates a 2013-era trust store (including CAs that were later removed for
+# issuing bad certificates) and replaces the 7.1 signature-permission map with
+# one that predates it.  The build even says so, once per file:
+#     warning: overriding commands for target '.../system/etc/security/cacerts/bf64f35b.0'
 ETC_DIRS = [
     "acdbdata", "bluetooth", "firmware", "hostapd", "permissions",
-    "ppp", "security", "wifi", "dhcpcd", "nfc",
+    "ppp", "wifi", "dhcpcd", "nfc",
 ]
 ETC_FILES = """
 audio_effects.conf audio_policy.conf mixer_paths.xml
