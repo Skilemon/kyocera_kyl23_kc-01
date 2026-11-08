@@ -249,7 +249,13 @@ jobs:
           # last one).  Build it up front: it takes a couple of minutes, and
           # failing here is a lot cheaper than failing at 37% of bacon an hour
           # from now.  Everything built here is reused by bacon.
-          mka libqdutils liboverlay libhwcomposer libgralloc libqservice \
+          #
+          # Names have to be exact - ninja rejects the whole invocation on one
+          # unknown target.  There is no libgralloc here: gralloc's Android.mk
+          # names the module gralloc.$(TARGET_BOARD_PLATFORM) (msm8226) and
+          # calls its helper libmemalloc.
+          mka libqdutils liboverlay libhwcomposer libqservice libmemalloc \
+              "gralloc.$(get_build_var TARGET_BOARD_PLATFORM)" \
               -j"$(nproc --all)"
 
           # The build prints its own progress; -j is capped at the runner's
