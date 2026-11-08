@@ -148,7 +148,21 @@ jobs:
           # The proprietary files are a release asset, not part of the repo:
           # 74 MB of binaries would bloat every clone and are not ours to
           # redistribute.
-          curl -fL --retry 3 "$BLOBS_URL" -o /tmp/proprietary.tar.gz
+          # The release download goes through GitHub's CDN, which does answer
+          # 504 now and then: the kyl23 job lost a whole run to four 504s in a
+          # row, before anything was built.  Retry until it lands rather than
+          # for a fixed three attempts, and prove the archive is readable
+          # before handing it to tar.
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if curl -fL --retry 5 --retry-all-errors --retry-delay 5 \
+                     --connect-timeout 30 "$BLOBS_URL" -o /tmp/proprietary.tar.gz; then
+              break
+            fi
+            echo "download attempt $attempt failed, retrying" >&2
+            sleep $((attempt * 10))
+          done
+          test -s /tmp/proprietary.tar.gz
+          tar -tzf /tmp/proprietary.tar.gz >/dev/null
           tar -xzf /tmp/proprietary.tar.gz -C vendor/kyocera/msm8926-common/
 
           # Six files come out of the stock image unreadable by anyone but
