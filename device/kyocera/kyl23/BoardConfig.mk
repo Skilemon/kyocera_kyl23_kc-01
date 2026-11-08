@@ -8,4 +8,6 @@
 include device/kyocera/msm8926-common/BoardConfigCommon.mk
 
 # -------------------------------------------------------------------- disk
-TARGET_RECOVERY_FSTAB := device/kyocera/msm8926-common/recovery.fstab
+# TARGET_RECOVERY_FSTAB is set in BoardConfigCommon.mk, which picks between the
+# TWRP and the LineageOS fstab by product name.  Do not set it here: an
+# unconditional assignment would undo that choice.

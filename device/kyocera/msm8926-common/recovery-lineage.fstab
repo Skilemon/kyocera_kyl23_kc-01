@@ -1,0 +1,36 @@
+#
+# Recovery fstab - Android 7.1 flavour, for the LineageOS build only.
+#
+# Same partitions as recovery.fstab next to it, but in the unified (version 2)
+# format: <src> <mnt_point> <type> <mnt_flags and options> <fs_mgr_flags>.
+# The two files exist because seven's releasetools insists on that format -
+# it parses with fstab_version 2 and needs exactly five columns - while TWRP
+# reads the four-column version 1 file with its flags= column, and both trees
+# take the path from TARGET_RECOVERY_FSTAB.  BoardConfigCommon.mk picks by
+# product: lineage_* gets this file, everything else keeps recovery.fstab.
+#
+# (Version 1 is not an option for the ROM build even though the file exists:
+# common.py's LoadRecoveryFSTab version 1 branch constructs Partition() without
+# the `context` argument that the class requires, so it raises TypeError before
+# it can parse a single line.)
+#
+# /boot, /recovery and /misc stay listed because make_recovery_patch looks the
+# boot image up by mount point when it builds recovery-from-boot.p.
+#
+# WARNING: /persist, /modem, /carrier and /sysprop hold per-unit factory data
+# (RF calibration, IMEI-related blobs, carrier config).  Mount them, read them,
+# but never format or restore them from another unit.
+#
+#<src>                                                  <mnt_point>    <type>  <mnt_flags and options>                          <fs_mgr_flags>
+/dev/block/platform/msm_sdcc.1/by-name/boot             /boot          emmc    defaults                                         defaults
+/dev/block/platform/msm_sdcc.1/by-name/recovery         /recovery      emmc    defaults                                         defaults
+/dev/block/platform/msm_sdcc.1/by-name/misc             /misc          emmc    defaults                                         defaults
+/dev/block/platform/msm_sdcc.1/by-name/system           /system        ext4    ro,barrier=1                                     wait
+/dev/block/platform/msm_sdcc.1/by-name/cache            /cache         ext4    nosuid,nodev,noatime,barrier=1,noauto_da_alloc   wait,check
+/dev/block/platform/msm_sdcc.1/by-name/userdata         /data          ext4    nosuid,nodev,barrier=1,noauto_da_alloc           wait,check,encryptable=/persist/udf
+/dev/block/platform/msm_sdcc.1/by-name/persist          /persist       ext4    nosuid,nodev,barrier=1                           wait,check
+/dev/block/platform/msm_sdcc.1/by-name/carrier          /carrier       ext4    nosuid,nodev,barrier=1                           wait,check
+/dev/block/platform/msm_sdcc.1/by-name/sysprop          /sysprop       ext4    nosuid,nodev,barrier=1,noauto_da_alloc,data=journal  wait,check
+/dev/block/platform/msm_sdcc.1/by-name/modem            /firmware      vfat    ro,shortname=lower,uid=1000,gid=1026,dmask=0227,fmask=0337  wait
+/devices/msm_sdcc.2/mmc_host                            /external_sd   vfat    nosuid,nodev                                     wait,voldmanaged=sdcard1:auto
+/devices/platform/msm_hsusb_host/usb                    /usb-otg       vfat    nosuid,nodev                                     wait,voldmanaged=usb:auto

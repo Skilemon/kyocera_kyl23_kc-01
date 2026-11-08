@@ -1,10 +1,16 @@
 # TWRP recovery.fstab - Kyocera msm8926 family (KC-01 / KYL23)
 #
+# This is the tree's *version 1* fstab: <mount point> <fstype> <device>
+# <flags=...>.  The LineageOS build cannot use it - seven's releasetools
+# treats fstab_version 2 as the only real format and its version 1 branch is
+# broken (common.py's Partition() gained a `context` argument that branch
+# never passes) - so the ROM gets recovery-lineage.fstab instead and
+# BoardConfigCommon.mk picks between the two by product name.  Keep this file
+# four-column; TWRP is the only reader.
+#
 # Derived from the fstab that ships inside the STOCK recovery ramdisk
 # (etc/recovery.fstab and fstab.qcom), plus /carrier which is present on
 # the device but missing from the stock recovery table.
-#
-# Device layout is <mount point> <fstype> <device> <flags>.
 #
 # WARNING: /persist, /modem, /carrier and /sysprop hold per-unit factory
 # data (RF calibration, IMEI-related blobs, carrier config).  They are

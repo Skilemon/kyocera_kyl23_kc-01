@@ -105,6 +105,22 @@ TARGET_RECOVERY_PIXEL_FORMAT := "RGBX_8888"
 TARGET_USERIMAGES_USE_EXT4 := true
 TARGET_RECOVERY_FSTAB := $(DEVICE_COMMON_PATH)/recovery.fstab
 RECOVERY_FSTAB_VERSION := 2
+
+# Two fstabs, because seven's releasetools only reads the unified format and
+# TWRP only reads the flags= one.  Its version 1 branch is not usable either:
+# common.py builds Partition() there without the `context` argument the class
+# requires, so it raises TypeError on the first line.  Same variable, so pick
+# by product; omni (TWRP) is everything that is not lineage.
+#
+# Without this the build dies at 99%, in make_recovery_patch:
+#
+#   ValueError: malformed recovery.fstab line: "/boot  emmc
+#   /dev/block/platform/msm_sdcc.1/by-name/boot  flags=backup=1;flashimg=1"
+#
+# because a version 2 parser wants five columns and that line has four.
+ifneq ($(filter lineage_%,$(TARGET_PRODUCT)),)
+TARGET_RECOVERY_FSTAB := $(DEVICE_COMMON_PATH)/recovery-lineage.fstab
+endif
 BOARD_HAS_NO_SELECT_BUTTON := true
 BOARD_RECOVERY_SWIPE := true
 LZMA_RAMDISK_TARGETS := recovery
