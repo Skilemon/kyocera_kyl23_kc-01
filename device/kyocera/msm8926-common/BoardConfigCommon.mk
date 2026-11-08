@@ -49,6 +49,21 @@ TARGET_PREBUILT_KERNEL := $(DEVICE_COMMON_PATH)/prebuilt/kernel
 BOARD_KERNEL_BASE := 0x00000000
 BOARD_KERNEL_PAGESIZE := 2048
 BOARD_KERNEL_CMDLINE := console=ttyHSL0,115200,n8 no_console_suspend=1 androidboot.console=ttyHSL0 androidboot.hardware=qcom user_debug=31 msm_rtb.filter=0x37
+
+# SELinux is permissive for now, and deliberately so.
+#
+# The kernel is built with CONFIG_SECURITY_SELINUX=y, so init enforces unless
+# told otherwise, and enforcement here would stop the boot in the first second:
+# the device has exactly one policy addition (sepolicy/te/placeholder.te) while
+# the vendor tree ships a dozen Kyocera daemons with no domains of their own,
+# plus two partitions (/sysprop, /pstore) no other msm8226 device has.  An
+# enforcing boot would be a stream of avc denials against services that then
+# die, and the phone would never reach the launcher.
+#
+# Permissive keeps every denial in the log, which is where the policy has to be
+# written from anyway.  Flip this to "enforcing" once `dmesg | grep avc` is
+# quiet during a full boot, a camera session and a call.
+BOARD_KERNEL_CMDLINE += androidboot.selinux=permissive
 BOARD_MKBOOTIMG_ARGS := --ramdisk_offset 0x01000000 --second_offset 0x00f00000 --tags_offset 0x00000100
 
 # The device tree is appended to the image as a Qualcomm QCDT blob.  It is

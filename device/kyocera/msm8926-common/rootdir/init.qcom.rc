@@ -1,0 +1,215 @@
+#
+# Board init - Kyocera msm8926 family (KC-01 / KYV36, miraie KYL23)
+#
+# Android 7.1 has no default board init: system/core/rootdir/init.rc only does
+# `import /init.${ro.hardware}.rc`, and ro.hardware is "qcom" because that is
+# what the kernel command line says.  Without this file nothing ever runs
+# `mount_all`, /system never gets mounted, and the boot stops before a single
+# line reaches the log -- the screen stays on the boot logo and adb never
+# appears, which looks exactly like a kernel problem and is not one.
+#
+# The stock 4.4.4 ramdisk carried init.qcom.rc, init.target.rc and
+# init.kc.cust.rc; those were read out of the factory boot.img and folded into
+# this one file.  What did not survive the port:
+#
+#   * everything 4.4 spelled as a filesystem mount - the fstab owns that now,
+#     and 7.1's mount_all is the only supported way to do it
+#   * the dhcpcd / sdcard / wpa_supplicant services - 7.1 ships its own, with
+#     different arguments, in /etc/init
+#   * the debugging and factory-test services (diag_mdlog, fastmmi, qlogd,
+#     rootagent, fbfm) - they need binaries and properties the ROM does not
+#     have, and a service that cannot exec is just log noise
+#
+# Everything below was checked against the binaries actually present in
+# system.img; a service pointing at a missing binary fails to start and is
+# worse than no service at all.
+#
+
+# ------------------------------------------------------------------ boot order
+on early-init
+    # The modem image is mounted here; qcril opens /firmware/image/* directly.
+    mkdir /firmware 0771 system system
+
+    # Stock kept kernel panics and modem dumps on the data partition.  Keep the
+    # path so a crash still produces something readable.
+    symlink /data/tombstones /tombstones
+
+on fs
+    # One call, every filesystem: 7.1's fs_mgr walks /fstab.qcom in order and
+    # honours the "wait" flag on each entry.  system comes first in that file
+    # for exactly this reason -- exec of /system/bin/* has to work before the
+    # rest of init's actions run.
+    mount_all /fstab.qcom
+
+on post-fs
+    # /sysprop holds the factory RF calibration the radio reads at startup.  It
+    # is mounted read-write by the fstab (the modem writes its own copy back on
+    # first attach), but only root may look at it.
+    chown root root /sysprop
+    chmod 0770 /sysprop
+
+    # Same for /pstore: root only, but the kernel needs to keep writing there.
+    chown root root /pstore
+    chmod 0771 /pstore
+
+on post-fs-data
+    # Directories the qcom daemons expect and that AOSP's init.rc does not
+    # create.  A missing one is not fatal, it just makes the daemon fail late
+    # and quietly.
+    mkdir /data/misc/wifi 0770 wifi wifi
+    mkdir /data/misc/wifi/sockets 0770 wifi wifi
+    mkdir /data/misc/wifi/wpa_supplicant 0770 wifi wifi
+    mkdir /data/vendor 0771 system system
+    mkdir /data/connectivity 0771 system system
+    mkdir /data/connectivity/nsrm 0771 system system
+    mkdir /data/misc/gpsone_d 0770 system gps
+    mkdir /data/misc/quipc 0770 gps system
+    mkdir /data/misc/location 0770 gps gps
+    mkdir /data/misc/location/mq 0770 gps gps
+    mkdir /data/misc/location/xtwifi 0770 gps gps
+    mkdir /data/time 0700 system system
+    mkdir /data/nfc 0770 nfc nfc
+    mkdir /data/nfc/param 0770 nfc nfc
+
+    # The persist partition carries the sensor and RF calibration blobs.  Stock
+    # chowns it here because the mount itself runs as root with default modes.
+    chown system system /persist
+    chmod 0771 /persist
+
+on boot
+    # ---------------------------------------------------------- bluetooth UART
+    # hci_uart talks to the Broadcom part over ttyHS0; nothing else may open it.
+    chown bluetooth bluetooth /dev/ttyHS0
+    chmod 0660 /dev/ttyHS0
+    chown bluetooth bluetooth /sys/module/hci_uart/parameters/ath_lpm
+    chmod 0660 /sys/module/hci_uart/parameters/ath_lpm
+    chown bluetooth bluetooth /sys/module/hci_uart/parameters/ath_btwrite
+    chmod 0660 /sys/module/hci_uart/parameters/ath_btwrite
+    chown bluetooth bluetooth /sys/class/rfkill/rfkill0/state
+    chmod 0660 /sys/class/rfkill/rfkill0/state
+    chown bluetooth bluetooth /sys/class/rfkill/rfkill0/type
+
+    # ------------------------------------------------------------ QMUX sockets
+    # uimd and the qmi stack find each other through these; qmuxd creates the
+    # sockets themselves, the directories have to exist first.
+    mkdir /dev/socket/qmux_radio 0770 radio radio
+    chmod 2770 /dev/socket/qmux_radio
+    mkdir /dev/socket/qmux_audio 0770 media audio
+    chmod 2770 /dev/socket/qmux_audio
+    mkdir /dev/socket/qmux_bluetooth 0770 bluetooth bluetooth
+    chmod 2770 /dev/socket/qmux_bluetooth
+    mkdir /dev/socket/qmux_gps 0770 gps gps
+    chmod 2770 /dev/socket/qmux_gps
+
+    # --------------------------------------------------------------- networking
+    # 4.4 tuned these in init; 7.1 sets none of them and the au network needs
+    # the EVDO/LTE windows to match what the radio advertises.
+    write /proc/sys/net/core/rmem_max 2097152
+    write /proc/sys/net/core/wmem_max 2097152
+    setprop net.tcp.buffersize.default 4096,87380,110208,4096,16384,110208
+    setprop net.tcp.buffersize.evdo 4096,87380,129720,4096,24576,110208
+    setprop net.tcp.buffersize.evdo_b 327336,327336,524400,4096,65536,262144
+    setprop net.tcp.buffersize.ehrpd 327336,327336,524400,4096,65536,262144
+    setprop net.tcp.buffersize.lte 524288,1048576,1573200,262144,524288,1048576
+
+    # -------------------------------------------------------------- filesystem
+    # Kyocera's battery/charger logger and the two vendor scripts that must not
+    # be world-writable.
+    chmod 0700 /system/vendor/etc/KyoceraNfc/KyoceraNfc.sh
+    chmod 0700 /system/vendor/etc/wlan/Wifi_Mac_Set.sh
+
+    # Quiet the kernel log down to KERN_INFO once userspace is up.
+    write /proc/sys/kernel/printk "6 6 1 7"
+
+    # WCNSS restarts itself on a watchdog bite instead of taking the phone down.
+    setprop persist.sys.ssr.restart_level wcnss
+
+# ------------------------------------------------------------------- services
+#
+# Only the daemons the radio and the camera actually need are started here.
+# Everything else the vendor ships (diag loggers, factory tests, kdfs, kerrd)
+# stays off; it can be enabled one at a time once the base system is known to
+# boot.
+
+service qmuxd /system/bin/qmuxd
+    class main
+    user radio
+    group radio audio bluetooth gps qcom_diag
+    socket qmuxd stream 0660 radio radio
+
+service netmgrd /system/bin/netmgrd
+    class main
+    user root
+    group radio
+
+# AT command bridge, used by the au network for the non-QMI paths (SMS over
+# AT, the SIM toolkit).  It attaches to the same smd channel rild uses and
+# stays idle until something asks it for a session.
+service qmiproxy /system/bin/qmiproxy
+    class main
+    user radio
+    group radio qcom_diag
+    disabled
+
+service sensors /system/bin/sensors.qcom
+    class late_start
+    user root
+    group root
+
+# mm-qcamera-daemon owns the ISP; the camera HAL in liboemcamera talks to it
+# over /dev/socket.  Without it CameraService opens the device and times out.
+service qcamerasvr /system/bin/mm-qcamera-daemon
+    class late_start
+    user camera
+    group camera system inet input graphics
+
+service thermal-engine /system/bin/thermal-engine
+    class main
+    user root
+    group root
+
+service mpdecision /system/bin/mpdecision --avg_comp
+    class main
+    user root
+    group root
+
+service qseecomd /system/bin/qseecomd
+    class core
+    user root
+    group root
+
+service irsc_util /system/bin/logwrapper /system/bin/irsc_util "/etc/sec_config"
+    class main
+    user root
+    oneshot
+
+service rmt_storage /system/bin/rmt_storage
+    class core
+    user root
+    disabled
+
+on property:ro.boot.emmc=true
+    start rmt_storage
+
+service time_daemon /system/bin/time_daemon
+    class late_start
+    user root
+    group root
+
+service adsprpcd /system/bin/adsprpcd
+    class main
+    user media
+    group media
+
+# ------------------------------------------------------------------- Kyocera
+# uimd is the au UIM (SIM) daemon: qcril's CDMA path reads the card through its
+# socket rather than through the modem, so RIL comes up without a SIM but never
+# registers without this.  lkspad is the keypad/LED pad controller.
+service uimd /system/bin/uimd
+    class core
+    socket uimd stream 0666 system system
+
+service lkspad /system/bin/lkspad
+    class core
+    user root
+    group root

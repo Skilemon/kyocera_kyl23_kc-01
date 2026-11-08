@@ -46,6 +46,15 @@ PRODUCT_COPY_FILES += \
     $(LINEAGE_COMMON_PATH)/rootdir/etc/fstab.qcom:$(TARGET_COPY_OUT_VENDOR)/etc/fstab.qcom \
     $(LINEAGE_COMMON_PATH)/rootdir/etc/fstab.qcom:root/fstab.qcom
 
+# The two files init looks for by name.  7.1's own init.rc only does
+# `import /init.${ro.hardware}.rc` and leaves the mounting to the board file --
+# there is no fallback, so a missing init.qcom.rc means no mount_all, no
+# /system, and a phone that sits on the boot logo with nothing in the log.
+# ueventd.cpp looks for /ueventd.${ro.hardware}.rc in the same way.
+PRODUCT_COPY_FILES += \
+    $(LINEAGE_COMMON_PATH)/rootdir/init.qcom.rc:root/init.qcom.rc \
+    $(LINEAGE_COMMON_PATH)/rootdir/ueventd.qcom.rc:root/ueventd.qcom.rc
+
 # Everything here mirrors the stock build.prop.  Duplicating a few of them in
 # system.prop would be harmless but confusing, so these stay in one place.
 PRODUCT_PROPERTY_OVERRIDES += \
