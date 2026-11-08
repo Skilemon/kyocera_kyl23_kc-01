@@ -153,6 +153,21 @@ jobs:
           du -sh vendor/kyocera/msm8926-common/proprietary
           find device/kyocera -maxdepth 2 -type f | sort
 
+      - name: Patch the synced sources
+        run: |
+          set -ex
+          cd "$ROM"
+          # A few files in cm-14.1 are written against CAF kernels that this
+          # device's 3.4 tree forked away from.  The patches live in the device
+          # tree so they are reviewable and reproducible; patching from a YAML
+          # heredoc would bury the one thing that matters in a sea of quoting.
+          # Applying them right after sync also means a stale patch fails in
+          # seconds rather than an hour into bacon.
+          for p in "$GITHUB_WORKSPACE/local/device/kyocera/msm8926-common/patches"/*.patch; do
+            echo "applying $(basename "$p")"
+            patch -p1 --forward --batch < "$p"
+          done
+
       - name: Check the inputs
         run: |
           set -ex
