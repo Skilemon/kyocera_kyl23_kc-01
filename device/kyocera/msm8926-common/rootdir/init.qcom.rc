@@ -77,6 +77,13 @@ on post-fs-data
     chmod 0771 /persist
 
 on boot
+    # --------------------------------------------------------------- bring-up
+    # The tree ships persist.sys.usb.config=none, which init.usb.rc turns into
+    # `stop adbd`.  Setting the function here as well means the port comes up
+    # even if the property file disagrees, and this is one less way to end up
+    # with a phone that boots to a black screen and says nothing.
+    setprop sys.usb.config adb
+
     # ---------------------------------------------------------- bluetooth UART
     # hci_uart talks to the Broadcom part over ttyHS0; nothing else may open it.
     chown bluetooth bluetooth /dev/ttyHS0
