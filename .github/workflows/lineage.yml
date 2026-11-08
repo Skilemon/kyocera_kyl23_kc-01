@@ -243,6 +243,15 @@ jobs:
           # and afterwards bacon finds the files already there.
           mka org.cyanogenmod.platform-res -j"$(nproc --all)"
 
+          # The display HAL is the one place where a 7.1 userspace meets the
+          # kernel headers shipped in prebuilt/kernel-headers.tar.gz, so it is
+          # where an ABI mismatch shows up first (MDP_SMP_FORCE_ALLOC was the
+          # last one).  Build it up front: it takes a couple of minutes, and
+          # failing here is a lot cheaper than failing at 37% of bacon an hour
+          # from now.  Everything built here is reused by bacon.
+          mka libqdutils liboverlay libhwcomposer libgralloc libqservice \
+              -j"$(nproc --all)"
+
           # The build prints its own progress; -j is capped at the runner's
           # core count by soong anyway.
           mka bacon -j"$(nproc --all)"
