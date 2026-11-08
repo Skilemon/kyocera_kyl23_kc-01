@@ -65,20 +65,19 @@ BOARD_KERNEL_CMDLINE := console=ttyHSL0,115200,n8 no_console_suspend=1 androidbo
 # quiet during a full boot, a camera session and a call.
 BOARD_KERNEL_CMDLINE += androidboot.selinux=permissive
 
-# Bring-up adb, set here rather than in a product makefile because this is a
-# board variable: build/core/sysprop.mk writes ADDITIONAL_DEFAULT_PROPERTIES
-# into the ramdisk's default.prop, and a product-level assignment lands in a
-# different file that load_system_props() reads later.
+# Bring-up adb.  The tree defaults this device to persist.sys.usb.config=none
+# and init.usb.rc answers that with `stop adbd`, so a boot that hangs before the
+# launcher has no adb at all -- and that is the one boot whose log matters.
 #
-# The tree defaults this device to persist.sys.usb.config=none, and
-# init.usb.rc answers that with `stop adbd` -- a boot that hangs before the
-# launcher would have no adb at all, so the only way to find out why would be
-# to boot TWRP and guess.  ro.adb.secure=0 also drops the on-device "allow USB
-# debugging" prompt, which is unanswerable on a black screen.
+# ro.adb.secure is deliberately *not* set here.  The build system appends its
+# own value to ADDITIONAL_DEFAULT_PROPERTIES after the product's, and ro.* is
+# write-once: whichever line is written first into default.prop wins, so a
+# product-level ro.adb.secure=0 is silently ignored (verified: the built
+# default.prop still says 1).  Authorisation is bypassed with a shipped public
+# key in /adb_keys instead; see lineage-common.mk.
 #
-# Revert both (none / 1) before this image is used for anything but bring-up:
-# together they hand a root shell to anything that plugs in a cable.
-ADDITIONAL_DEFAULT_PROPERTIES += persist.sys.usb.config=adb ro.adb.secure=0
+# Revert to none before this image is used for anything but bring-up.
+ADDITIONAL_DEFAULT_PROPERTIES += persist.sys.usb.config=adb
 BOARD_MKBOOTIMG_ARGS := --ramdisk_offset 0x01000000 --second_offset 0x00f00000 --tags_offset 0x00000100
 
 # The device tree is appended to the image as a Qualcomm QCDT blob.  It is

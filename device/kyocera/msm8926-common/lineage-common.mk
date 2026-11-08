@@ -55,6 +55,18 @@ PRODUCT_COPY_FILES += \
     $(LINEAGE_COMMON_PATH)/rootdir/init.qcom.rc:root/init.qcom.rc \
     $(LINEAGE_COMMON_PATH)/rootdir/ueventd.qcom.rc:root/ueventd.qcom.rc
 
+# adbd will not hand out a shell until it has an authorised key, and the dialog
+# that authorises one needs a screen that works -- precisely what is missing
+# when the boot hangs.  adbd checks /adb_keys in the ramdisk before it looks at
+# /data/misc/adb/adb_keys (key_paths[] in adb_auth_client.cpp), so shipping a
+# known public key here makes the device reachable from a black screen.
+#
+# This is a bring-up crutch: anyone holding the matching private key gets a
+# root shell.  Delete both this rule and rootdir/adb_keys before the image is
+# used for anything real.
+PRODUCT_COPY_FILES += \
+    $(LINEAGE_COMMON_PATH)/rootdir/adb_keys:root/adb_keys
+
 # Everything here mirrors the stock build.prop.  Duplicating a few of them in
 # system.prop would be harmless but confusing, so these stay in one place.
 PRODUCT_PROPERTY_OVERRIDES += \
