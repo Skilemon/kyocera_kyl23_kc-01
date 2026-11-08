@@ -233,11 +233,35 @@ def vendor_closure(sysroot):
     return out
 
 
+def device_mode(src_mode):
+    """Turn a stock mode into one a build can read and a device can still use.
+
+    Six files in the stock image are unreadable by anyone but root, and one of
+    them -- vendor/bin/akscd -- is 0000, which even root cannot execute:
+
+        0000  vendor/bin/akscd              (Kyocera's signature daemon)
+        0700  vendor/bin/kcjprop_daemon, vendor/bin/lkspad
+        0400  vendor/etc/ps_ro.dat, ps_rw.dat
+        0550  system/etc/dhcpcd/dhcpcd-run-hooks
+
+    Copying those modes verbatim broke the CI build at 97%: acp runs as the
+    runner, not as root, and died on the first one with
+
+        acp: unable to open '.../proprietary/vendor/bin/akscd': Permission denied
+
+    So grant read to everyone, keep the executable bit where the stock file
+    already had it, and drop it where it did not.  akscd ending up non-
+    executable matches stock: nothing can execute a 0000 file, and the reason
+    it is 0000 is that Kyocera disabled it.
+    """
+    return 0o755 if src_mode & 0o111 else 0o644
+
+
 def copy(src, dst, mode=None):
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copyfile(src, dst)
     st = os.stat(src)
-    os.chmod(dst, mode if mode is not None else (st.st_mode & 0o777))
+    os.chmod(dst, mode if mode is not None else device_mode(st.st_mode))
     return os.path.getsize(dst)
 
 

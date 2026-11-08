@@ -150,6 +150,19 @@ jobs:
           # redistribute.
           curl -fL --retry 3 "$BLOBS_URL" -o /tmp/proprietary.tar.gz
           tar -xzf /tmp/proprietary.tar.gz -C vendor/kyocera/msm8926-common/
+
+          # Six files come out of the stock image unreadable by anyone but
+          # root, and acp runs as the runner:
+          #
+          #   acp: unable to open '.../proprietary/vendor/bin/akscd':
+          #   Permission denied
+          #
+          # (akscd is mode 0000 in stock, kcjprop_daemon and lkspad 0700,
+          # ps_ro.dat and ps_rw.dat 0400, dhcpcd-run-hooks 0550.)  a+rX adds
+          # read for everyone and an exec bit only where one already exists,
+          # so akscd stays the non-executable file Kyocera made it.
+          chmod -R a+rX,u+w vendor/kyocera/msm8926-common/proprietary
+
           du -sh vendor/kyocera/msm8926-common/proprietary
           find device/kyocera -maxdepth 2 -type f | sort
 
