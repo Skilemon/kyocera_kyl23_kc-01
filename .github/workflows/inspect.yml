@@ -40,7 +40,8 @@ jobs:
           echo "artifact id $aid"
           gh api "repos/${{ github.repository }}/actions/artifacts/$aid/zip" > pkg.zip
           ls -l pkg.zip
-          mkdir -p pkg && cd pkg
+          mkdir -p pkg
+          cd pkg
           unzip -q ../pkg.zip
           ls -l
 
@@ -53,14 +54,11 @@ jobs:
           ls -l "$ZIP"
           sha256sum "$ZIP"
           md5sum "$ZIP"
-          echo
           echo "### entries that matter"
-          unzip -l "$ZIP" | awk 'NR>3' | head -60
-          echo
+          unzip -l "$ZIP" | head -40
           echo "### signature"
           unzip -l "$ZIP" | grep -E 'META-INF/' || echo "NO META-INF"
-          echo
-          echo "### updater"
+          echo "### updater-script"
           unzip -p "$ZIP" META-INF/com/google/android/updater-script | head -40 || true
 
       - name: Unpack boot.img
@@ -73,38 +71,30 @@ jobs:
           import struct
           d = open("boot.img", "rb").read()
           f = lambda o: struct.unpack_from("<I", d, o)[0]
-          print("magic      ", d[:8])
-          print("kernel_size", f(8), "kernel_addr", hex(f(12)))
-          print("ramdisk    ", f(16), "addr", hex(f(20)))
-          print("second     ", f(24))
-          print("tags_addr  ", hex(f(28)))
-          print("page_size  ", f(36))
-          print("dt_size    ", f(40) if len(d) > 44 else 0)
+          print("magic       ", d[:8])
+          print("kernel_size ", f(8), "kernel_addr", hex(f(12)))
+          print("ramdisk_size", f(16), "addr", hex(f(20)))
+          print("second_size ", f(24))
+          print("tags_addr   ", hex(f(28)))
+          print("page_size   ", f(36))
+          print("dt_size     ", f(40) if len(d) > 44 else 0)
           ks, rs, ps = f(8), f(16), f(36)
           open("kernel.zImage", "wb").write(d[ps:ps+ks])
-          open("ramdisk.gz", "wb").write(d[ps+((ks+ps-1)//ps)*ps:][:rs])
-          cmd_end = d.find(b"\0", 608)
-          print("cmdline    ", d[608:cmd_end].decode(errors="replace"))
+          start = ps + ((ks + ps - 1) // ps) * ps
+          open("ramdisk.gz", "wb").write(d[start:start+rs])
+          end = d.find(b"\0", 608)
+          print("cmdline     ", d[608:end].decode(errors="replace"))
           PY
-          echo
-          echo "### ramdisk"
-          mkdir -p rd && cd rd
-          if file ../ramdisk.gz | grep -qi gzip; then
-            gzip -dc ../ramdisk.gz | cpio -idm --quiet
-          else
-            # gzip -9 header is sometimes stripped; try the kernel's zlib anyway
-            python3 -c "
-import zlib,sys
-d=zlib.decompressobj(16+zlib.MAX_WBITS).decompress(open('../ramdisk.gz','rb').read())
-sys.stdout.buffer.write(d)" | cpio -idm --quiet
-          fi
-          find . -type f | sort | head -80
-          echo
-          echo "### default.prop"
+          mkdir -p rd
+          cd rd
+          gzip -dc ../ramdisk.gz | cpio -idm --quiet 2>/dev/null || \
+            python3 -c "import zlib,sys;sys.stdout.buffer.write(zlib.decompress(open('../ramdisk.gz','rb').read(),16+zlib.MAX_WBITS))" | cpio -idm --quiet
+          echo "### ramdisk files"
+          find . -type f | sort | head -100
+          echo "### prop.default"
           cat prop.default 2>/dev/null || cat default.prop 2>/dev/null || echo none
-          echo
-          echo "### init.rc: vendor and selinux lines"
-          grep -nE "vendor|selinux|mount|symlink" init.rc | head -40 || true
+          echo "### init.rc vendor / selinux / mount lines"
+          grep -nE "vendor|selinux|symlink|mount " init.rc 2>/dev/null | head -50 || true
 
       - name: Unpack the system image
         run: |
@@ -112,47 +102,38 @@ sys.stdout.buffer.write(d)" | cpio -idm --quiet
           cd pkg
           ZIP=$(ls lineage-14.1-*.zip | head -1)
           unzip -o -q "$ZIP" system.new.dat system.transfer.list
-          pip install --quiet sdat2img || pip install --quiet git+https://github.com/xpirt/sdat2img
-          python3 -c "import sdat2img" 2>/dev/null || {
+          pip3 install --quiet sdat2img || true
+          if [ ! -f sdat2img.py ]; then
             curl -sSLo sdat2img.py https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
-            sed -i 's/^#!/#!/usr/bin/env python3/' sdat2img.py
-          }
-          [ -f sdat2img.py ] && python3 sdat2img.py system.transfer.list system.new.dat system.img \
-                             || python3 -m sdat2img system.transfer.list system.new.dat system.img
+            sed -i '1s|.*|#!/usr/bin/env python3|' sdat2img.py
+          fi
+          python3 sdat2img.py system.transfer.list system.new.dat system.img
           ls -l system.img
           sudo mkdir -p /mnt/sys
           sudo mount -o loop,ro system.img /mnt/sys
           echo "### top level"
-          ls -la /mnt/sys | head -30
-          echo
+          ls -la /mnt/sys | head -40
           echo "### /vendor"
-          ls -la /mnt/sys/vendor 2>/dev/null | head -10 || echo "NO /vendor IN SYSTEM"
-          echo
+          ls -la /mnt/sys/vendor 2>/dev/null | head -15 || echo "NO /vendor IN SYSTEM"
           echo "### key blobs"
-          for f in vendor/lib/libril-qc-qmi-1.so vendor/bin/rild vendor/lib/hw/camera.msm8226.so \
-                   vendor/lib/liboemcamera.so lib/libreference-ril.so bin/rild \
-                   etc/permissions/qcrilhook.xml etc/init/rild.rc; do
+          for f in vendor/lib/libril-qc-qmi-1.so vendor/bin/rild vendor/lib/hw/camera.msm8226.so vendor/lib/liboemcamera.so lib/libreference-ril.so bin/rild etc/permissions/qcrilhook.xml etc/init/rild.rc; do
             if [ -e "/mnt/sys/$f" ]; then echo "ok   $f"; else echo "MISS $f"; fi
           done
-          echo
           echo "### build.prop"
-          cat /mnt/sys/build.prop | head -60
-          echo
+          head -70 /mnt/sys/build.prop
           echo "### init rc files"
-          ls /mnt/sys/etc/init/ | head -40
-          echo
+          ls /mnt/sys/etc/init/ 2>/dev/null | head -40
           echo "### sepolicy"
           ls -l /mnt/sys/etc/selinux/ 2>/dev/null
-          echo
           echo "### fstab"
-          cat /mnt/sys/etc/fstab.qcom 2>/dev/null || ls /mnt/sys/etc | grep -i fstab
+          cat /mnt/sys/etc/fstab.qcom 2>/dev/null || ls /mnt/sys/etc | grep -i fstab || true
 
       - name: Collect a small report
         if: always()
         run: |
           set -euo pipefail
           mkdir -p report
-          find /mnt/sys -maxdepth 2 2>/dev/null | head -200 > report/system_top.txt || true
+          find /mnt/sys -maxdepth 2 2>/dev/null | head -300 > report/system_top.txt || true
           ls -l /mnt/sys/vendor/lib 2>/dev/null > report/vendor_lib.txt || true
           cat /mnt/sys/build.prop > report/build.prop 2>/dev/null || true
           cp pkg/boot.img report/ 2>/dev/null || true
