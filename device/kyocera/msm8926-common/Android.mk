@@ -32,15 +32,14 @@ LOCAL_PATH := $(call my-dir)
 # This device's key is (msm_id=200, board=8, variant=0, soc_rev=0x10001),
 # which must resolve to the DTB at offset 0xec800.
 #
-# Only define the rule when the build tree does not already have one.  cm-14.1
-# carries vendor/cm/build/tasks/dt_image.mk, which honours
-# BOARD_KERNEL_PREBUILT_DT and defines exactly this rule; defining it a second
-# time here earns
-#     warning: overriding commands for target '.../dt.img'
-# on every single build.  The recovery-only tree (TWRP) has no such file and
-# still needs us.
+# Define the rule only for the tree that will not define it itself, i.e. when
+# BoardConfig set BOARD_KERNEL_PREBUILT_DT to the literal "true" (omni, TWRP).
+# cm-14.1 gets a path there and copies the blob from dt_image.mk instead.  See
+# the long comment in BoardConfigCommon.mk; this test is the exact complement
+# of omni's `ifneq ($(strip $(BOARD_KERNEL_PREBUILT_DT)),true)`, so exactly one
+# of the two trees defines dt.img and neither warns about overriding the other.
 ifeq ($(strip $(BOARD_KERNEL_SEPARATED_DT)),true)
-ifeq ($(wildcard vendor/cm/build/tasks/dt_image.mk),)
+ifeq ($(strip $(BOARD_KERNEL_PREBUILT_DT)),true)
 
 INSTALLED_DTIMAGE_TARGET := $(PRODUCT_OUT)/dt.img
 QCDT_PREBUILT           := $(LOCAL_PATH)/prebuilt/stock/dtb-kyl23.img

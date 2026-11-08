@@ -52,28 +52,40 @@ BOARD_KERNEL_CMDLINE := console=ttyHSL0,115200,n8 no_console_suspend=1 androidbo
 BOARD_MKBOOTIMG_ARGS := --ramdisk_offset 0x01000000 --second_offset 0x00f00000 --tags_offset 0x00000100
 
 # The device tree is appended to the image as a Qualcomm QCDT blob.  It is
-# shipped prebuilt (prebuilt/stock/dtb-kyl23.img) and merely copied into place
-# by Android.mk.  Do not regenerate it: the stock table has 40 board=8 entries
-# pointing at eight distinct DTBs, and collapsing that to one DTB makes aboot
-# hand the kernel a tree for the wrong SoC (logo, then reboot after ~3s).
+# shipped prebuilt (prebuilt/stock/dtb-kyl23.img) and copied into place either
+# by dt_image.mk or by Android.mk, depending on the tree.  Do not regenerate
+# it: the stock table has 40 board=8 entries pointing at eight distinct DTBs,
+# and collapsing that to one DTB makes aboot hand the kernel a tree for the
+# wrong SoC (logo, then reboot after ~3s).
 #
-# BOARD_KERNEL_PREBUILT_DT stops build/core/tasks/dt_image.mk from defining
-# its own dt.img rule.  That rule shells out to $(HOST_OUT)/bin/dtbToolCM and
-# reads DTBs out of $(KERNEL_OUT)/arch/arm/boot - neither exists when we build
-# around a prebuilt kernel, and ninja fails with "missing and no known rule".
+# BOARD_KERNEL_PREBUILT_DT means two incompatible things depending on which
+# build tree reads it, and both trees have to be satisfied because the same
+# device tree feeds LineageOS and TWRP:
 #
-# The value is the *path* to the blob, not "true".  dt_image.mk tests it with
-# `ifeq ($(strip $(BOARD_KERNEL_PREBUILT_DT)),)` and, in the else branch, turns
-# it into a prerequisite:
+#   cm-14.1 (vendor/cm)   empty  -> define a rule that runs dtbToolCM
+#                         non-empty -> copy that file to dt.img
+#     The value is used as a prerequisite:
+#       $(INSTALLED_DTIMAGE_TARGET): $(BOARD_KERNEL_PREBUILT_DT) | $(ACP)
+#     so a literal "true" asks ninja for a file named "true" and dies with
+#     `ninja: error: 'true', needed by 'dt.img', missing and no known rule`.
 #
-#     $(INSTALLED_DTIMAGE_TARGET): $(BOARD_KERNEL_PREBUILT_DT) | $(ACP)
+#   omni-7.1 (TWRP)       "true" -> skip dt_image.mk entirely
+#                         anything else -> define the dtbToolCM rule
+#     tested with `ifneq ($(strip $(BOARD_KERNEL_PREBUILT_DT)),true)`, so a
+#     path here is *not* treated as prebuilt - omni overwrites our rule with
+#     one that wants `out/host/linux-x86/bin/dtbToolCM`, which the recovery
+#     tree never builds.
 #
-# so "true" becomes a dependency on a file named "true" and ninja reports
-# `ninja: error: 'true', needed by 'dt.img', missing and no known rule to make
-# it`.  A recovery-only tree never includes dt_image.mk, which is why the TWRP
-# build tolerated it.
-BOARD_KERNEL_SEPARATED_DT := true
+# Hence: a path for LineageOS, the word "true" for anything else.  In the
+# omni case Android.mk supplies the copy rule, guarded by the same test, so
+# exactly one of the two trees defines dt.img and neither warns about
+# overriding the other.
+ifneq ($(filter lineage_%,$(TARGET_PRODUCT)),)
 BOARD_KERNEL_PREBUILT_DT := $(DEVICE_COMMON_PATH)/prebuilt/stock/dtb-kyl23.img
+else
+BOARD_KERNEL_PREBUILT_DT := true
+endif
+BOARD_KERNEL_SEPARATED_DT := true
 BOARD_DTBTOOL_ARGS :=
 
 # -------------------------------------------------------------- partitions

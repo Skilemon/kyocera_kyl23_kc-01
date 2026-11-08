@@ -209,6 +209,23 @@ jobs:
           export CCACHE_DIR="$HOME/.ccache"
           export USE_CCACHE=1
           export CCACHE_COMPRESS=1
+
+          # jack 4.8 only speaks TLSv1, and the jammy openjdk-8 package lists
+          # TLSv1 and TLSv1.1 in jdk.tls.disabledAlgorithms.  Every connection
+          # to the jack server therefore fails the handshake:
+          #
+          #   Jack server failed to (re)start, try 'jack-diagnose'
+          #   SSL error when connecting to the Jack server
+          #   FAILED: [code=47] setup-jack-server
+          #
+          # and the build dies at 11% with nothing actually broken.  Drop the
+          # two protocols from the blacklist rather than disabling jack
+          # altogether: javac+dx would work but roughly triples the build time.
+          sudo sed -i 's/TLSv1\.1, //; s/TLSv1, //' \
+            "$JAVA_HOME/jre/lib/security/java.security"
+          grep -n '^jdk.tls.disabledAlgorithms' -A3 \
+            "$JAVA_HOME/jre/lib/security/java.security"
+
           source build/envsetup.sh
           lunch "lineage_${DEVICE}-userdebug"
           # The build prints its own progress; -j is capped at the runner's
