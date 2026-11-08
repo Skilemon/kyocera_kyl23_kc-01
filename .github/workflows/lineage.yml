@@ -228,6 +228,21 @@ jobs:
 
           source build/envsetup.sh
           lunch "lineage_${DEVICE}-userdebug"
+
+          # cm-14.1 wart.  org.cyanogenmod.platform.internal is built with
+          # javac (cmsdk opts out of jack) and puts the aapt output of
+          # org.cyanogenmod.platform-res -- R.java, Manifest.java -- on its
+          # source list, but the ninja graph never orders the two:
+          #
+          #   [ 34%] target Java: org.cyanogenmod.platform.internal
+          #   javac: file not found: .../org.cyanogenmod.platform-res_
+          #   intermediates/src/cyanogenmod/platform/Manifest.java
+          #   FAILED: [code=41] .../classes-full-debug.jar
+          #
+          # Build the resource package first.  It is pure aapt, takes seconds,
+          # and afterwards bacon finds the files already there.
+          mka org.cyanogenmod.platform-res -j"$(nproc --all)"
+
           # The build prints its own progress; -j is capped at the runner's
           # core count by soong anyway.
           mka bacon -j"$(nproc --all)"
