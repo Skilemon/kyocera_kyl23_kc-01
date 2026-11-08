@@ -60,30 +60,37 @@ endif
 #
 # The kernel is a prebuilt zImage, so scripts/headers_install never runs and
 # $(KERNEL_HEADERS) - $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include -
-# never comes into existence.  system/core/sdcard still asks for it, as an
-# include path and as a prerequisite, and the build dies before compiling a
-# single line of anything:
+# never comes into existence.  Modules ask for it as an include path and as a
+# prerequisite, and the build dies:
 #
 #   ninja: error: '.../obj/KERNEL_OBJ/usr', needed by
 #   '.../libsdcard_intermediates/sdcard.o', missing and no known rule to make it
 #
-# Pointing TARGET_KERNEL_SOURCE at a real tree would satisfy it the proper way,
-# but there is no kernel in this repo to point at (see README.md: the zImage is
-# built by hand from Kyocera's GPL drop), and dragging 2 GB of kernel source
-# into CI to generate headers nothing else reads is not a trade worth making.
+# An empty directory gets past that one, and then the display HAL fails:
 #
-# So the directory is created empty.  That is enough for both uses: the -I is
-# additive and everything sdcard.c needs comes from bionic's copy of the uapi
-# headers, which is searched anyway.  No other module in a cm-14.1 tree pulls
-# in $(KERNEL_HEADERS) as a prerequisite.
+#   hardware/qcom/display-caf/msm8974/libqdutils/mdp_version.cpp:30:10:
+#   fatal error: 'linux/msm_mdp.h' file not found
+#
+# msm_mdp.h, msm_ion.h and the other 27 msm_* headers are Qualcomm's, not
+# upstream Linux, so bionic's copy of the uapi headers does not have them.
+#
+# Pointing TARGET_KERNEL_SOURCE at the real tree would satisfy all of this the
+# proper way, but that tree is 2 GB and lives outside the repo (see README.md:
+# the zImage is built by hand from Kyocera's GPL drop, it is not checked out in
+# CI).  So the output of `make ARCH=arm headers_install` is shipped instead:
+# prebuilt/kernel-headers.tar.gz, 953 KB, 848 files, generated once from that
+# same 3.4.0 source.  It is byte-for-byte what the build would have produced.
 #
 # Both the parent and the leaf get a rule: ninja names whichever one the
 # dependant happened to record, and complaining about a missing parent is just
-# as fatal as complaining about a missing leaf.
-KERNEL_HEADERS_STUB := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
+# as fatal as complaining about a missing leaf.  The tarball is unpacked by the
+# parent's rule because that is the one the compiler actually waits for.
+KERNEL_HEADERS_TARBALL := $(LOCAL_PATH)/prebuilt/kernel-headers.tar.gz
+KERNEL_OBJ_USR := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
 
-$(KERNEL_HEADERS_STUB):
-	@mkdir -p $(KERNEL_HEADERS_STUB)/include
+$(KERNEL_OBJ_USR): $(KERNEL_HEADERS_TARBALL)
+	@mkdir -p $@/include
+	$(hide) tar -xzf $< -C $@/include
 
-$(KERNEL_HEADERS_STUB)/include: $(KERNEL_HEADERS_STUB)
+$(KERNEL_OBJ_USR)/include: $(KERNEL_OBJ_USR)
 	@mkdir -p $@
