@@ -1,0 +1,168 @@
+name: Inspect built package
+
+# Pull a finished lineage-14.1 package out of the artifact store and report what
+# is actually inside it.  The point is to answer the questions a flash would
+# otherwise answer the hard way -- is the ramdisk the one we think it is, does
+# /vendor exist as a symlink, did the Kyocera blobs land, is SELinux going to
+# enforce on first boot -- while the download stays a few megabytes instead of
+# the full 380 MB package.
+#
+# Inputs are the run id that owns the artifact and the artifact name.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run id that produced the artifact'
+        required: true
+      artifact:
+        description: 'Artifact name (lineage-14.1-kyl23 / lineage-14.1-kc01)'
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Fetch the artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+          NAME: ${{ inputs.artifact }}
+        run: |
+          set -euo pipefail
+          aid=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" \
+                  --jq ".artifacts[] | select(.name==\"$NAME\") | .id")
+          echo "artifact id $aid"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$aid/zip" > pkg.zip
+          ls -l pkg.zip
+          mkdir -p pkg && cd pkg
+          unzip -q ../pkg.zip
+          ls -l
+
+      - name: Package level checks
+        run: |
+          set -euo pipefail
+          cd pkg
+          ZIP=$(ls lineage-14.1-*.zip | head -1)
+          echo "### $ZIP"
+          ls -l "$ZIP"
+          sha256sum "$ZIP"
+          md5sum "$ZIP"
+          echo
+          echo "### entries that matter"
+          unzip -l "$ZIP" | awk 'NR>3' | head -60
+          echo
+          echo "### signature"
+          unzip -l "$ZIP" | grep -E 'META-INF/' || echo "NO META-INF"
+          echo
+          echo "### updater"
+          unzip -p "$ZIP" META-INF/com/google/android/updater-script | head -40 || true
+
+      - name: Unpack boot.img
+        run: |
+          set -euo pipefail
+          cd pkg
+          ZIP=$(ls lineage-14.1-*.zip | head -1)
+          unzip -o -q "$ZIP" boot.img
+          python3 - <<'PY'
+          import struct
+          d = open("boot.img", "rb").read()
+          f = lambda o: struct.unpack_from("<I", d, o)[0]
+          print("magic      ", d[:8])
+          print("kernel_size", f(8), "kernel_addr", hex(f(12)))
+          print("ramdisk    ", f(16), "addr", hex(f(20)))
+          print("second     ", f(24))
+          print("tags_addr  ", hex(f(28)))
+          print("page_size  ", f(36))
+          print("dt_size    ", f(40) if len(d) > 44 else 0)
+          ks, rs, ps = f(8), f(16), f(36)
+          open("kernel.zImage", "wb").write(d[ps:ps+ks])
+          open("ramdisk.gz", "wb").write(d[ps+((ks+ps-1)//ps)*ps:][:rs])
+          cmd_end = d.find(b"\0", 608)
+          print("cmdline    ", d[608:cmd_end].decode(errors="replace"))
+          PY
+          echo
+          echo "### ramdisk"
+          mkdir -p rd && cd rd
+          if file ../ramdisk.gz | grep -qi gzip; then
+            gzip -dc ../ramdisk.gz | cpio -idm --quiet
+          else
+            # gzip -9 header is sometimes stripped; try the kernel's zlib anyway
+            python3 -c "
+import zlib,sys
+d=zlib.decompressobj(16+zlib.MAX_WBITS).decompress(open('../ramdisk.gz','rb').read())
+sys.stdout.buffer.write(d)" | cpio -idm --quiet
+          fi
+          find . -type f | sort | head -80
+          echo
+          echo "### default.prop"
+          cat prop.default 2>/dev/null || cat default.prop 2>/dev/null || echo none
+          echo
+          echo "### init.rc: vendor and selinux lines"
+          grep -nE "vendor|selinux|mount|symlink" init.rc | head -40 || true
+
+      - name: Unpack the system image
+        run: |
+          set -euo pipefail
+          cd pkg
+          ZIP=$(ls lineage-14.1-*.zip | head -1)
+          unzip -o -q "$ZIP" system.new.dat system.transfer.list
+          pip install --quiet sdat2img || pip install --quiet git+https://github.com/xpirt/sdat2img
+          python3 -c "import sdat2img" 2>/dev/null || {
+            curl -sSLo sdat2img.py https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py
+            sed -i 's/^#!/#!/usr/bin/env python3/' sdat2img.py
+          }
+          [ -f sdat2img.py ] && python3 sdat2img.py system.transfer.list system.new.dat system.img \
+                             || python3 -m sdat2img system.transfer.list system.new.dat system.img
+          ls -l system.img
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro system.img /mnt/sys
+          echo "### top level"
+          ls -la /mnt/sys | head -30
+          echo
+          echo "### /vendor"
+          ls -la /mnt/sys/vendor 2>/dev/null | head -10 || echo "NO /vendor IN SYSTEM"
+          echo
+          echo "### key blobs"
+          for f in vendor/lib/libril-qc-qmi-1.so vendor/bin/rild vendor/lib/hw/camera.msm8226.so \
+                   vendor/lib/liboemcamera.so lib/libreference-ril.so bin/rild \
+                   etc/permissions/qcrilhook.xml etc/init/rild.rc; do
+            if [ -e "/mnt/sys/$f" ]; then echo "ok   $f"; else echo "MISS $f"; fi
+          done
+          echo
+          echo "### build.prop"
+          cat /mnt/sys/build.prop | head -60
+          echo
+          echo "### init rc files"
+          ls /mnt/sys/etc/init/ | head -40
+          echo
+          echo "### sepolicy"
+          ls -l /mnt/sys/etc/selinux/ 2>/dev/null
+          echo
+          echo "### fstab"
+          cat /mnt/sys/etc/fstab.qcom 2>/dev/null || ls /mnt/sys/etc | grep -i fstab
+
+      - name: Collect a small report
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p report
+          find /mnt/sys -maxdepth 2 2>/dev/null | head -200 > report/system_top.txt || true
+          ls -l /mnt/sys/vendor/lib 2>/dev/null > report/vendor_lib.txt || true
+          cat /mnt/sys/build.prop > report/build.prop 2>/dev/null || true
+          cp pkg/boot.img report/ 2>/dev/null || true
+          cp pkg/rd/init.rc report/ramdisk-init.rc 2>/dev/null || true
+          cp pkg/rd/prop.default report/ramdisk-prop.default 2>/dev/null || true
+          sudo umount /mnt/sys 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: inspect-${{ inputs.artifact }}
+          path: report/
+          retention-days: 7
