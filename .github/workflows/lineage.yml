@@ -153,6 +153,31 @@ jobs:
           du -sh vendor/kyocera/msm8926-common/proprietary
           find device/kyocera -maxdepth 2 -type f | sort
 
+      - name: Fetch the Git LFS prebuilts
+        run: |
+          set -ex
+          cd "$ROM"
+          # cm-14.1 stores several prebuilts in Git LFS, and repo does not run
+          # `git lfs pull`.  WebView is the one this device trips over: the
+          # checkout holds a 133-byte pointer instead of the 83 MB APK, so the
+          # build gets to 89% and then
+          #
+          #   java.util.zip.ZipException: error in opening zip file
+          #   FAILED: .../APPS/webview_intermediates/package.apk
+          #
+          # The batch API on review.lineageos.org hands out anonymous download
+          # URLs (checked with the real oid before writing this), so the pull
+          # needs no credentials.
+          command -v git-lfs >/dev/null || { echo "git-lfs is not installed"; exit 1; }
+          for d in external/chromium-webview/prebuilt/arm; do
+            ( cd "$d" && git lfs install --local && git lfs pull )
+          done
+          # 133 bytes means the pointer is still there and the build would fail
+          # again an hour from now.
+          size=$(stat -c %s external/chromium-webview/prebuilt/arm/webview.apk)
+          echo "webview.apk: ${size} bytes"
+          test "$size" -gt 1048576
+
       - name: Patch the synced sources
         run: |
           set -ex
