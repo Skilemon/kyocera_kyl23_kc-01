@@ -173,9 +173,12 @@ model         = "Qualcomm MSM 8926 MTP"                    # 与 dmesg 的 Machi
 | 名称 | 节点 | 大小 | 用途 |
 |---|---|---|---|
 | modem | mmcblk0p1 | 64 MiB | 基带 |
-| boot | mmcblk0p11 | 16 MiB | 内核（有写保护） |
+| boot | **mmcblk0p9** | 16 MiB | 内核（有写保护） |
+| tz | mmcblk0p10 | 1 MiB | TrustZone |
+| tzbak | mmcblk0p11 | 1 MiB | TrustZone 备份（**不是 boot**） |
 | recovery | mmcblk0p12 | 16 MiB | recovery（有写保护） |
 | system | mmcblk0p19 | 1,404 MiB | 系统 |
+| bootwork | mmcblk0p24 | 4 MiB | boot 的工作槽 |
 | userdata | mmcblk0p20 | 5,093 MiB | 数据 |
 | cache | mmcblk0p21 | 458 MiB | 缓存（无保护） |
 | log | mmcblk0p22 | 20 MiB | **Kyocera ram console，最近一次启动的完整 dmesg** |
@@ -185,6 +188,18 @@ model         = "Qualcomm MSM 8926 MTP"                    # 与 dmesg 的 Machi
 | persist | mmcblk0p28 | 8 MiB | 单机校准 |
 | carrier | mmcblk0p32 | 8 MiB | 运营商配置 |
 | sysprop | mmcblk0p37 | 8 MiB | 系统属性分区 |
+
+> **2026-11 订正：boot 是 mmcblk0p9，之前写的 mmcblk0p11 是错的。**
+>
+> 依据是设备上 `ls -l /dev/block/platform/msm_sdcc.1/by-name/` 与
+> `cat /proc/partitions` 实测：`boot -> mmcblk0p9`（16384 KB = 16 MiB），
+> `tzbak -> mmcblk0p11`（1024 KB = 1 MiB）。kc_wp 模块按 `p11` 清保护时，
+> 内核读到的是 `start_sect=192512 nr_sects=2048`，1 MiB 根本装不下一个
+> boot.img（内核 5.7 MB + ramdisk 8.3 MB），等于一直在清 tzbak，
+> 真正的 boot 从未被解锁 —— 刷进去的内核被卡静默丢弃，重启照旧走原厂内核。
+>
+> 教训：**清写保护要传分区名，不要传 `mmcblk0pN`。** 现在的 kc_wp 用
+> by-name 解析，名字对就不会错。
 
 **拿到崩溃现场的正确方式是 `log` 分区，不是 pstore。** 这台机器的内核没编
 `CONFIG_PSTORE`（`/sys/fs/pstore` 根本不存在，`mount` 也挂不上），也没开
