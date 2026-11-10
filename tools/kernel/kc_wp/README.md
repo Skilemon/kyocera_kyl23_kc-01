@@ -40,7 +40,7 @@ insmod /sbin/kc_wp.ko
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `parts` | `mmcblk0p12 mmcblk0p11 mmcblk0p19` | 开机要清的分区，空格分隔（recovery / boot / system，aboot 三片都上锁） |
+| `parts` | `recovery boot system` | 开机要清的分区，空格分隔。**写分区名，不要写 `mmcblk0pN`**：名字走 by-name 解析，编号会随批次/GPT 变 |
 | `autofix` | `1` | `0` = 关掉自动清除，只留手动命令 |
 | `delay` | `4000` | insmod 后等多少毫秒再动手 |
 | `retry` | `15` | 设备节点没就绪时重试次数，每次间隔 500ms |
@@ -54,7 +54,7 @@ insmod /sbin/kc_wp.ko
 
 ```sh
 echo info > /sys/kernel/kc_wp/run                  # EXT_CSD: USER_WP / WR_REL_SET / SECURE_WP
-echo "autofix mmcblk0p12" > /sys/kernel/kc_wp/run  # 清一个分区并复查
+echo "autofix system" > /sys/kernel/kc_wp/run   # 清一个分区并复查（名字也可以是 mmcblk0p19）
 echo "31 0x2f800" > /sys/kernel/kc_wp/run          # 原始 CMD31，只读
 ```
 

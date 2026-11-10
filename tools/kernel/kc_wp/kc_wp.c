@@ -102,16 +102,42 @@ static int kcw_part_info(const char *path, u64 *start_sect, u64 *nr_sects)
 }
 
 /*
- * 把 "mmcblk0p12" 补成 "/dev/block/mmcblk0p12"。
+ * 把裸名字解析成真正存在的设备节点。
+ *
  * 别指望调用方给全路径：init.rc 和 shell 里传的都是裸名字，而
  * kern_path("mmcblk0p12") 是相对路径，必然 -ENOENT(-2)。
+ *
+ * 分区名优先走 by-name：编号在不同批次 / 改过 GPT 的机器上会变，
+ * 名字不会。踩过的坑：文档里写 boot = mmcblk0p11，实际 p11 只有
+ * 2048 扇区（1 MiB），连一个 boot.img 都装不下 —— 编号是错的，
+ * 于是 boot 从来没被清过写保护，刷进去的 boot.img 被卡静默丢弃，
+ * 机器照旧用原厂内核启动。传 "boot" 让内核自己查 by-name 就不会错。
  */
+#define KCW_BYNAME "/dev/block/platform/msm_sdcc.1/by-name/"
+
+static int kcw_path_ok(const char *p)
+{
+	struct block_device *bdev;
+
+	bdev = blkdev_get_by_path(p, FMODE_READ, NULL);
+	if (IS_ERR(bdev))
+		return 0;
+	blkdev_put(bdev, FMODE_READ);
+	return 1;
+}
+
 static void kcw_dev_path(const char *name, char *out, size_t n)
 {
-	if (name[0] == '/')
+	if (name[0] == '/') {
 		snprintf(out, n, "%s", name);
-	else
-		snprintf(out, n, "/dev/block/%s", name);
+		return;
+	}
+	if (strncmp(name, "mmcblk", 6) != 0) {
+		snprintf(out, n, KCW_BYNAME "%s", name);
+		if (kcw_path_ok(out))
+			return;
+	}
+	snprintf(out, n, "/dev/block/%s", name);
 }
 
 static int kcw_cmd_q(struct mmc_card *card, u32 opcode, u32 arg, u32 *r1)
@@ -407,11 +433,14 @@ static void kcw_auto(const char *name)
 
 /*
  * aboot 每次上电按 WP group 把 boot / recovery / system 三片区域一起上锁，
- * 写受保护区不报错、数据直接丢。三片都要清：只清前两个的话，刷 system.img
- * 会「报成功、回读没变」，重启还是原厂系统。
- *   mmcblk0p11 = boot, mmcblk0p12 = recovery, mmcblk0p19 = system
+ * 写受保护区不报错、数据直接丢。
+ *
+ * 这里写的是**分区名**，不是节点号：名字交给 by-name 解析，编号交给 GPT。
+ * 用节点号会踩两个坑 —— 编号在不同批次上会变；文档里那张表也把 boot 记成了
+ * mmcblk0p11，而 p11 实测只有 2048 扇区（1 MiB），根本装不下 boot.img，
+ * 于是 boot 从来没被清过，刷进去的内核被卡静默丢弃。
  */
-static char *kcw_parts = "mmcblk0p12 mmcblk0p11 mmcblk0p19";
+static char *kcw_parts = "recovery boot system";
 module_param_named(parts, kcw_parts, charp, 0644);
 MODULE_PARM_DESC(parts, "开机要清写保护的分区，空格分隔");
 
@@ -486,12 +515,12 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 		if (sscanf(buf, "%*s %31s", name) == 1)
 			kcw_autofix(name);
 		else
-			kcw_autofix("mmcblk0p12");
+			kcw_autofix("recovery");
 	} else if (!strcmp(op, "auto")) {
 		if (sscanf(buf, "%*s %31s", name) == 1)
 			kcw_auto(name);
 		else
-			kcw_auto("mmcblk0p12");
+			kcw_auto("recovery");
 	} else if (!strcmp(op, "info")) {
 		pr_err(TAG "info: host=%s\n", mmc_hostname(card->host));
 		kcw_dump_extcsd(card);
