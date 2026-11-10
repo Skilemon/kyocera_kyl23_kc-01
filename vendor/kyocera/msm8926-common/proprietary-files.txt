@@ -264,7 +264,10 @@ vendor/lib/libaudcal.so 66772
 vendor/lib/libaudioUsbAlert.so 22780
 vendor/lib/libaudioalsa.so 13412
 vendor/lib/libaudioparameter.so 13428
+vendor/lib/libaudioroute.so 9220
 vendor/lib/libbfss.so 17520
+vendor/lib/libbt-hci.so 29956
+vendor/lib/libbt-utils.so 5220
 vendor/lib/libbtnv.so 5160
 vendor/lib/libc2d2_z180.so 58800
 vendor/lib/libc2d30-a3xx.so 677404
@@ -381,6 +384,7 @@ vendor/lib/libdsi_netctrl.so 157192
 vendor/lib/libdsnetutils.so 21616
 vendor/lib/libdsucsd.so 21828
 vendor/lib/libdsutils.so 33956
+vendor/lib/libexternal.so 17412
 vendor/lib/libfastcvadsp_stub.so 329016
 vendor/lib/libfastcvopt.so 2063988
 vendor/lib/libgeofence.so 34080
@@ -474,6 +478,7 @@ vendor/lib/libmmrtpdecoder.so 29808
 vendor/lib/libmmrtpencoder.so 17564
 vendor/lib/libmsapm_jni.so 42468
 vendor/lib/libnetmgr.so 38048
+vendor/lib/libnl_2.so 13368
 vendor/lib/liboemcamera.so 38272
 vendor/lib/liboemcrypto.so 33920
 vendor/lib/liboi_sbc_decoder.so 13480
@@ -513,10 +518,13 @@ vendor/lib/libscve.so 83168
 vendor/lib/libsensor1.so 43956
 vendor/lib/libssd.so 5292
 vendor/lib/libstagefrighthw.so 5228
+vendor/lib/libstlport.so 210252
 vendor/lib/libsubsystem_control.so 5288
 vendor/lib/libthermalclient.so 13748
 vendor/lib/libthermalioctl.so 5172
 vendor/lib/libtime_genoff.so 5124
+vendor/lib/libtinycompress.so 9432
+vendor/lib/libtinyxml.so 29976
 vendor/lib/libtzdrmgenprov.so 9344
 vendor/lib/libtzplayready.so 58908
 vendor/lib/libulp2.so 85072

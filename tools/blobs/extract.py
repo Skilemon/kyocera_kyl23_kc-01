@@ -73,10 +73,37 @@ libkeystore_binder libvorbisidec
 # would only add dead weight (and, for libsoftkeymaster, a second keymaster).
 DROP = {
     "libsoftkeymaster", "libril", "librilutils", "libreference-ril",
-    "libbt-hci", "libbt-utils", "libsensors.default",
+    "libsensors.default",
     "libsupol",                      # SuperSU leftover, nothing links to it
     "libdvm", "libcorkscrew", "libbcc.sha1",
 }
+
+# Libraries whose names look like AOSP ones -- that is why they also appear in
+# AOSP_LIBS above -- but which the 7.1 tree no longer builds.  The 4.4 vendor
+# blobs still list them in DT_NEEDED, or dlopen them by name, and with nothing
+# in the image to satisfy the request the process dies before it can draw:
+#
+#     libGLESv2_adreno.so: dlopen failed: library "libstlport.so" not found
+#     hwcomposer.msm8226.so: dlopen failed: library "libexternal.so" not found
+#
+# stlport disappeared in 6.0 when Bionic moved to libc++, and a 4.4 build of
+# it is the only thing that satisfies libGLESv2_adreno/libllvm-qcom/libc2d30;
+# libexternal went away with the ExternalDisplay rewrite.  The rest are the
+# 4.4 bluetooth, audio and XML helpers that 7.1 replaced under other module
+# names: audio.primary.msm8226 needs libtinycompress and libaudioroute,
+# bluetooth.default needs libbt-hci and libbt-utils, the wifi and media HALs
+# need libnl_2 and libtinyxml.
+#
+# None of these shadows a 7.1 library, because none of them is in the 7.1
+# image -- verified by listing system/lib in the built image.  libmemtrack is
+# deliberately absent from this set: 7.1 does build it, and the 4.4 copy would
+# take precedence in /vendor/lib.
+CARRY_OVER = set("""
+libstlport libexternal
+libtinycompress libaudioroute
+libbt-hci libbt-utils
+libtinyxml libnl_2
+""".split())
 
 # init.rc / init.qcom.rc / init.target.rc start these; they are the binaries
 # without which the radio, the sensors, the charger and the thermal loop are
@@ -319,7 +346,7 @@ def main():
             continue
         base = soname(p)
         base = base[:-3] if base.endswith(".so") else base
-        if base in AOSP_LIBS or base in DROP or fn not in wanted:
+        if base not in CARRY_OVER and (base in AOSP_LIBS or base in DROP or fn not in wanted):
             skipped.append(fn)
             continue
         add(os.path.join("lib", fn), os.path.join("vendor", "lib", fn))
