@@ -40,7 +40,7 @@ insmod /sbin/kc_wp.ko
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `parts` | `mmcblk0p12 mmcblk0p11` | 开机要清的分区，空格分隔 |
+| `parts` | `mmcblk0p12 mmcblk0p11 mmcblk0p19` | 开机要清的分区，空格分隔（recovery / boot / system，aboot 三片都上锁） |
 | `autofix` | `1` | `0` = 关掉自动清除，只留手动命令 |
 | `delay` | `4000` | insmod 后等多少毫秒再动手 |
 | `retry` | `15` | 设备节点没就绪时重试次数，每次间隔 500ms |

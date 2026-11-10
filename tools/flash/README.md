@@ -4,11 +4,11 @@
 用于清除 boot / recovery **/ system** 分区的 eMMC 硬件写保护。用法见 [../../docs/FLASHING.md](../../docs/FLASHING.md)。
 
 > **system 也要清。** aboot 每次上电按 WP group 把 boot / recovery / system 三片区域
-> 一起置上保护，写进去不报错、数据被丢弃。kc_wp.ko 自带的 delayed work 只清
-> `mmcblk0p12` / `mmcblk0p11`（表写死在模块 rodata 里），**不含 `mmcblk0p19`**。
-> 所以 TWRP 由 `init.rc` 在 `class_start default` 之后 exec `/sbin/wp_fix.sh`，
-> 对 p12 / p11 / p19 各发一次 CMD29。少了这一步，刷 `system.img` 会「报成功、
-> 回读没变」，重启还是原厂系统。
+> 一起置上保护，写进去不报错、数据被丢弃。`kc_wp.ko` 的 `parts` 默认值就是
+> `mmcblk0p12 mmcblk0p11 mmcblk0p19`（recovery / boot / system），insmod 后 4 秒
+> 在自己的 delayed work 里依次清掉，不依赖 init.rc。少了 system 这一片，刷
+> `system.img` 会「报成功、回读没变」，重启还是原厂系统。
+> 下面这个脚本只是手动兜底/排查用。
 
 > **TWRP 镜像里已经内置了它**：同一个文件以 `mmc_protect.ko` 的名字放在
 > `device/kyocera/msm8926-common/prebuilt/`，构建时由 `mkhybrid.py --module`

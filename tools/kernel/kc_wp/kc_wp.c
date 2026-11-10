@@ -405,7 +405,13 @@ static void kcw_auto(const char *name)
 
 /* ---------- 开机自动清除（不依赖 init.rc 的 exec） ---------- */
 
-static char *kcw_parts = "mmcblk0p12 mmcblk0p11";
+/*
+ * aboot 每次上电按 WP group 把 boot / recovery / system 三片区域一起上锁，
+ * 写受保护区不报错、数据直接丢。三片都要清：只清前两个的话，刷 system.img
+ * 会「报成功、回读没变」，重启还是原厂系统。
+ *   mmcblk0p11 = boot, mmcblk0p12 = recovery, mmcblk0p19 = system
+ */
+static char *kcw_parts = "mmcblk0p12 mmcblk0p11 mmcblk0p19";
 module_param_named(parts, kcw_parts, charp, 0644);
 MODULE_PARM_DESC(parts, "开机要清写保护的分区，空格分隔");
 
