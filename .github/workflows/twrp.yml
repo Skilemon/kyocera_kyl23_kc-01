@@ -207,6 +207,8 @@ jobs:
             --languages "en,zh_CN" \
             --single-font \
             --module   "$C/kc_wp.ko" \
+            --wp-clear mmcblk0p12 \
+            --wp-script "$GITHUB_WORKSPACE/local/tools/flash/wp_fix.sh" \
             --out      "$ROM/twrp-$DEVICE.img"
           # --single-font points every twres font reference at
           # DroidSansFallback.ttf (full ASCII + 20,902 of 20,992 CJK) and drops
@@ -221,10 +223,15 @@ jobs:
           # 2GB, so every command came back OUT_OF_RANGE while the sysfs
           # 'clear' still reported success.
           # kc_wp.ko computes the offset from bd_part->start_sect and sweeps the
-          # whole partition in both units.  It also lifts the protection by
-          # itself: a delayed work 4s after insmod, retried until
-          # /dev/block/mmcblk0p12 shows up.  No init.rc exec needed -- /dev
-          # nodes are late and TWRP remounts /tmp, which ate the log.
+          # whole partition in both units.  Its own delayed work only clears the
+          # pair hard-coded in rodata ("mmcblk0p12 mmcblk0p11"), i.e. recovery
+          # and boot -- system (mmcblk0p19) is NOT in that table.  Writing
+          # system.img to a still-protected region returns success and drops
+          # every byte, so the ROM never lands and the phone boots the stock
+          # system again.  --wp-script closes that gap: /sbin/wp_fix.sh runs
+          # from init.rc after class_start, waits for the device nodes and
+          # issues CMD29 for p12 / p11 / p19.  --wp-clear is what emits the
+          # "wait /dev/block/mmcblk0p12 10" line in front of the exec.
 
       - name: Verify the image
         run: |
