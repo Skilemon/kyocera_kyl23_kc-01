@@ -1697,3 +1697,174 @@ python serial_restore.py COM13 --image twrp-kyl23.img --part recovery --verify
 ```
 
 或者 TWRP 里 `insmod mmc_protect_fix2.ko` 后 `dd` 回去（见 12.6）。
+
+## 14. Wi-Fi：删掉已保存网络的，是当初为了兼容 4.4 打的那个补丁
+
+这一节记的是这台设备最后一个长期未解的 bug，以及它为什么绕了那么多圈。
+结论在前：**根因是 `/system/framework/wifi-service.jar` 里一处手工补丁，
+而它补的是一个已经不存在的问题。**
+
+### 14.1 现象
+
+| 步骤 | 结果 |
+|---|---|
+| 开机 | 不自动连，但设置里能看到保存过的热点 |
+| 手动连一次 | 成功，能上网 |
+| 关 Wi-Fi → 开 | 显示"无法连接到 Wi-Fi"，热点仍在列表里、仍标着"已保存" |
+| 再关 → 再开 | 热点从"已保存"里消失，要求输入密码 |
+| 重启 | 同样要求密码 |
+
+关键点：**手动连接永远是成功的**。凡是"新建网络"的路径都正常，出问题的
+只有"重新加载已保存网络"这条路径。
+
+### 14.2 先排除掉的几个方向
+
+这些都是当时看起来最像、实际都不是的：
+
+- **`networkHistory.txt` 的 configKey 校验**。`loadConfiguredNetworks()` 里
+  `WifiNetworkHistory.readNetworkHistory()` 会因为 configKey 对不上而丢弃配置，
+  日志是 `Ignoring network ...`。实测 `grep -c "Ignoring network"` = 0，这条排除。
+- **`nid=-1616136200`**。这个负数在日志里很扎眼，但它只是 `"K2"WPA_PSK` 的
+  Java `hashCode()`，来自 `readIpAndProxyConfigurations()` 的
+  `configuration found for missing network, nid=`，是无害的。
+- **captive portal 把网络判定为"无互联网"然后禁用**。7.1 的
+  `NETWORK_SELECTION_DISABLE_THRESHOLD[DISABLED_NO_INTERNET] = 1`，
+  `TIMEOUT = Integer.MAX_VALUE`，一次探测失败就永久禁用，而探针
+  `connectivitycheck.gstatic.com` 在国内不可能通——所以这条**确实存在**，
+  但它解释的是"连上了却显示无法访问网络"，不是"配置被删掉"。
+  `kcfix.sh` 把 `captive_portal_mode` 设成 `IGNORE` 就是为这个。
+- **`wpa_supplicant.conf` 的权限/属主**。曾经被脚本改成 root 所有导致 supplicant
+  读不了，但修好之后现象不变。
+
+### 14.3 决定性证据：让 supplicant 自己说话
+
+fix45 在 `p2p_supplicant` 服务的命令行末尾加了 `-d`。这是整件事的转折点——
+之前所有日志都来自 framework，而 framework 只能说"我认为失败"，
+说不出"失败在哪一步"。
+
+以下是关掉再打开 Wi-Fi 那一刻，supplicant 自己的记录：
+
+```
+16:41:06.795  Priority group 1
+16:41:06.795     id=0 ssid='K2'              <- 配置里 K2 还在
+16:41:06.903  wlan0: command 'LIST_NETWORKS'
+16:41:06.919  wlan0: command 'LIST_NETWORKS' <- 它又读了一遍
+16:41:06.928  wlan0: command 'REMOVE_NETWORK 0' <- framework 把它删了
+16:41:12.086  CTRL_IFACE: Could not find network id=0
+16:41:12.087  wlan0: command 'SAVE_CONFIG'   <- 把空配置写回文件
+```
+
+**framework 在每次重新加载网络时，把自己保存的那个网络删掉了。**
+之后的 `SET_NETWORK 0 ...` 全部回答 `FAIL`（`id=0` 已经不存在），
+`saveNetwork()` 返回 false，下一次开关就把空配置写进文件——这就是密码提示。
+
+### 14.4 根因：两行互相矛盾的代码
+
+`WifiConfigStore.loadNetworks()` 是分页读的：
+
+```java
+int last_id = -1;
+boolean done = false;
+while (!done) {
+    String listStr = mWifiNative.listNetworks(last_id);
+    ...
+    done = (lines.length == 1);     // 本页只有表头 = 读完了
+}
+```
+
+`WifiNative.listNetworks(int last_id)` 本该把 `last_id` 发出去：
+
+```java
+return doStringCommand("LIST_NETWORKS LAST_ID=" + last_id);
+```
+
+但这台设备镜像里的那份 jar，这个方法体是：
+
+```
+const-string/jumbo v0, LIST_NETWORKS
+invoke-direct v1, v0, WifiNative->doStringCommand(String)
+```
+
+**参数被忽略，每次都发裸 `LIST_NETWORKS`。** 于是"第二页"就是第一页：
+
+1. 第一轮读到 `id=0 K2`，塞进 map；
+2. 第二轮又读到同一个 `id=0 K2`，`configs.put(configKey, config)` 返回
+   上一轮的值 → 判定"重复网络" → `mWifiNative.removeNetwork(0)`；
+3. 第三轮读到空列表 → `done = true`，循环结束，但网络已经没了。
+
+`removeNetwork()` 那行本来是为 WPS 场景写的（"用户手动连过之后又用 WPS
+连了一次，supplicant 会新建一个 network"），注释写得没错，只是这里被
+自己的分页逻辑喂了个"重复"。
+
+### 14.5 这个补丁是干什么的，为什么早该撤
+
+`git log` 里 fix43 的注释已经把话说完了：
+
+> Everything above this line was written to keep a 4.4 wpa_supplicant blob alive
+> under a 7.1 framework: kcwpad talked to it, kcwd repaired its config file,
+> **the framework's jar was patched so LIST_NETWORKS would be understood**.
+> ... So: no daemon, no file repair, **no jar patch**.
+
+4.4 的 supplicant（v2.1-devel）的命令表用 `strcmp` 比裸字符串 `LIST_NETWORKS`，
+收到 `LIST_NETWORKS LAST_ID=-1` 会回 `UNKNOWN COMMAND`。所以在用 4.4 blob 的
+那些版本里，这个补丁是**必要的**。
+
+fix43 把 `/system/bin/wpa_supplicant` 换成 cm-14.1 自己构建的 v2.6-devel 之后，
+前提消失了，但**补丁没撤**。于是"兼容 4.4 的补丁"反过来破坏了 7.1 的分页，
+而且症状比原来更难查——它不报错，它删数据。
+
+### 14.6 修法：什么都不用改
+
+7.1 的 supplicant 分页是正确的（`ctrl_iface.c`）：
+
+```c
+if (cmd != NULL && os_strncmp(cmd, "LAST_ID=", 8) == 0) {
+    int last_id = atoi(cmd + 8);
+    if (last_id != -1) {
+        while (ssid != NULL && ssid->id <= last_id)
+            ssid = ssid->next;
+    }
+}
+```
+
+`LAST_ID=-1` 返回全部；`LAST_ID=<最后一个 id>` 返回只剩表头的一行；
+`lines.length == 1` → `done = true`。**原版 jar 和 7.1 supplicant 是自洽的。**
+
+所以最终这一版做的是：
+
+- `/system/framework/wifi-service.jar` **换回构建系统产出的那一份**，
+  与 `out/target/product/kyl23/system/framework/wifi-service.jar` 一字不差
+  （458,803 B，md5 `073f7af8d9a7fb449d7438787e29505e`）；
+- `/system/bin/wpa_supplicant` 用 cm-14.1 的 v2.6-devel（fix43 起就是这样）；
+- **没有任何东西**去写 `wpa_supplicant.conf`、`networkHistory.txt`，
+  也没有任何东西往 supplicant 里预置网络。
+
+### 14.7 顺带清掉的东西
+
+4.4 supplicant 时代留下的一整套东西，前提消失后全是负担：
+
+| 文件 | 作用 | 现状 |
+|---|---|---|
+| `/vendor/bin/wpa_supplicant` | 4.4 blob，871 KB | 删 |
+| `/vendor/bin/kcwpa` | 4.4 supplicant 的启动包装 | 删 |
+| `/vendor/lib/kcssl/` | 专供 4.4 supplicant 的 OpenSSL 1.0（1.2 MB） | 删 |
+| `/vendor/bin/kcwifi2.sh` `kcwifi3.sh` `kcwifiwd.sh` | 直接改 conf 文件"修"网络 | 删 |
+| `/vendor/bin/kcwpad` | 直接改 conf 文件 + 禁用蓝牙包 | 删 |
+| `/system/bin/wpaq` `/system/etc/kcprobe.sh` | 问 daemon"为什么 FAIL"的探针 | 删（它已回答完了） |
+
+`kcwifi` 留着——它是加载 prima 驱动的那个东西，删了 Wi-Fi 根本起不来。
+
+### 14.8 如果以后又怀疑 Wi-Fi
+
+按这个顺序，两分钟能定位：
+
+1. `getprop | grep wpa`、`dumpsys wifi | grep -E "SET_NETWORK|LIST_NETWORKS"`
+   —— 看 framework 认为自己在发什么；
+2. `logcat -s wpa_supplicant` —— 加了 `-d` 的 supplicant 会把收到的每条命令
+   和它的回答都打出来，`Could not find network id=` 和 `Failed to set network
+   variable` 是两个完全不同的方向；
+3. `cat /data/misc/wifi/wpa_supplicant.conf` —— `network={...}` 块在不在、
+   `id_str` 里的 configKey 是什么。
+
+**不要先怀疑 jar。** 这一轮的教训是：镜像里的每一个手工补丁都要能说出
+"它当时在解决什么问题、那个问题现在还在不在"，说不出来就该删。
