@@ -97,3 +97,22 @@ PRODUCT_PROPERTY_OVERRIDES += \
 # its own launcher, dialer and camera.  Everything else the device needs
 # arrives as a prebuilt file through msm8926-common-vendor.mk, not as a
 # package.
+
+# 7.1 ships its own wpa_supplicant, and this ROM has to use it.  The stock 4.4
+# binary that has been standing in its place speaks the 4.4 ctrl_iface
+# dialect: its command table holds the bare string "LIST_NETWORKS" compared
+# with strcmp, so the framework's "LIST_NETWORKS LAST_ID=-1" comes back as
+# UNKNOWN COMMAND, and the network ids it hands out never line up with the
+# ones the framework remembers.  What that looks like on the device is a
+# Wi-Fi list showing saved networks the supplicant does not have, a password
+# prompt after every toggle, and a 375-byte wpa_supplicant.conf with no
+# network block left in it.
+#
+# The module is LOCAL_MODULE_TAGS := optional, so nothing pulls it in unless
+# it is named here.  BOARD_WPA_SUPPLICANT_PRIVATE_LIB is already set to
+# lib_driver_cmd_qcwcn in BoardConfigCommon.mk, which makes the build link the
+# QCA driver-command shim instead of the ANDROID_LIB_STUB no-op; that shim is
+# what carries DRIVER SETSUSPENDMODE to the pronto driver, and it needs
+# hardware/qcom/wlan present in the manifest (see the workflow).
+PRODUCT_PACKAGES += \
+    wpa_supplicant

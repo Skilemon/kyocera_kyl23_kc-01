@@ -131,6 +131,14 @@ jobs:
             <project path="device/qcom/common"
                      name="LineageOS/android_device_qcom_common"
                      revision="cm-14.1" />
+            <!-- BOARD_WPA_SUPPLICANT_PRIVATE_LIB is lib_driver_cmd_qcwcn, so
+                 wpa_supplicant links that static library by name and the
+                 build fails with "module 'lib_driver_cmd_qcwcn' not found"
+                 if the tree holding it is missing.  It lives in its own repo
+                 and is not in the cm-14.1 default manifest. -->
+            <project path="hardware/qcom/wlan"
+                     name="LineageOS/android_hardware_qcom_wlan"
+                     revision="cm-14.1" />
           </manifest>
           XML
           repo sync -c --force-sync --no-clone-bundle --no-tags --no-repo-verify -j8
@@ -232,6 +240,23 @@ jobs:
           test -f device/kyocera/msm8926-common/system.prop
           test -f device/kyocera/msm8926-common/rootdir/etc/fstab.qcom
           test -f device/kyocera/msm8926-common/bluetooth/bdroid_buildcfg.h
+          # wpa_supplicant is built from the synced tree again (see the
+          # packages section of lineage-common.mk).  Two things have to be
+          # there: the module itself, and the qcwcn static library that
+          # BOARD_WPA_SUPPLICANT_PRIVATE_LIB names.  Missing either one used to
+          # surface as a ninja error an hour into the build; both are checked
+          # here so a bad sync fails in seconds.
+          test -d external/wpa_supplicant_8/wpa_supplicant
+          test -f hardware/qcom/wlan/qcwcn/wpa_supplicant_8_lib/Android.mk
+          # That library is wrapped in `ifeq ($(WPA_SUPPLICANT_VERSION),
+          # VER_0_8_X)`, and it is the only producer of the module.  If the
+          # variable is ever dropped from BoardConfigCommon.mk the static
+          # library silently stops being built and wpa_supplicant then fails
+          # to link against a module that does not exist.
+          grep -q "WPA_SUPPLICANT_VERSION := VER_0_8_X" \
+              device/kyocera/msm8926-common/BoardConfigCommon.mk
+          grep -q "lib_driver_cmd_qcwcn" \
+              device/kyocera/msm8926-common/BoardConfigCommon.mk
           # cm-14.1's product_config.mk looks the product up by filename:
           # brunch/lunch export CM_BUILD and it does
           #   find device -path "*/$CM_BUILD/lineage.mk"
