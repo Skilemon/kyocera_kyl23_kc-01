@@ -1,0 +1,529 @@
+# ===========================================================================
+# kyl23-extra.rc -- board init for the 7.1 port of the Kyocera msm8926.
+#
+# This file is part of the device tree (system/etc/init/kyl23-extra.rc) and is
+# what makes the ROM boot at all: the vendor blob set is 4.4, the framework is
+# 7.1, and everything in between is bridged here or in the helpers it starts.
+#
+# ---------------------------------------------------------------------------
+# Wi-Fi: finished, and this is the shape it ended in.
+#
+# The device shipped a 4.4 wpa_supplicant (v2.1-devel) that speaks the old
+# ctrl_iface dialect, so several rounds of work went into making a 7.1
+# framework talk to it -- including a patch to /system/framework/wifi-service.jar
+# that made WifiNative.listNetworks() drop the LAST_ID argument, because the
+# 4.4 binary answered UNKNOWN COMMAND to it.
+#
+# That patch was the bug.  WifiConfigStore.loadNetworks() pages through the
+# network list and stops when a page holds nothing but the header; with the
+# argument gone, "page two" is page one again, the same configKey shows up
+# twice, the duplicate branch calls removeNetwork() on the entry it just read,
+# and the saved network is deleted on every Wi-Fi toggle.  Settings kept
+# showing the AP, the supplicant no longer had it, every SET_NETWORK after that
+# answered FAIL, and the next toggle wrote an empty config -- the password
+# prompt.
+#
+# The fix is not another patch.  /system/bin/wpa_supplicant is now built from
+# cm-14.1's own external/wpa_supplicant_8 (v2.6-devel), which pages correctly:
+# LIST_NETWORKS LAST_ID=-1 returns everything, LAST_ID=<last id> returns the
+# header alone, and the loop terminates the way it was written to.  With that
+# in place the framework's own wifi-service.jar works untouched, so the jar in
+# this build is the unmodified one the build system produced, and nothing
+# anywhere writes wpa_supplicant.conf or networkHistory.txt.
+#
+# What that removed: kcwpa (the 4.4 supplicant wrapper), the 4.4 blob itself,
+# /vendor/lib/kcssl, kcwifi2.sh / kcwifi3.sh / kcwifiwd.sh (all three rewrote
+# the conf file behind the framework's back), kcwpad, and the jar patch.  What
+# stayed: kcwifi, which is what loads the prima driver in the first place.
+# ---------------------------------------------------------------------------
+#
+# The blobs themselves: they were linked against 4.4's bionic/libcutils/
+# libmedia, which exported symbols 7.1 dropped (ioprio_set, list_add_tail, the
+# two-argument AudioTrack::write, CameraParameters::KEY_BLINK_DETECT, ...).
+# Every consumer died at dlopen with "cannot locate symbol", which is why
+# rmt_storage (no modem EFS -> unknown baseband), audio.primary (no sound),
+# camera.msm8226 (no camera app) and bluetooth.default never worked.
+# /vendor/lib/libkccabi.so back-fills all of them at once, so it is preloaded
+# into everything init spawns from here on.  It is built with -nostdlib: no
+# NEEDED entries, no constructors, nothing that can fail.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# kyl23: 7.1 framework on top of a 4.4 vendor blob set.
+#
+# The vendor blobs were linked against 4.4's bionic/libcutils/libmedia, which
+# exported symbols 7.1 dropped (ioprio_set, list_add_tail, the two-argument
+# AudioTrack::write, CameraParameters::KEY_BLINK_DETECT, ...).  Every consumer
+# died at dlopen with "cannot locate symbol", which is why rmt_storage (no
+# modem EFS -> unknown baseband), audio.primary (no sound), camera.msm8226 (no
+# camera app) and bluetooth.default never worked.  /vendor/lib/libkccabi.so
+# back-fills all of them at once, so it is preloaded into everything init
+# spawns from here on.  It is built with -nostdlib: no NEEDED entries, no
+# constructors, nothing that can fail.
+# ---------------------------------------------------------------------------
+
+on boot
+    setprop wifi.interface wlan0
+
+# ---------------------------------------------------------------------------
+# Modem remote filesystem.  rfs_access serves the modem's EFS requests
+# (modemst1/2 + fsg).  Without it the firmware stalls during init and its own
+# watchdog resets it, and Android shows an unknown baseband.
+# ---------------------------------------------------------------------------
+service rfs_access /vendor/bin/rfs_access
+    class core
+    user system
+    group system net_raw
+
+# ---------------------------------------------------------------------------
+# WiFi.
+#
+# prima is a "satellite" driver: it cannot bring wlan0 up until wcnss_service
+# has fed WCNSS_cfg.dat to the chip over /dev/wcnss_wlan.  The load itself has
+# to go through init_module(2), because 7.1's libhardware_legacy (and toybox
+# insmod) use finit_module(2), which arrived in Linux 3.8 and this kernel is
+# 3.4.  libkccabi makes finit_module() report success; kcwifi does the real
+# load and retries until wlan0 exists, so a chip that comes up late still ends
+# up working instead of leaving wifi dead for the session.
+# ---------------------------------------------------------------------------
+service kcwifi /vendor/bin/kcwifi
+    class core
+    user root
+    group root system wifi net_raw
+
+# ---------------------------------------------------------------------------
+# fix33: WiFi reconnect and the Bluetooth crash loop.
+#
+# After an off/on cycle the supplicant is a fresh process that, unlike at boot,
+# does not select the saved network by itself -- and the framework cannot ask
+# it to, because it never adopted that network (it rebuilds it with a made-up
+# netId, does not find it in its own list, and drops it:
+# "configuration found for missing network, nid=-1616136200, ignored,
+# networks.size=1"; -1616136200 is "K2"WPA_PSK.hashCode()).  So the phone scans
+# and scans and never joins.  kcwpad is the missing peer: it talks wpa_ctrl on
+# /data/misc/wifi/sockets/wlan0 -- the build has no wpa_cli -- and sends
+# RECONNECT when the supplicant has been sitting disconnected with an enabled
+# network.  It also keeps the conf file itself from being eaten, and disables
+# the com.android.bluetooth package, whose 4.4 vendor stack cannot survive the
+# 7.1 framework and otherwise SIGSEGVs every 0.7 s.
+#
+# fix34 turned it from "started, logged four lines, then silence" into a
+# daemon that says what it sees on every poll (state, scan result count,
+# network list, and the exact step that failed if the ctrl socket is not
+# reachable), because last round it was impossible to tell "there was nothing
+# to do" from "it gave up".  On top of the kick it now:
+#   * strips bssid= from the saved block -- a bssid pin plus a firmware reload
+#     (the framework reloads the radio on every enable) means the supplicant
+#     scans but can never select a BSS;
+#   * pushes the saved network back into a live supplicant that has none
+#     (ADD_NETWORK/SET_NETWORK/ENABLE_NETWORK), which is the case that ends in
+#     "input the password again";
+#   * creates /dev/kmsg when the image has none, so kernel-log breadcrumbs
+#     exist even if /cache is truncated.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# fix40: kcwpad is retired.
+#
+# It did the right thing in the wrong place.  Its job was to put the saved
+# network back when the supplicant came up without one, but it wrote the conf
+# *file*, and a running supplicant never re-reads that file -- so after an
+# off/on cycle it restored the file while the live process kept an empty
+# configuration, the framework kept aiming SET_NETWORK at network id 0, the
+# blob answered FAIL, CMD_AUTO_CONNECT gave up with "couldn't update the
+# config, got null config", and the phone scanned forever without joining.
+# Its own log said as much: "ctrl open failed (connect:Connection refused)".
+#
+# kcwd talks to the running process instead, over the interface control socket
+# /data/misc/wifi/sockets/wlan0 (4.4 style, bare commands) and, failing that,
+# the abstract name wpa_wlan0 that the 7.1 framework uses.  When LIST_NETWORKS
+# comes back with no rows it recreates the saved network with ADD_NETWORK /
+# SET_NETWORK / ENABLE_NETWORK / SAVE_CONFIG, which repairs the live process
+# *and* the file in one step.  It stays out of the way otherwise: it only acts
+# when the supplicant has no networks at all, so it never fights the framework
+# over a network the user actually has, and it keeps /data/misc/wifi/kc_wpa.gold
+# as the last known good copy.
+#
+# service kcwpad /vendor/bin/kcwpad
+#     class late_start
+#     user root
+#     group root system wifi
+
+# ---------------------------------------------------------------------------
+# fix43: kcwd is gone, and so is the 4.4 supplicant.
+#
+# Everything above this line was written to keep a 4.4 wpa_supplicant blob
+# alive under a 7.1 framework: kcwpad talked to it, kcwd repaired its config
+# file, the framework's jar was patched so LIST_NETWORKS would be understood.
+# The real fix is the one the device should have shipped with -- /system/bin
+# wpa_supplicant, built from cm-14.1's own external/wpa_supplicant_8, which
+# speaks the ctrl_iface dialect the framework expects.  With it in place the
+# network ids agree, SAVE_CONFIG stores a real config, and the saved network
+# survives an off/on cycle without any help.
+#
+# So: no daemon, no file repair, no jar patch.  See the p2p_supplicant
+# service below for the one line that changed.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# WiFi, part two: the framework's half.
+#
+# fix29 proved the config side was fine -- /data/misc/wifi/wpa_supplicant.conf
+# carries psk= and update_config=1 -- and the phone still refused to reconnect
+# after a single off/on cycle.  logcat says why, twice:
+#
+#     WifiMonitor: killSupplicant p2ptrue init.svc.wpa_supplicant=unknown
+#     WifiStateMachine: Failed to load driver
+#
+# "Failed to load driver" is 7.1's libhardware_legacy/wifi.c asking for the
+# module: is_wifi_driver_loaded() looks at /proc/modules *and* at the property
+# wlan.driver.status, and when that check misses it calls insmod(), which uses
+# finit_module(2).  This kernel is 3.4; finit_module does not exist, so insmod
+# fails in two milliseconds and the whole wifi stack stops before it ever
+# reaches the supplicant -- no supplicant, no config, no saved networks, which
+# is the "it forgot my password again" screen.
+#
+# wlan0 is already up at that point: wlan_up.sh loaded prima with
+# init_module(2) at 10 s and set wlan.driver.status=ok.  The framework is
+# arguing about a module it does not need to load.
+#
+# So wifi_load_driver() and wifi_unload_driver() in /lib/libhardware_legacy.so
+# are patched to "movs r0,#0 ; bx lr" -- report success, touch nothing.  The
+# interface then comes up once per boot (wlan_up.sh) and stays up for the life
+# of the boot: turning wifi off stops the supplicant, turning it on starts a new
+# one against a live wlan0, and the saved network is there every time.
+#
+# kcwifiwd is the insurance: if wlan0 ever does disappear, reload it.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# WiFi, part three: keep the saved network on disk for the whole session.
+#
+# fix31 made the file correct at boot and the phone now joins K2 by itself
+# after a cold start -- but not after a WiFi off/on cycle, and the password has
+# to be typed again every time.  The dump finally shows why, and it is not the
+# supplicant's fault:
+#
+#     WifiConfigManager: Loading config and enabling all networks
+#     WifiConfigManager: configuration found for missing network,
+#                        nid=-1616136200, ignored, networks.size=1
+#
+# -1616136200 is Java's "K2"WPA_PSK.hashCode(): the framework rebuilds the
+# network from the file, gets a made-up netId instead of the supplicant's 0,
+# throws it away, and therefore holds *zero* configured networks for the whole
+# boot.  WiFi still works at boot because the supplicant joins a network it
+# already has without asking the framework.
+#
+# Turning WiFi off is where that empty list becomes data loss.
+# WifiConfigStore.saveConfig() begins by calling removeNetwork() for every
+# netId the supplicant has and the framework does not know about, then saves.
+# With an empty list that is "remove the only network, then save the empty
+# result" -- the psk is deleted from /data/misc/wifi/wpa_supplicant.conf, not
+# merely forgotten.  Turning WiFi back on starts a supplicant with no networks
+# at all, Settings asks for the password (ID: -1, hasEverConnected: false), and
+# each entry deposits one more disabled=1 copy of K2 -- the file grew from 1
+# block to 4 in a single session.
+#
+# kcwifi3 keeps a copy of the healthy file (one block, psk=, no disabled=1) in
+# /data/misc/wifi/kc_wpa.gold and in /cache, and puts it back the moment the
+# file loses it, which is while WiFi is still off -- so the next supplicant
+# start is byte for byte the one that auto-joins after a reboot.  If the file
+# comes back with duplicates, it collapses them per SSID.  After a repair it
+# sends SIGHUP to the supplicant, which it treats as "reconfigure": the repair
+# also takes effect when WiFi is already on, without wpa_cli (there is none on
+# this build).  See kcwifi3.sh.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Bluetooth: stop the crash loop.
+#
+# The kernel's user-fault reporter finally caught the crash this time:
+#
+#     USRFLT BluetoothAdapte/3667 addr=0000003c fsr=00005
+#     USRFLT pc ... bluetooth.default.so off=000343f2 (ldr r2,[r4,#0x3c], r4=0)
+#
+# bluetooth.default.so dereferences a NULL callback struct 0x3c bytes in -- the
+# 7.1 framework hands the 4.4 vendor stack a bt_callbacks_t of the wrong shape,
+# the guard before it passes, and the stack walks off the end of the struct.
+# Same root as everything else on this port: the blobs predate the framework.
+# It crashes, the framework restarts AdapterService, it crashes again: 100 times
+# in four minutes, each one spawning debuggerd, and that storm is why a 1 MB
+# logcat only held 75 seconds and why the UI stutters.
+#
+# btif_init_bluetooth is patched to return BT_STATUS_NOT_READY immediately, so
+# the stack never gets far enough to walk off the struct: AdapterService sees
+# initNative fail and stays off, quietly, with no crash and no restart loop.
+# Bluetooth still cannot be turned on -- the WCNSS BT core never comes up on
+# this port -- but it no longer costs the rest of the phone anything.
+# Reverting this one 4-byte patch brings the crashes back.
+#
+# fix31: that was only half of it.  The stack still crashed every 1.3 s, and
+# the kernel's fault reporter said why -- JNI wrappers hand the HAL's
+# bt_status_t back as if it were a pointer:
+#
+#     libbluetooth_jni.so off=00015b82, 00016416, and then 0001481c
+#
+# Each is an `ldr r1,[r0,#4]` / `blx r1` pair that runs when the status is not
+# zero, i.e. it dereferences 2 (BT_STATUS_NOT_READY) as an address and faults
+# at 0x6.  fix26 patched the first one at a wrong offset, fix27 patched the
+# second and the crash moved back to the first, fix31 patched both and the
+# crash moved to a third: whack-a-mole, because the whole file is built from
+# one template.
+#
+# fix32 stops playing that game.  The template is
+#
+#     ldr rX,[iface,#0x58] ; blx rX ; cmp r0,#0 ; str r0,[global] ; beq err
+#     ldr rY,[r0,#4] ; blx rY
+#
+# -- 7.1's slot 0x58 is get_profile_interface, but the 4.4 vendor library has a
+# different table layout, so 0x58 is a function that returns a bt_status_t and
+# the JNI dereferences 2 as if it were a profile struct.  All eleven copies of
+# that template are patched (the beq before each dereference becomes an
+# unconditional branch), so the status is logged and the call returns instead
+# of faulting.  Even with a correct offset the seven-year-old profile structs
+# behind it would not survive contact with the 7.1 callbacks, so Bluetooth
+# stays off -- but it stays off quietly: the session before this one restarted
+# AdapterService ~380 times in seven minutes.
+# ---------------------------------------------------------------------------
+
+service kcssr /vendor/bin/kcssr.sh
+    class core
+    user root
+    group root system
+    oneshot
+
+# The ADSP never loads on this port, and nothing that needs audio works without
+# it: the SLIMBUS controller is NGSLIM (it drives the bus through the ADSP), so
+# no ADSP means no tapan codec, no sound card, no audio calibration, no sensor
+# daemon and no DSP camera post-processing.  See kcadsp.sh.
+service kcadsp /vendor/bin/kcadsp.sh
+    class core
+    user root
+    group root system
+    oneshot
+
+# The first attempt runs at 5 s, before audioserver, because the audio HAL
+# blocks in adev_open() until the sound card exists.  If the ADSP was not ready
+# that early, try again once the framework is up: a late boot is still better
+# than a phone without sound.
+on property:sys.boot_completed=1
+    start kcadsp
+
+# The only supplicant in this build.  It pages its network list correctly, so
+# the framework's unmodified wifi-service.jar works with it -- see the header.
+# -d stays on: it is the only reason the daemon's own view of a command is
+# visible at all, and it is what turned this bug from a guess into two lines of
+# log.  It costs a few kilobytes in /data/misc/wifi.
+service p2p_supplicant /system/bin/wpa_supplicant \
+    -ip2p0 -Dnl80211 -c/data/misc/wifi/p2p_supplicant.conf \
+    -I/system/etc/wifi/p2p_supplicant_overlay.conf -N \
+    -iwlan0 -Dnl80211 -c/data/misc/wifi/wpa_supplicant.conf \
+    -I/system/etc/wifi/wpa_supplicant_overlay.conf \
+    -O/data/misc/wifi/sockets -puse_p2p_group_interface=1 \
+    -e/data/misc/wifi/entropy.bin -g@android:wpa_wlan0 -d
+    class main
+    socket wpa_wlan0 dgram 660 wifi wifi
+    disabled
+    oneshot
+
+# ---------------------------------------------------------------------------
+# Capacitive key backlight.  7.1 does not time LIGHT_ID_BUTTONS out by itself
+# and the framework never even asks for it at a key press, so a tiny daemon
+# owns the LED:
+#   * lights it on any EV_KEY down (logging what the kernel read back),
+#   * kills it after the timeout, or immediately when the panel blanks,
+#   * follows Settings -> Buttons -> Backlight, i.e. CMSettings.Secure
+#     "button_brightness" (0 = illumination off) and "button_backlight_timeout"
+#     (milliseconds).
+#
+# The two values are read by the daemon itself, straight out of the provider's
+# SQLite file: it walks the b-tree read-only, with no sqlite3 binary, no locks
+# and no child process.  Every earlier attempt used a shell loop with sqlite3,
+# and each one failed at a different layer -- wrong key name (fix13), missing
+# /xbin/sqlite3 (fix15), and finally a script that logged "started" and then
+# never logged anything again (fix16/fix17), which left the daemon on its
+# compiled-in 255/5000 defaults no matter what the page said.  Parsing the file
+# in-process removes that whole class of failure.
+#
+# State changes go to /cache/kclog.txt (mirrored to /data/misc and the card) and
+# every decision is also written to the kernel log as KCLED -- that second path
+# is the important one: the cache partition is 458 MB and a dump only ever
+# returns its first 20 MB, while the kernel log lands on the 20 MB "log"
+# partition, which dumps in well under a minute.  The daemon also prints the
+# physical offset of each of its log files with FIEMAP, so "the log is missing"
+# can never again be confused with "the log was written past the dump window".
+# ---------------------------------------------------------------------------
+service kcbtnled /vendor/bin/kcbtnled
+    class core
+    user root
+    group root system input
+
+# ---------------------------------------------------------------------------
+# /dev/fuse does not exist: the kernel has FUSE built in (no uevent) and the
+# ramdisk ueventd.rc has no static entry for it.  Create it before vold tries
+# to bring up /storage/emulated/0, otherwise /sdcard stays empty forever.
+# ---------------------------------------------------------------------------
+on post-fs-data
+    # This file is parsed from /system/etc/init, which init only reads once
+    # /system is mounted -- that happens *after* the "init" trigger, so an
+    # on-init export here would never run.  post-fs-data is the last trigger
+    # before "boot", which is where class_start core/main (zygote, mediaserver,
+    # audioserver) happens, so everything spawned from here on inherits it.
+    export LD_PRELOAD /vendor/lib/libkccabi.so
+
+    # A NULL deref inside cfg80211 must not take the whole phone down.  The
+    # kernel has panic_on_oops=1 (Kyocera set it so ramdump would catch every
+    # oops); with it every prima teardown turns into a reboot loop.  Let the
+    # oops kill the offending thread instead, and keep the log we need.
+    write /proc/sys/kernel/panic_on_oops 0
+
+    # PRODUCT_COPY_FILES in the device makefile installs everything 0644, so
+    # the helpers arrive without the execute bit on a ROM built from source
+    # (the images shipped during bring-up were built by hand and already had
+    # it).  Set it here, before any of them is exec'd or started below.  On a
+    # hand-built image this is a no-op.
+    chmod 0755 /vendor/bin/kcwifi /vendor/bin/kcboot /vendor/bin/kcbtnled
+    chmod 0755 /vendor/bin/kcfuse.sh /vendor/bin/kcssr.sh /vendor/bin/kcadsp.sh
+    chmod 0755 /vendor/bin/kctail.sh /vendor/bin/kcshut.sh /vendor/bin/kchalt.sh
+    chmod 0755 /vendor/bin/kcstate.sh /vendor/bin/kcstate-boot.sh
+    chmod 0755 /vendor/bin/kcstate-delay.sh /vendor/bin/kc_bootanim.sh
+    chmod 0755 /vendor/bin/kccam.sh /system/etc/kcfix.sh
+    exec -- /vendor/bin/kcfuse.sh
+    exec -- /vendor/bin/kcboot mknod
+    mkdir /data/misc/wifi 0770 wifi wifi
+    # QMI transport nodes.  This kernel has CONFIG_DEVTMPFS=n, so they come
+    # from ueventd.qcom.rc with the 4.4 ownership; qmuxd runs as radio and
+    # fails with "qmi_qmux_if_pwr_up_init failed rc=-1" unless it can open
+    # them, which leaves every RIL request unanswered (baseband "unknown").
+    chown radio radio /dev/qmi0
+    chown radio radio /dev/qmi1
+    chown radio radio /dev/qmi2
+    chmod 0660 /dev/qmi0
+    chmod 0660 /dev/qmi1
+    chmod 0660 /dev/qmi2
+    chown radio radio /dev/smdcntl0
+    chown radio radio /dev/smdcntl1
+    chmod 0660 /dev/smdcntl0
+    chmod 0660 /dev/smdcntl1
+    mkdir /data/misc/wifi/sockets 0770 wifi wifi
+    mkdir /data/misc/audio 0770 audio audio
+
+    # Nothing in this build touches wpa_supplicant.conf or networkHistory.txt.
+    # A network written by a script is a network the framework cannot manage,
+    # and the saved list is the framework's data, not ours.
+    #
+    # What is left in kcfix.sh is one system setting:
+    #   - captive_portal_mode=IGNORE, because on 7.1 a single failed internet
+    #     probe permanently disables a network (threshold 1, timeout
+    #     MAX_VALUE) and the gstatic probe cannot succeed from a CN network.
+    exec -- /system/bin/sh /system/etc/kcfix.sh
+
+    # The jar below was put back to the build system's own copy (see the
+    # header).  Its dex checksum differs from the one ART cached, so it would
+    # be recompiled anyway; removing the stale oat makes that certain rather
+    # than likely, and costs one line.
+    exec -- /system/bin/rm -f /data/dalvik-cache/arm/system@framework@wifi-service.jar@classes.dex
+    exec -- /system/bin/rm -f /data/dalvik-cache/system@framework@wifi-service.jar@classes.dex
+
+    # Both of these are declared as services further up.  They have to be
+    # started by name: this file is parsed at 4.3 s, long after init has already
+    # run class_start core, so a plain "class core" service added here would
+    # never run at all -- which is exactly what happened to kcssr in fix23.
+    start kcssr
+    start kcadsp
+
+    # /cache is where every one of these scripts leaves its transcript, and
+    # the bluetooth process (uid 1002) needs to be able to write next to it.
+    chmod 0777 /cache
+
+# ---------------------------------------------------------------------------
+# Health report for the subsystems that are still broken (key-light settings,
+# WiFi, audio, camera, baseband).  Runs at boot_completed and again two minutes
+# later, because the supplicant / audio HAL only fail once the framework is up.
+# Writing to /cache alone is not enough: the user's dump of that partition is
+# truncated, so every line is also pushed to /dev/kmsg ("KCST ...") and
+# therefore survives on the log partition.
+# ---------------------------------------------------------------------------
+# Runs on a timer from late_start; sys.boot_completed is far too late here.
+# Watches for the shutdown and records how far the kernel got.  See kcshut.sh.
+# ---------------------------------------------------------------------------
+# fix28: keep the tail of logcat, not the head.
+#
+# kcrec stops at 1 MB (~75 s into the boot); the settings freeze happened at
+# 74 s and its aftermath -- the watchdog kill of system_server, the audioserver
+# respawn loop -- was past the end of the file.  kctail keeps only the tags
+# that explain a hang, in five rotating 192 KB files, so the last ten minutes
+# before a freeze always survive.  See kctail.sh.
+# ---------------------------------------------------------------------------
+service kctail /vendor/bin/kctail.sh
+    class late_start
+    user root
+    group root system log
+
+service kcshut /vendor/bin/kcshut.sh
+    class late_start
+    user root
+    group root system
+    oneshot
+
+# Mirrors the camera open/preview transitions into the kernel log, which is the
+# only channel a dump always carries in full.  See kccam.sh.
+
+
+# ---------------------------------------------------------------------------
+# Reboot that finishes.
+#
+# The framework sets sys.shutdown.requested the moment the user picks Reboot or
+# Power off; sys.powerctl follows a few seconds later, once userspace is done.
+# Up to fix28 the kernel then took over and sat there for eight minutes waiting
+# for a modem that is permanently resetting itself.  kchalt.sh waits for
+# sys.powerctl and then pulls the sysrq lever, which is the same shortcut a long
+# power-press takes: emergency_restart(), with no subsystem stop to wait for.
+# See kchalt.sh.
+# ---------------------------------------------------------------------------
+# Declared as a service, not run with "exec": init blocks until an exec'd
+# child exits, and that would stall init's property socket -- including the
+# sys.powerctl the framework is about to write, which is exactly what kchalt
+# has to see.  As a service it runs beside init and the property goes through.
+service kchalt /vendor/bin/kchalt.sh
+    class late_start
+    user root
+    group root system
+    oneshot
+    disabled
+
+on property:sys.shutdown.requested=*
+    start kchalt
+
+service kcstate /vendor/bin/kcstate-boot.sh
+    class late_start
+    user root
+    group root system
+    oneshot
+
+# ---------------------------------------------------------------------------
+# Board diagnostics.  kcboot is a static binary because the shell probe that
+# came before it started but never produced a single line: this kernel has
+# CONFIG_DEVTMPFS=n, the stock ueventd.rc has no /dev/kmsg, and every write
+# went to /dev/null.  kcboot creates /dev/kmsg itself *and* writes the same
+# transcript to /cache/kc_diag.txt, because the kernel log capture drops
+# bursts.  Runs twice: once at boot and once when the framework says it is
+# done, so the LED/UIO/storage state can be compared.
+# ---------------------------------------------------------------------------
+service kcdiag /vendor/bin/kcboot diag
+    class core
+    user root
+    group root system
+    oneshot
+
+service kcdiag2 /vendor/bin/kcboot diag2
+    class late_start
+    user root
+    group root system
+    oneshot
+    disabled
+
+# fix47: the kcprobe/wpaq pair is gone.  It existed to answer one question --
+# what does the daemon reply to SET_NETWORK -- and it answered it.  With Wi-Fi
+# working and nothing writing the config, there is nothing left for it to watch,
+# and a probe that runs on every boot is just another thing that can fail.
+# ---------------------------------------------------------------------------

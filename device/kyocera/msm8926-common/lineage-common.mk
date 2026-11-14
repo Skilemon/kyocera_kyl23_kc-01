@@ -116,3 +116,34 @@ PRODUCT_PROPERTY_OVERRIDES += \
 # hardware/qcom/wlan present in the manifest (see the workflow).
 PRODUCT_PACKAGES += \
     wpa_supplicant
+
+# ------------------------------------------------------- board init, and the
+# helpers it starts
+#
+# kyl23-extra.rc is where this port actually lives.  Everything the 7.1
+# framework needs and the 4.4 blob set cannot provide -- the modem EFS server,
+# the prima loader, the supplicant, the ADSP bring-up, the LD_PRELOAD that
+# back-fills the dropped 4.4 symbols into every vendor binary -- is started
+# from, or configured in, that one file.  Without it in system/etc/init the ROM
+# boots and then does nothing: no baseband, no Wi-Fi, no sound.
+#
+# The helpers are prebuilt binaries and scripts, not build products; they are
+# the glue nothing else on this device ships.  PRODUCT_COPY_FILES installs
+# everything 0644, so the rc sets the execute bit itself in post-fs-data, before
+# the first exec.  (The images used during bring-up were assembled by hand and
+# already carried 0755, which is why this only matters for a ROM built here.)
+KC_PREBUILT := $(LINEAGE_COMMON_PATH)/prebuilt/kc
+KC_BINS := kcboot kcfuse.sh kcbtnled kc_bootanim.sh kcstate.sh kcwifi \
+           kccam.sh kcssr.sh kcstate-delay.sh kcstate-boot.sh kcadsp.sh \
+           kcshut.sh kctail.sh kchalt.sh
+KC_LIBS := libkccabi.so libkcabi.so libkchwc.so
+
+PRODUCT_COPY_FILES += \
+    $(LINEAGE_COMMON_PATH)/rootdir/etc/init/kyl23-extra.rc:system/etc/init/kyl23-extra.rc \
+    $(KC_PREBUILT)/kcfix.sh:system/etc/kcfix.sh
+
+PRODUCT_COPY_FILES += \
+    $(foreach f,$(KC_BINS),$(KC_PREBUILT)/bin/$(f):$(TARGET_COPY_OUT_VENDOR)/bin/$(f))
+
+PRODUCT_COPY_FILES += \
+    $(foreach f,$(KC_LIBS),$(KC_PREBUILT)/lib/$(f):$(TARGET_COPY_OUT_VENDOR)/lib/$(f))
