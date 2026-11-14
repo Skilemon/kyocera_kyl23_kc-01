@@ -131,14 +131,12 @@ jobs:
             <project path="device/qcom/common"
                      name="LineageOS/android_device_qcom_common"
                      revision="cm-14.1" />
-            <!-- BOARD_WPA_SUPPLICANT_PRIVATE_LIB is lib_driver_cmd_qcwcn, so
-                 wpa_supplicant links that static library by name and the
-                 build fails with "module 'lib_driver_cmd_qcwcn' not found"
-                 if the tree holding it is missing.  It lives in its own repo
-                 and is not in the cm-14.1 default manifest. -->
-            <project path="hardware/qcom/wlan"
-                     name="LineageOS/android_hardware_qcom_wlan"
-                     revision="cm-14.1" />
+            <!-- hardware/qcom/wlan is already in the default manifest
+                 (default.xml:367, groups="qcom_wlan,pdk"), and that is where
+                 lib_driver_cmd_qcwcn lives.  Listing it again here makes repo
+                 bail out with "duplicate path hardware/qcom/wlan" before it
+                 fetches anything, so it is deliberately *not* repeated; the
+                 check below proves the tree really arrived. -->
           </manifest>
           XML
           repo sync -c --force-sync --no-clone-bundle --no-tags --no-repo-verify -j8
@@ -357,6 +355,20 @@ jobs:
           mka libqdutils libqdMetaData liboverlay libqservice libmemalloc \
               "hwcomposer.${PLATFORM}" "gralloc.${PLATFORM}" \
               "copybit.${PLATFORM}" -j"$(nproc --all)"
+
+          # wpa_supplicant is what this whole change is about: the product now
+          # names it, and every Wi-Fi bug this device has comes from the 4.4
+          # binary that used to stand in its place.  Build it before bacon so a
+          # missing module or an unresolved lib_driver_cmd_qcwcn fails here in
+          # minutes instead of at 90% of a two-hour build.
+          mka wpa_supplicant -j"$(nproc --all)"
+          WP="out/target/product/$DEVICE/system/bin/wpa_supplicant"
+          ls -l "$WP"
+          # The size proves nothing (the 4.4 blob is 871 KB), the version
+          # string does.  This is the pair of lines that has to change.
+          strings -a "$WP" | grep -m1 "wpa_supplicant v"
+          strings -a "$WP" | grep -q "v2.6-devel" || {
+            echo "built binary is not the 7.1 supplicant"; exit 1; }
 
           # The build prints its own progress; -j is capped at the runner's
           # core count by soong anyway.
