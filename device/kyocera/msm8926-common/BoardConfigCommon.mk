@@ -65,19 +65,21 @@ BOARD_KERNEL_CMDLINE := console=ttyHSL0,115200,n8 no_console_suspend=1 androidbo
 # quiet during a full boot, a camera session and a call.
 BOARD_KERNEL_CMDLINE += androidboot.selinux=permissive
 
-# Bring-up adb.  The tree defaults this device to persist.sys.usb.config=none
-# and init.usb.rc answers that with `stop adbd`, so a boot that hangs before the
-# launcher has no adb at all -- and that is the one boot whose log matters.
+# adb is not enabled by default.  Nothing here forces persist.sys.usb.config,
+# so what comes up on the USB port is whatever the framework asks for once the
+# user turns USB debugging on in Developer options -- adbd still needs a key:
+# there is no shipped /adb_keys and no ro.adb.secure=0 (the product-level value
+# is ignored anyway, ro.* is write-once and the build system writes its own
+# line first).
 #
-# ro.adb.secure is deliberately *not* set here.  The build system appends its
-# own value to ADDITIONAL_DEFAULT_PROPERTIES after the product's, and ro.* is
-# write-once: whichever line is written first into default.prop wins, so a
-# product-level ro.adb.secure=0 is silently ignored (verified: the built
-# default.prop still says 1).  Authorisation is bypassed with a shipped public
-# key in /adb_keys instead; see lineage-common.mk.
+# To get a shell on a device that will not boot, use the recovery image, or
+# temporarily add the two bring-up lines back: this one, and
+# `setprop sys.usb.config adb` in rootdir/init.qcom.rc.
 #
-# Revert to none before this image is used for anything but bring-up.
-ADDITIONAL_DEFAULT_PROPERTIES += persist.sys.usb.config=adb
+# (Historically this tree forced persist.sys.usb.config=adb because init.usb.rc
+# turns the stock default of `none` into `stop adbd`.  That is the wrong fix:
+# it leaves adb open on every boot of every unit, and it disables the user's
+# ability to keep it closed.)
 BOARD_MKBOOTIMG_ARGS := --ramdisk_offset 0x01000000 --second_offset 0x00f00000 --tags_offset 0x00000100
 
 # The device tree is appended to the image as a Qualcomm QCDT blob.  It is

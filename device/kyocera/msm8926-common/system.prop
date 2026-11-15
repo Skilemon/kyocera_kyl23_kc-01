@@ -37,6 +37,27 @@ ro.qc.sdk.izat.service_mask=0x0
 ro.telephony.default_network=8
 persist.radio.apm_sim_not_pwdn=1
 
+# How rild finds and execs the stock qcril blob.  These two are here, and not in
+# PRODUCT_PROPERTY_OVERRIDES with the rest of the board's properties, because
+# rild.libargs contains a space and that list can only hold single words -- see
+# the long note at the telephony section of lineage-common.mk.  Written as a
+# file, the value survives intact, which is exactly what /vendor/lib and the
+# stock build.prop have.
+rild.libpath=/vendor/lib/libril-qc-qmi-1.so
+rild.libargs=-d /dev/smd0
+
+# ------------------------------------------------------------ baseband string
+# Deliberately not set.  Settings -> About -> Baseband version reads
+# gsm.version.baseband, whose only writer is the telephony stack, and on this
+# port RIL_REQUEST_BASEBAND_VERSION never succeeds, so the field reads
+# "unknown".
+#
+# A hand-written value was tried here and removed: it made the UI look right
+# while claiming nothing had been fixed.  The failure is a firmware/timing
+# mismatch, not a missing property -- see docs/DEVICE_NOTES.md section 19 for
+# the IDL table, the two length limits that reject the reply, and why the
+# value could only ever have been a copy of the modem's own header anyway.
+
 # ------------------------------------------------------------------ dalvik
 dalvik.vm.heapsize=256m
 dalvik.vm.heapgrowthlimit=96m

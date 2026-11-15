@@ -55,20 +55,16 @@ PRODUCT_COPY_FILES += \
     $(LINEAGE_COMMON_PATH)/rootdir/init.qcom.rc:root/init.qcom.rc \
     $(LINEAGE_COMMON_PATH)/rootdir/ueventd.qcom.rc:root/ueventd.qcom.rc
 
-# adbd will not hand out a shell until it has an authorised key, and the dialog
-# that authorises one needs a screen that works -- precisely what is missing
-# when the boot hangs.  adbd checks /adb_keys in the ramdisk before it looks at
-# /data/misc/adb/adb_keys (key_paths[] in adb_auth_client.cpp), so shipping a
-# known public key here makes the device reachable from a black screen.
-#
-# This is a bring-up crutch: anyone holding the matching private key gets a
-# root shell.  Delete both this rule and rootdir/adb_keys before the image is
-# used for anything real.
-PRODUCT_COPY_FILES += \
-    $(LINEAGE_COMMON_PATH)/rootdir/adb_keys:root/adb_keys
+# No /adb_keys in the ramdisk.  adbd used to pick it up before it looked at
+# /data/misc/adb/adb_keys (key_paths[] in adb_auth_client.cpp), which made every
+# unit reachable with one private key and no confirmation -- a backdoor, not a
+# feature.  Authorisation now goes through the normal path: the dialog on the
+# device, or whatever the user has already approved in /data/misc/adb/adb_keys.
 
 # Everything here mirrors the stock build.prop.  Duplicating a few of them in
 # system.prop would be harmless but confusing, so these stay in one place.
+# Every value here is a single word by construction -- anything with a space in
+# it has to go into system.prop instead, see the telephony note below.
 PRODUCT_PROPERTY_OVERRIDES += \
     ro.board.platform=msm8226 \
     ro.opengles.version=196608 \
@@ -76,12 +72,20 @@ PRODUCT_PROPERTY_OVERRIDES += \
     persist.hwc.mdpcomp.enable=true
 
 # --------------------------------------------------------------- telephony
-# rild comes from the stock qcril blob, not from AOSP's reference RIL.  These
-# two properties are how libhardware_legacy finds and execs it.
-PRODUCT_PROPERTY_OVERRIDES += \
-    rild.libpath=/vendor/lib/libril-qc-qmi-1.so \
-    rild.libargs=-d /dev/smd0 \
-    ro.telephony.default_network=8
+# rild comes from the stock qcril blob, not from AOSP's reference RIL.  Its two
+# properties live in system.prop, not here, and that is not a style choice:
+# PRODUCT_PROPERTY_OVERRIDES is a whitespace-separated list of key=value words,
+# so a value containing a space cannot be expressed in it at all.  Written here
+# as `rild.libargs=-d /dev/smd0` it shipped as `rild.libargs=-d`, with /dev/smd0
+# silently dropped off the end; backslash-escaping the space does not help,
+# because make splits on the space after the expansion, not before it.
+#
+# What that cost: rild handed qcril one argument fewer than the stock
+# build.prop does (RIL_Init argc 4 instead of 5).  The RIL still came up --
+# registration state, UIM, SMS and data all answered -- but
+# RIL_REQUEST_BASEBAND_VERSION returned GENERIC_FAILURE 14 ms after it was sent,
+# on every boot, and Settings showed "Baseband version: Unknown" because the
+# telephony stack only writes gsm.version.baseband when that request succeeds.
 
 # ------------------------------------------------------------------- audio
 PRODUCT_PROPERTY_OVERRIDES += \

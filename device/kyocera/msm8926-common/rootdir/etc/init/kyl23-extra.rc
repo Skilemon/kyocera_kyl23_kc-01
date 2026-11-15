@@ -634,7 +634,10 @@ on post-fs-data
     # QMI transport nodes.  This kernel has CONFIG_DEVTMPFS=n, so they come
     # from ueventd.qcom.rc with the 4.4 ownership; qmuxd runs as radio and
     # fails with "qmi_qmux_if_pwr_up_init failed rc=-1" unless it can open
-    # them, which leaves every RIL request unanswered (baseband "unknown").
+    # them, which leaves every RIL request unanswered.  (This was once blamed
+    # for the baseband showing as unknown -- that one was rild.libargs losing
+    # its device path in the makefile, see the telephony note in
+    # lineage-common.mk.)
     chown radio radio /dev/qmi0
     chown radio radio /dev/qmi1
     chown radio radio /dev/qmi2
@@ -645,6 +648,19 @@ on post-fs-data
     chown radio radio /dev/smdcntl1
     chmod 0660 /dev/smdcntl0
     chmod 0660 /dev/smdcntl1
+
+    # persist.radio.adb_log_on (qcril's hex dump of the messages it sends) is
+    # NOT set here.  A setprop in this section does nothing: post-fs-data runs
+    # before load_persist_props_action, so init then loads /data/property and
+    # the value on disk -- normally 0 -- overwrites this one.  Measured on the
+    # device: the property read back as 0 on every boot that had this line.
+    # Set it once by hand instead, and it survives because setprop writes
+    # /data/property/persist.radio.adb_log_on:
+    #     adb shell setprop persist.radio.adb_log_on 1
+    #     adb reboot
+    #     adb shell setprop persist.radio.adb_log_on 0
+    # It is very verbose, so leave it off except while chasing a QMI message.
+
     mkdir /data/misc/wifi/sockets 0770 wifi wifi
     mkdir /data/misc/audio 0770 audio audio
 

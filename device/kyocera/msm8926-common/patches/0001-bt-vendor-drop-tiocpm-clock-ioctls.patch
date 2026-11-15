@@ -1,0 +1,55 @@
+--- a/hardware/qcom/bt-caf/libbt-vendor/include/hci_uart.h
++++ b/hardware/qcom/bt-caf/libbt-vendor/include/hci_uart.h
+@@ -91,11 +91,18 @@
+ #endif
+ #endif // (BT_WAKE_VIA_USERIAL_IOCTL==TRUE)
+ 
+-/* UART CLOCK IOCTLS*/
+-/* UART CLOCK IOCTLS*/
+-#define USERIAL_OP_CLK_ON    TIOCPMGET    /* PM get */
+-#define USERIAL_OP_CLK_OFF    TIOCPMPUT   /* PM put */
+-#define USERIAL_OP_CLK_STATE    TIOCPMACT    /* PM is active */
++/* UART CLOCK IOCTLS
++ *
++ * TIOCPMGET, TIOCPMPUT and TIOCPMACT are Qualcomm's, not mainline, and this
++ * kernel does not have them: Kyocera's 3.4 tree defines none of the three and
++ * msm_serial_hs.c never handles such an ioctl.  Numbering the ops locally
++ * keeps the callers compiling; userial_clock_operation() below turns into a
++ * no-op, which is what the hardware needs anyway - the serial driver clocks
++ * the UART itself.
++ */
++#define USERIAL_OP_CLK_ON       0
++#define USERIAL_OP_CLK_OFF      1
++#define USERIAL_OP_CLK_STATE    2
+ 
+ /******************************************************************************
+ **  Type definitions
+--- a/hardware/qcom/bt-caf/libbt-vendor/src/hci_uart.c
++++ b/hardware/qcom/bt-caf/libbt-vendor/src/hci_uart.c
+@@ -509,18 +509,13 @@
+ 
+ int userial_clock_operation(int fd, int cmd)
+ {
+-    int ret = 0;
++    /* The ioctls this used to issue (TIOCPMGET/TIOCPMPUT/TIOCPMACT) do not
++     * exist in this kernel - see include/hci_uart.h.  Issuing an unknown
++     * command would just earn an ENOTTY and a stale errno, and the serial
++     * driver already manages the UART clock, so report success and do
++     * nothing. */
++    (void)fd;
++    (void)cmd;
+ 
+-    switch (cmd)
+-    {
+-        case USERIAL_OP_CLK_ON:
+-        case USERIAL_OP_CLK_OFF:
+-             ioctl(fd, cmd);
+-             break;
+-        case USERIAL_OP_CLK_STATE:
+-             ret = ioctl(fd, cmd);
+-             break;
+-    }
+-
+-    return ret;
++    return 0;
+ }

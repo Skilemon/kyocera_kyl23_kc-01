@@ -1,12 +1,32 @@
 on init
+    # The gadget is addressed before anything configures a function: VID/PID
+    # only, left disabled.  A function is written when the framework asks for
+    # one, below.  This used to write `functions adb` + `enable 1`
+    # unconditionally, which put an adb interface on the bus on every boot even
+    # with USB debugging off.
     write /sys/class/android_usb/android0/enable 0
     write /sys/class/android_usb/android0/idVendor 0482
     write /sys/class/android_usb/android0/idProduct 09xx
-    write /sys/class/android_usb/android0/functions adb
-    write /sys/class/android_usb/android0/enable 1
 
 # Kyocera VID is 0482
 on property:sys.usb.config=adb
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/idVendor 0482
+    write /sys/class/android_usb/android0/functions adb
+    write /sys/class/android_usb/android0/enable 1
+
+# What the framework writes when USB debugging is on.  This port has no MTP (nor
+# PTP) function in the kernel gadget, so both are served as adb alone: writing
+# `functions mtp,adb` would fail and leave the port dead, and adb is what the
+# user asked for anyway.  adbd is started by init.usb.rc, which carries the same
+# trigger.
+on property:sys.usb.config=mtp,adb
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/idVendor 0482
+    write /sys/class/android_usb/android0/functions adb
+    write /sys/class/android_usb/android0/enable 1
+
+on property:sys.usb.config=ptp,adb
     write /sys/class/android_usb/android0/enable 0
     write /sys/class/android_usb/android0/idVendor 0482
     write /sys/class/android_usb/android0/functions adb

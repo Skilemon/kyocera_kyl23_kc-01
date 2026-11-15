@@ -377,6 +377,7 @@ run "log" 'logcat -d -v time -b all -t 2000 2>/dev/null | grep -i -E "bluetooth|
 
 sec "modem / baseband"
 run "subsys" 'ls /sys/bus/msm_subsys/devices 2>&1; for d in /sys/bus/msm_subsys/devices/*; do echo "$d $(cat $d/name 2>/dev/null) state=$(cat $d/state 2>/dev/null)"; done'
+run "version" 'l=/cache/kc_ril.txt; /system/bin/logcat -d -v time -b all 2>/dev/null > $l; echo "baseband=$(getprop gsm.version.baseband)"; echo "ril-impl=$(getprop gsm.version.ril-impl)"; echo "adb_log=$(getprop persist.radio.adb_log_on)"; echo "argc5=$(grep -c RIL_Init.argc.=.5 $l)"; echo "-- BASEBAND_VERSION --"; grep -E "BASEBAND_VERSION" $l | tail -6; echo "-- RILQ (qmi msg hex) --"; grep -E "[VDIWEF]/RILQ" $l | grep -iE "msg|dms|send_msg" | tail -24'
 run "dmesg" 'dmesg | grep -i -E "modem|mss|q6v5|smem|pil_|subsys" | tail -40'
 run "rmt" 'tail -6 /cache/kc_diag.txt 2>&1'
 

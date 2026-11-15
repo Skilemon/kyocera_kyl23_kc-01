@@ -2169,3 +2169,430 @@ BD_ADDR` 在写地址之前发生）；第二条才是写完之后的答案，�
 地址是写进**芯片 NV** 的，正常一次就够，之后每次开机都还在。若某次刷回原厂
 4.4 或清 `/persist`，NV 文件没了，`btnvtool -O` 会生成一个新的（原厂行为），
 那时地址会变，已配对设备需要重新配。
+
+## 17. rild 少了设备路径：一个真实的缺陷，但不是基带未知的原因
+
+> **事后订正（fix54 实测）**：这一节最初是把「基带版本未知」归因到下面这个空格上
+> 的，那个结论是错的。fix54 把 `rild.libargs` 修好之后，日志里 `RIL_Init argc`
+> 确实从 4 变成 5，但 `BASEBAND_VERSION` 依旧在 14 ms 后失败，
+> `gsm.version.baseband` 依旧为空。真正的原因记在 §18。
+>
+> 这个空格本身是一个独立存在的缺陷（见 17.4），修它是对的，只是它不解释这个症状。
+> 保留这一节是因为 17.2 里那组时间线（14 ms 失败 vs 30 秒超时）仍然是判断
+> 「请求有没有出进程」的有效方法。
+
+### 17.1 症状与属性链
+
+设置 → 关于手机 → 基带版本，显示"未知"。这一格读的是
+`TelephonyManager.getBasebandVersion()`，实现就是一行：
+
+```java
+return SystemProperties.get(TelephonyProperties.PROPERTY_BASEBAND_VERSION);
+```
+
+也就是 `gsm.version.baseband`。而这个属性的**唯一写入方是电话栈自己**：收到
+`EVENT_GET_BASEBAND_VERSION_DONE` 且没有异常时，才把 RIL 的返回值写进去；
+请求失败就 `break`，属性保持不存在。
+
+抓到的属性表里确实没有它，而同一批的 `gsm.version.ril-impl` 在：
+
+```
+[gsm.version.ril-impl]: [Qualcomm RIL 1.0]
+（没有 gsm.version.baseband）
+```
+
+### 17.2 请求确实发出去了，而且被拒了
+
+```
+D RILJ    : [3657]> BASEBAND_VERSION [SUB0]
+D RilRequest: [3657]< BASEBAND_VERSION error: ... CommandException: GENERIC_FAILURE
+```
+
+两条相隔 **14 毫秒**，八次开机八次如此。关键在于 14 ms 这个数字：qcril 里处理
+这个请求的函数 `qcril_qmi_nas_dms_request_baseband_version()`，反汇编出来是
+
+```
+mov r0, #4                 ; qcril_qmi_client_get_user_handle(DMS)
+mov r1, #81                ; QMI 消息号
+movw r2, #30000            ; 30 秒超时
+bl  qmi_client_send_msg_sync
+```
+
+**它带的超时是 30 秒**。所以 14 ms 失败不可能是 modem 超时——请求根本没出进程。
+而同一时刻 NAS/UIM/SMS/WDS 都初始化正常、注册状态有值，说明 QMI 链路本身是通的。
+
+### 17.3 对照原厂，差的是一个参数
+
+原厂 4.4 的 `build.prop`：
+
+```
+rild.libpath=/vendor/lib/libril-qc-qmi-1.so
+rild.libargs=-d /dev/smd0
+```
+
+我们的 7.1 镜像里：
+
+```
+rild.libpath=/vendor/lib/libril-qc-qmi-1.so
+rild.libargs=-d
+/dev/smd0
+```
+
+**`/dev/smd0` 掉到了下一行，成了一个没有 `=` 的孤立行。** 日志对得上：
+
+| | rild 传给 qcril 的参数个数 |
+|---|---|
+| 原厂 4.4 | `RIL_Init argc = 5` |
+| 本移植 | `RIL_Init argc = 4` |
+
+差的那一个就是设备路径。
+
+### 17.4 为什么这个值会丢：`PRODUCT_PROPERTY_OVERRIDES` 装不下带空格的值
+
+`lineage-common.mk` 里原来写的是：
+
+```make
+PRODUCT_PROPERTY_OVERRIDES += \
+    rild.libpath=/vendor/lib/libril-qc-qmi-1.so \
+    rild.libargs=-d /dev/smd0 \
+    ro.telephony.default_network=8
+```
+
+这个变量是**按空格分词的 `key=value` 列表**，一个带空格的值在里面无法表达：
+`rild.libargs=-d` 成了一个词，`/dev/smd0` 成了另一个词，两个都被原样写进
+build.prop，后者因为不含 `=` 被 init 忽略。
+
+**加反斜杠转义没有用**——`\ ` 是 shell 的规则，make 是在展开之后按空格切的：
+
+```make
+rild.libargs=-d\ /dev/smd0     # 仍然被切成两个词
+```
+
+### 17.5 修法
+
+把带空格的值从 makefile 挪进 `system.prop`（`BoardConfigCommon.mk:245` 把
+`TARGET_SYSTEM_PROP` 指向它，内容是**按文件原样**并进 build.prop，不经过分词）：
+
+```
+rild.libpath=/vendor/lib/libril-qc-qmi-1.so
+rild.libargs=-d /dev/smd0
+```
+
+`lineage-common.mk` 的 telephony 段随之清空，只留注释。注意顺序：build.prop 里
+`TARGET_SYSTEM_PROP` 先写、`PRODUCT_PROPERTY_OVERRIDES` 后写，后者会覆盖前者，
+所以 makefile 那边**必须真的删掉**，否则补好的值又被盖回 `-d`。
+
+### 17.6 实测结果：两条对上，一条没对
+
+fix54 刷入后从 dump 里读到：
+
+| 检查项 | 结果 |
+|---|---|
+| `RIL_Init argc = 5` | 通过，4 → 5，参数确实补回来了 |
+| `baseband=` 不再是空 | 没通过，仍然是空 |
+| RILJ 里不再有 `BASEBAND_VERSION error` | 没通过，仍然 14 ms 失败 |
+
+也就是说：这个空格是一个真实存在、也确实被修好的缺陷，但它不解释基带版本这个
+症状。因果链在别处，见 §18。
+
+值应当是 `MPSS.DI.2.0.1.c9-00059-M8926DAAAANAZM-1`——这是 modem 分区里固件自带的
+版本串：
+
+```
+$ strings modem.img | grep MPSS | head -1
+/local/mnt/workspace/CRMBuilds/MPSS.DI.2.0.1.c9-00059-M8926DAAAANAZM-1_20140912_030333/...
+```
+
+如果 `baseband=` 有了值但内容和这串不一致，说明 qcril 走的是自己那条路（返回的
+是 `QMI_DMS_GET_DEVICE_REV_ID` 的结果），更应该以它为准。
+
+## 18. 基带版本：一条命令被 modem 拒，另一条根本没发出去
+
+> 这一节的第一版把原因写成「qcril 比固件新，问了一条 modem 不认的命令」，
+> 并且据此打了个改命令号的补丁（fix55）。补丁刷进去之后毫无变化，复查
+> 反汇编才发现问题在**响应缓冲长度校验**上，而不是命令号。下面 18.3 之后
+> 是按实际机制重写的，18.4/18.5 保留的是那一版为什么失败——它本身是一个
+> 有用的教训：`0x51` 和 `0x23` 看着是同一个服务的两条命令，实际连门都进不去。
+
+### 18.1 一个被忽略的对照组
+
+这次 dump 里最有价值的一条，不是失败的那条，而是**成功**的那条：
+
+```
+[3657]> BASEBAND_VERSION [SUB0]
+[3658]> RIL_REQUEST_DEVICE_IDENTITY [SUB0]
+[3658]< RIL_REQUEST_DEVICE_IDENTITY {356408061218140, 00, 809A04BA, 35640806121814}
+[3657]< BASEBAND_VERSION error: CommandException: GENERIC_FAILURE
+```
+
+两条请求前后脚发出，`DEVICE_IDENTITY` 成功回来，`BASEBAND_VERSION` 失败。而
+`*#06#` 显示的 MEID 就是 `DEVICE_IDENTITY` 里的那个值——这就解释了为什么 MEID
+看得见、基带版本看不见。
+
+### 18.2 两条命令都走 DMS，但编号不同
+
+反汇编两个处理函数，请求发往同一个服务：
+
+```
+qcril_qmi_nas_dms_request_device_identity       msg_id = 0x25   -> 成功
+qcril_qmi_nas_dms_request_baseband_version      msg_id = 0x51   -> 失败
+```
+
+`qcril_qmi_nas_dms_request_baseband_version` 的关键几条指令：
+
+```
+1ab3d8: mov  r0, #4              ; qcril_qmi_client_get_user_handle(DMS)
+1ab3f4: mov.w r1, #81            ; msg_id = 0x51
+1ab3f8: mov  r2, #0              ; 无请求参数
+1ab3fc: mov  r3, #0
+        [sp+4] = 44              ; 响应缓冲 44 字节
+        [sp+8] = 30000           ; 30 秒超时
+1ab400: blx qmi_client_send_msg_sync
+```
+
+按 QMI DMS 消息表：
+
+| 编号 | 命令 | 含义 |
+|---|---|---|
+| 0x23 | `GET_REV_ID` | 取设备修订号，老设备上就是基带版本串 |
+| 0x25 | `GET_DEVICE_SERIAL_NUMBERS` | IMEI / ESN / MEID，这条通了 |
+| 0x51 | `GET_SW_VERSION` | 取软件版本，较新的命令 |
+
+**同一个 DMS 服务、同一个 client handle、同一条 QMI 通道，0x25 通、0x51 不通。**
+所以不是链路问题、不是权限问题、不是 radio 处于 off（`DEVICE_IDENTITY` 和它同一
+批发出）。是这一条命令 modem 不认。
+
+### 18.3 为什么 qcril 会去问一条 modem 不认的命令
+
+对比两边的年份：
+
+```
+modem 固件   MPSS.DI.2.0.1.c9-00059-M8926DAAAANAZM-1   2014-09-12
+qcril 库     含 QMI_NAS_GET_AREA_SETTING 等 2015+ 特性
+```
+
+qcril 比 modem 固件新，它选了新命令 `GET_SW_VERSION`，而这颗 2014 年的 modem
+只认老的 `GET_REV_ID`。modem 立即回一个服务错误（不是超时，14 ms 就回来了），
+qcril 转成 `GENERIC_FAILURE`，电话栈只在成功时才写 `gsm.version.baseband`，
+于是 Settings 显示「未知」。
+
+**这不是移植引入的。** `vendor/.../vendor/lib/libril-qc-qmi-1.so` 和原厂
+`system.img` 里那份 md5 完全一致（`cbdf5c2dc7025b59f24abe1f5c9d5e40`），也就是说
+原厂 4.4 用的就是这份 qcril 配这颗 modem，原厂状态下这一项大概率同样是未知。
+
+### 18.4 fix55 的改法：把命令号改回老的
+
+`libril-qc-qmi-1.so` 的第一个 LOAD 段 `Offset == VirtAddr == 0`，所以虚拟地址就是
+文件偏移。`0x1ab3f4` 处原本是：
+
+```
+4f f0 51 01     mov.w r1, #81     ; 0x51  GET_SW_VERSION
+```
+
+改成：
+
+```
+4f f0 23 01     mov.w r1, #35     ; 0x23  GET_REV_ID
+```
+
+**整库只改这一个字节**（`0x51` → `0x23`），`cmp -l` 确认差异为 1 处。改完反汇编
+验证：
+
+```
+1ab3f4: f04f 0123   mov.w r1, #35  @ 0x23
+1ab3f8: f04f 0200   mov.w r2, #0
+1ab400: blx 4cf7c   qmi_client_send_msg_sync@plt
+```
+
+同文件里另有两处 `4ff05101`，都不碰：`0x2294cc` 是 `qcril_hook_unsol_response`
+的 hook id（后面紧跟 `movt r1, #8`，拼成 `0x80051`），`0x23f37e` 是 `snprintf`
+的参数。只有 `0x1ab3f4` 是 `qmi_client_send_msg_sync` 的 msg_id。
+
+### 18.5 为什么这个改法是安全的（最坏也只是不生效）
+
+qcril 给这条请求的响应缓冲是 **44 字节**（`memset(sp+72, 0, 44)`，栈帧
+`sub sp, #120`，buffer 正好占满尾部，**无法加大**），读字符串的位置是
+`buffer+8`、长度 33：
+
+```
+1ab53c: add  r3, sp, #72
+1ab53e: add.w r3, r3, #8      ; 字符串在 buffer+8
+1ab544: mov.w r3, #33         ; 长度 33
+```
+
+`qmi_client_send_msg_sync` 在解码前会校验 `resp_c_struct_len` 是否够放下该消息的
+C 结构：
+
+- `GET_REV_ID` 结构不超过 44 字节 → 照常解码，字符串落在 `buffer+8`，成功；
+- 超过 44 字节 → 直接返回参数错误，**不会越界写**，qcril 走错误分支返回
+  `GENERIC_FAILURE`，行为与 fix54 完全相同。
+
+所以这个补丁的失败模式是「白改」，不是「崩掉」。回滚方式是把 fix54 再刷一遍。
+
+### 18.6 下次开机看什么
+
+`/vendor/bin/kcstate.sh` 的 `modem / baseband` → `version` 一节，三行就能定案：
+
+```
+baseband=...           有值 => 通了；仍为空 => 这条命令也不认，退回 §18.7
+argc5=1                应为 1，确认 rild 参数还是完整的
+（下面若干行）          若失败，这里会出现 qcril 的 DMS/baseband 错误
+```
+
+如果 `baseband=` 有值但字符串开头缺字符，说明两个结构的字符串偏移不同（一个在
+`+4`、一个在 `+8`），那就是 idl 布局差异，不是命令号问题——此时退回显示层兜底。
+
+### 18.7 备选：显示层兜底
+
+如果改命令号也不通，就不要再往闭源二进制里加补丁了。直接让显示拿到真实值：
+
+```
+# modem 分区挂在 /firmware，版本串在 image/modem.b* 里
+v=$(grep -ao 'MPSS\.DI\.[0-9A-Za-z._-]*' /firmware/image/modem.b* | head -1)
+setprop gsm.version.baseband "$v"
+```
+
+也可以在 `system.prop` 里直接写死
+`gsm.version.baseband=MPSS.DI.2.0.1.c9-00059-M8926DAAAANAZM-1`（这个串来自
+modem 分区，见 §17.6 末尾）。`gsm.version.baseband` 不是 `ro.*`，电话栈只在请求
+成功时才覆盖它，所以请求一直失败的前提下，写进去的值不会被抹掉。
+
+顺带记一下这颗 modem 的 `/firmware/VERINFO/VER_INFO.TXT` 只有 23 字节：
+
+```
+M8926AAAAANLYD1015015.2
+```
+
+那是 Kyocera 的构建号，不是基带版本，别拿它当值用。
+
+## 19. QMI 的发前校验：响应缓冲长度必须**精确相等**
+
+### 19.1 判据在 `libqmi_cci.so` 里，不在 qcril 里
+
+`qmi_client_send_msg_sync` 转发到内部实现后，第一件事是问 IDL 表这条消息的
+C 结构有多大，然后拿调用方传进来的长度去比：
+
+```
+2478: bl  qmi_idl_get_message_c_struct_len(service, RESPONSE=0, msg_id, &need)
+2486: ldr r1, [sp, #104]     ; 调用方传的 resp_c_struct_len
+2484: ldr r3, [sp, #40]      ; 表里说的 need
+2486: cmp r1, r3
+2488: bne 25a8               ; ← 不相等就走
+25a8: mov r7, #-1            ; 直接 return -1，请求根本不发
+```
+
+**是 `bne`，不是 `blo`。** 传大了也不行、传小了也不行，必须一分不差。
+请求侧同理，但有一条例外：`req_len == 0` 时整段校验被跳过（`cmp sl,#0; beq`），
+于是空请求会被当成"这条消息没有请求体"直接编码出去。
+
+这条 `bne` 解释了全部现象：11 ms 失败、logcat 里一条错误都没有（失败发生在本进程，
+连 QMUX 都没走到）、改 msg id 毫无反应。
+
+### 19.2 那张 IDL 表在哪，怎么自己解
+
+不需要外部规范文档，`libqmiservices.so` 里带的就是完整定义：
+
+- `dms_get_service_object_internal_v01` 用 `ldr r0,[pc,#4]; add r0,pc` 返回
+  service object，落在 `.data` 的 `0x150b8`；
+- object `+0x24` 指向 type table object；
+- object `+0x10` 存着 req/resp 各自的**消息条数**（低半字 resp、高半字 req，都是 56）；
+- object `+0x18` / `+0x1c` 是 resp / req 的**消息表指针**（`0x91fe` / `0x937a`）；
+- 消息表每条 **6 字节**：`{uint16 msg_id; uint16 packed; uint16 extra}`，
+  `packed` 高 4 位选类型组、低 12 位是组内序号；
+- 类型描述 `+0x0c` 是 `{uint32 size; uint32 type_ptr}` 数组，**`size` 就是
+  `sizeof()` 那个 C 结构**。
+
+按这个走一遍，三个已知量全部对上 qcril 代码里的立即数，说明这份解析是对的。
+
+### 19.3 三条命令的实际尺寸
+
+| 命令 | 名称 | req 结构 | resp 结构 | qcril 实际传 | 结果 |
+|---|---|---|---|---|---|
+| `0x25` | GET_DEVICE_SERIAL_NUMBERS | 空 | **368** | resp 368 ✓ | 成功（`*#06#` 的 MEID） |
+| `0x51` | GET_SW_VERSION | **12** | 44 | req **0** ✗ / resp 44 ✓ | 发出去了，modem 拒 |
+| `0x23` | GET_DEVICE_REV_ID | 空 | **540** | resp **44** ✗ | 本地 `return -1` |
+
+`368` 和 `44` 与 `qcril_qmi_nas_dms_request_device_identity` /
+`..._baseband_version` 里的 `mov.w r2,#368` / `#44` 完全一致——这是这条解析链
+可信的理由。
+
+### 19.4 两条路各堵在哪
+
+**`0x51`**：长度对得上，所以它**真的发到了 modem**。请求侧没有问题——IDL 给
+这条命令的请求结构就是 **1 字节的空结构**，`qcril` 传 `NULL + 0` 是合法形态，
+`req_len == 0` 时那段校验本来就被跳过。堵住的是**响应侧两道独立的闸**：
+
+| | 表里说的 | 这颗 modem 要回的 |
+|---|---|---|
+| 响应 c-struct | 44 字节（版本串在 `+8`，容量 36 = 35 字符 + NUL） | 47 字符 |
+| 响应编码上限（消息表第三半字） | 42 字节 | TLV 头 + 数组头 + 1 + 1 + 47 ≈ 53～55 |
+
+版本串本身 47 字符：`MPSS.DI.2.0.1.c9-00059-M8926DAAAANAZM-1.66647.1`。两条都
+超，所以 modem 的回复进不了 `libqmi_cci` 给的那块中转缓冲，解码失败，
+`qcril` 只能回 `GENERIC_FAILURE`。
+
+**`0x23`**：`540 ≠ 44`，`bne` 直接跳到 `return -1`。这就是 fix55 一个字节补丁
+完全没有动静的原因——**它连发送都没走到**。
+
+而 540 字节在这条路上放不下：函数开头 `sub sp, #120`，响应缓冲在 `sp+72`，
+44 字节正好铺到 `sp+115`，`sp+116` 是 stack canary。**缓冲加不大**。真要让
+`0x23` 跑起来，得把缓冲指针改成指向一块 540 字节的全局区，动三条指令外加
+找 BSS 空间——为了显示一个字符串，风险与收益不成比例。
+
+### 19.5 fix56 做的三件事
+
+1. **撤销 `0x23` 补丁**。`/vendor/lib/libril-qc-qmi-1.so` 的 md5 回到原厂的
+   `cbdf5c2dc7025b59f24abe1f5c9d5e40`，`0x1ab3f4` 处恢复成 `4ff05101`（`0x51`）。
+   留着它只会在下次读代码时误导人。
+2. **显示兜底（已撤回）**。fix56 曾在 `system.prop` 里写过
+   `gsm.version.baseband=MPSS.DI.2.0.1.c9-00059-M8926DAAAANAZM-1.66647.1`，
+   值取自 modem 分区 `0x26ea1f8` 处的版本头，紧挨着构建时间
+   `20160810_175730`——说明这颗 modem 被 OTA 更新过，2014 那个串只是编译
+   路径的一部分（在 `CRMBuilds/.../b/modem_proc/...` 里出现过上千次），
+   不是版本号。
+   刷入后设置里确实显示了这行字，但 logcat 证明 `BASEBAND_VERSION` 仍然
+   每次失败（10–19 ms，`GENERIC_FAILURE`），也就是说**那只是把显示修好了，
+   问题一个没动**。这个值已经删掉：一个看起来正确、实际来自手写属性的字段，
+   比"未知"更容易骗过下一次排查。
+3. **打开 qcril 的消息日志（没成）**。当时在 `kyl23-extra.rc` 的
+   `on post-fs-data` 里加了 `setprop persist.radio.adb_log_on 1`，实测每次
+   开机读回都是 0：那个 section 跑在 `load_persist_props_action` **之前**，
+   init 随后从 `/data/property` 载入旧值 0 把它盖掉。这行已经删了。
+   能用的是系统起来之后 `setprop persist.radio.adb_log_on 1`——它写的是同一个
+   `/data/property` 文件，下次开机留得住。
+
+### 19.6 实测：兜底那次开机看到了什么
+
+fix56 刷入后回传的 dump：
+
+```
+baseband=MPSS.DI.2.0.1.c9-00059-M8926DAAAANAZM-1.66647.1   兜底生效
+adb_log=0                                                  开关从来没起来过
+argc5=1                                                     rild 参数仍然完整
+-- BASEBAND_VERSION --   [3657] error: GENERIC_FAILURE, 10–19 ms
+```
+
+跨多次开机都是同一结果（`01-01 11:43:14.615`、`01-02 06:28:59.567` …），
+没有一次成功；`subsys1 modem state=ONLINE`，log.img 里也没有 modem crash。
+也就是说那行字**只可能来自 `system.prop`**，RIL 侧一点没变。
+
+`adb_log=0` 说明 QMI 的 hex 根本没收，所以"看错误码"这一步没法做——这也是
+19.5 第 3 条要撤回的原因。要看就得先 `setprop persist.radio.adb_log_on 1`、
+重启，再取一次 `version` 段。
+
+### 19.7 结论：这条线到此为止
+
+- RIL/IDL 是 **2015-08** 编的，modem 是 **2016-08** 的，中间这颗 modem 被
+  单独 OTA 过，版本串从 30 多字符长到 47 字符，越过了 IDL 的两个上限。
+  出厂 `build.prop` 里没有 `gsm.version.baseband`，说明出厂时这个请求是能
+  成功的——不是移植弄坏的，也不是库被换过（四个 QMI 库的 md5 与原厂镜像
+  逐一相同）。
+- 真治本要同时改四处：消息表编码上限 42→64（位置已知，一条 `strh`）、
+  IDL 里版本串 `max` 36→48（在未公开的打包 blob 里找那个字节，盲改）、
+  `qcril` 那 44 字节栈缓冲挪到全局（`sp+72..115` 紧挨 canary，原地扩不了）、
+  上报长度常量 33→48。收益是**显示 modem 里同一个字符串**——和手动写进
+  `system.prop` 的内容一字不差。风险与收益不成比例，不做。
+- 因此 `gsm.version.baseband` **不设**，设置里显示"未知"。这是真实状态。
+  如果哪天要确认这颗 modem 的版本，直接读 modem 分区 `0x26ea1f8`，或者看
+  `/vendor/bin/kcstate.sh` 的 `modem` 段。
+- 若以后 modem 再被 OTA、或换了主板，需要重新确认这个偏移还有效。

@@ -77,12 +77,16 @@ on post-fs-data
     chmod 0771 /persist
 
 on boot
-    # --------------------------------------------------------------- bring-up
-    # The tree ships persist.sys.usb.config=none, which init.usb.rc turns into
-    # `stop adbd`.  Setting the function here as well means the port comes up
-    # even if the property file disagrees, and this is one less way to end up
-    # with a phone that boots to a black screen and says nothing.
-    setprop sys.usb.config adb
+    # ------------------------------------------------------------------- adb
+    # Nothing here turns adb on.  adbd is started by init.usb.rc on
+    # sys.usb.config=adb, and this file no longer sets that property at boot:
+    # the framework sets it once the user turns USB debugging on, and until
+    # then the port stays closed.  (It used to be forced here so that a boot
+    # hanging before the launcher could still be read; use recovery for that.)
+    #
+    # init.kc01.usb.rc carries the `mtp,adb` handler, because that is the value
+    # the framework actually writes when debugging is on, and this port has no
+    # MTP function -- the handler maps it to adb alone.
 
     # ---------------------------------------------------------- bluetooth UART
     # hci_uart talks to the Broadcom part over ttyHS0; nothing else may open it.

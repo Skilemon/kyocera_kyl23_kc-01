@@ -211,6 +211,23 @@ jobs:
           echo "webview.apk: ${size} bytes"
           test "$size" -gt 1048576
 
+      - name: Patch the synced sources
+        run: |
+          set -ex
+          cd "$ROM"
+          # A few files in cm-14.1 are written against kernels this device's
+          # 3.4 tree forked away from.  The patches live in the device tree so
+          # they are reviewable and reproducible; patching from a heredoc here
+          # would bury the one thing that matters in a sea of quoting.
+          #
+          # Applied right after sync, and under set -e, so a patch that no
+          # longer matches fails in seconds instead of leaving a compile error
+          # to be found forty minutes into the build.
+          for p in "$GITHUB_WORKSPACE/local/device/kyocera/msm8926-common/patches"/*.patch; do
+            echo "applying $(basename "$p")"
+            patch -p1 --forward --batch < "$p"
+          done
+
       - name: Check the inputs
         run: |
           set -ex
@@ -223,12 +240,15 @@ jobs:
           test -f device/kyocera/msm8926-common/system.prop
           test -f device/kyocera/msm8926-common/rootdir/etc/fstab.qcom
           test -f device/kyocera/msm8926-common/bluetooth/bdroid_buildcfg.h
-          # libbt-vendor comes from hardware/qcom/bt on cm-14.1, which has no
-          # top-level libbt-vendor directory: per-platform trees only, and
-          # msm8226 is served by msm8960.  Checked here because a source tree
-          # that moved would break the Bluetooth vendor build at 49%, and
-          # because this is the path a patch has to name to be applied at all.
-          test -f hardware/qcom/bt/msm8960/libbt-vendor/src/userial_vendor.c
+          # Two Bluetooth vendor trees arrive: hardware/qcom/bt from
+          # default.xml and hardware/qcom/bt-caf from snippets/cm.xml (branch
+          # cm-14.1-caf), same repository name, different path.  The CAF one
+          # is what gets built for msm8226 -- libbt-vendor there has hci_uart.c
+          # and bt_vendor_persist.cpp, while msm8960/libbt-vendor has neither.
+          # Asserting the built tree rather than the other one is also
+          # asserting the target of the first patch in patches/, which runs
+          # above under set -e.
+          test -f hardware/qcom/bt-caf/libbt-vendor/src/hci_uart.c
           # wpa_supplicant is built from the synced tree again (see the
           # packages section of lineage-common.mk).  Two things have to be
           # there: the module itself, and the qcwcn static library that
