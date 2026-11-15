@@ -77,17 +77,6 @@ on post-fs-data
     chmod 0771 /persist
 
 on boot
-    # ------------------------------------------------------------------- adb
-    # Nothing here turns adb on.  adbd is started by init.usb.rc on
-    # sys.usb.config=adb, and this file no longer sets that property at boot:
-    # the framework sets it once the user turns USB debugging on, and until
-    # then the port stays closed.  (It used to be forced here so that a boot
-    # hanging before the launcher could still be read; use recovery for that.)
-    #
-    # init.kc01.usb.rc carries the `mtp,adb` handler, because that is the value
-    # the framework actually writes when debugging is on, and this port has no
-    # MTP function -- the handler maps it to adb alone.
-
     # ---------------------------------------------------------- bluetooth UART
     # hci_uart talks to the Broadcom part over ttyHS0; nothing else may open it.
     chown bluetooth bluetooth /dev/ttyHS0
@@ -141,6 +130,78 @@ on boot
 # Everything else the vendor ships (diag loggers, factory tests, kdfs, kerrd)
 # stays off; it can be enabled one at a time once the base system is known to
 # boot.
+
+# ---------------------------------------------------------------------- USB
+# Every value the framework can write into sys.usb.config needs a stanza here.
+# One without a stanza leaves the gadget disabled: no enumeration, no USB
+# notification, and a phone that looks like it is charging from a wall charger.
+#
+# This is the only board init that gets installed, for both products: init.rc
+# imports /init.${ro.hardware}.rc, and everything else under device/kyocera/*
+# is reference material (see the note in kc01/device.mk).  The old
+# init.kc01.usb.rc was in that category, which is why the port had no USB
+# compositions at all and why firmware written by the 7.1 framework -- `mtp`
+# with debugging off, `mtp,adb` with it on -- was answered by nobody.
+#
+# VID/PID are the stock pairs from init.kyocera.usb.rc in the factory boot.img:
+# 0a28 mtp, 0a27 mtp+adb, 0a23 mass storage.  MTP needs no driver on Windows.
+#
+# adb appears in none of these unless the framework asks for it.  Turning on
+# USB debugging makes it write `mtp,adb`; turning it off writes `mtp` again and
+# the port goes back to file transfer.
+
+# Addressed but left disabled: no function until the framework picks one.
+on init
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/idVendor 0482
+    write /sys/class/android_usb/android0/idProduct 0a28
+
+on property:sys.usb.config=mtp
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/bDeviceClass 0
+    write /sys/class/android_usb/android0/idVendor 0482
+    write /sys/class/android_usb/android0/idProduct 0a28
+    write /sys/class/android_usb/android0/functions ${sys.usb.config}
+    write /sys/class/android_usb/android0/enable 1
+    setprop sys.usb.state ${sys.usb.config}
+
+on property:sys.usb.config=mtp,adb
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/bDeviceClass 0
+    write /sys/class/android_usb/android0/idVendor 0482
+    write /sys/class/android_usb/android0/idProduct 0a27
+    write /sys/class/android_usb/android0/functions ${sys.usb.config}
+    write /sys/class/android_usb/android0/enable 1
+    start adbd
+    setprop sys.usb.state ${sys.usb.config}
+
+on property:sys.usb.config=ptp
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/bDeviceClass 0
+    write /sys/class/android_usb/android0/idVendor 0482
+    write /sys/class/android_usb/android0/idProduct 0a28
+    write /sys/class/android_usb/android0/functions ${sys.usb.config}
+    write /sys/class/android_usb/android0/enable 1
+    setprop sys.usb.state ${sys.usb.config}
+
+on property:sys.usb.config=ptp,adb
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/bDeviceClass 0
+    write /sys/class/android_usb/android0/idVendor 0482
+    write /sys/class/android_usb/android0/idProduct 0a27
+    write /sys/class/android_usb/android0/functions ${sys.usb.config}
+    write /sys/class/android_usb/android0/enable 1
+    start adbd
+    setprop sys.usb.state ${sys.usb.config}
+
+on property:sys.usb.config=mass_storage
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/bDeviceClass 0
+    write /sys/class/android_usb/android0/idVendor 0482
+    write /sys/class/android_usb/android0/idProduct 0a23
+    write /sys/class/android_usb/android0/functions ${sys.usb.config}
+    write /sys/class/android_usb/android0/enable 1
+    setprop sys.usb.state ${sys.usb.config}
 
 service qmuxd /system/bin/qmuxd
     class main

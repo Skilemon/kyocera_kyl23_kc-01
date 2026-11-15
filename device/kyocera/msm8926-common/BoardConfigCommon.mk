@@ -65,21 +65,23 @@ BOARD_KERNEL_CMDLINE := console=ttyHSL0,115200,n8 no_console_suspend=1 androidbo
 # quiet during a full boot, a camera session and a call.
 BOARD_KERNEL_CMDLINE += androidboot.selinux=permissive
 
-# adb is not enabled by default.  Nothing here forces persist.sys.usb.config,
-# so what comes up on the USB port is whatever the framework asks for once the
-# user turns USB debugging on in Developer options -- adbd still needs a key:
-# there is no shipped /adb_keys and no ro.adb.secure=0 (the product-level value
-# is ignored anyway, ro.* is write-once and the build system writes its own
-# line first).
+# The USB port comes up as MTP, not as adb.  Two different things were being
+# conflated here before: "USB works" and "a shell is open".  The framework
+# writes persist.sys.usb.config into sys.usb.config on boot, and the board init
+# answers each value with a composition -- mtp for file transfer, mtp,adb once
+# USB debugging is switched on.  Leaving the property unset means the trigger
+# `on boot && property:persist.sys.usb.config=*` in init.usb.rc never fires and
+# the gadget stays disabled until something else sets it, which is a phone that
+# only charges.
 #
-# To get a shell on a device that will not boot, use the recovery image, or
-# temporarily add the two bring-up lines back: this one, and
-# `setprop sys.usb.config adb` in rootdir/init.qcom.rc.
+# adb is still not part of the default: adbd starts only when the user turns on
+# USB debugging, and then it still needs an authorised key -- there is no
+# shipped /adb_keys and no ro.adb.secure=0 (the product-level value is ignored
+# anyway, ro.* is write-once and the build system writes its own line first).
 #
-# (Historically this tree forced persist.sys.usb.config=adb because init.usb.rc
-# turns the stock default of `none` into `stop adbd`.  That is the wrong fix:
-# it leaves adb open on every boot of every unit, and it disables the user's
-# ability to keep it closed.)
+# To get a shell on a device that will not boot, use the recovery image.
+ADDITIONAL_DEFAULT_PROPERTIES += persist.sys.usb.config=mtp
+
 BOARD_MKBOOTIMG_ARGS := --ramdisk_offset 0x01000000 --second_offset 0x00f00000 --tags_offset 0x00000100
 
 # The device tree is appended to the image as a Qualcomm QCDT blob.  It is

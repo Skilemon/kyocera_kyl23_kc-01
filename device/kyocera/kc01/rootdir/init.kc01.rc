@@ -1,4 +1,9 @@
-import init.kc01.usb.rc
+# The USB compositions used to live in init.kc01.usb.rc next to this file.
+# Neither file is installed -- see the note in device.mk -- so they were dead
+# weight, and the port had no working USB because of it.  The compositions are
+# in msm8926-common/rootdir/init.qcom.rc, which is the board init init.rc
+# actually imports for both products.  This file stays as reference material
+# for a full-ROM bring-up; add the import back if it is ever installed.
 
 on init
     # Platform

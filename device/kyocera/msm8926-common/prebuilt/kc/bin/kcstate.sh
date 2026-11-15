@@ -385,6 +385,11 @@ sec "logcat"
 run "settings errors" '/system/bin/logcat -d -v time -b all -t 4000 2>/dev/null | grep -i -E "cmparts|cmsettings|SQLite|sqlite|SecurityException|Backlight" | tail -40'
 run "tail" '/system/bin/logcat -d -v time -b all -t 3000 2>/dev/null | grep -i -E "wpa|supplicant|WifiHW|WifiStateMachine|WifiNative|qmuxd|RIL |audio_hw|AudioPolicy|adsprpc|mm-camera|kcbtnled|cmsettings" | tail -90'
 
+sec "usb"
+run "props" 'echo "persist=[$(getprop persist.sys.usb.config)] config=[$(getprop sys.usb.config)] state=[$(getprop sys.usb.state)]"; echo "adbd=[$(getprop init.svc.adbd)]"'
+run "gadget" 'echo "enable=$(cat /sys/class/android_usb/android0/enable 2>&1) functions=[$(cat /sys/class/android_usb/android0/functions 2>&1)]"; echo "state=$(cat /sys/class/android_usb/android0/state 2>&1)"; ls /sys/class/android_usb/android0/ 2>&1 | head -12'
+run "usb log" 'dmesg 2>/dev/null | grep -i -E "android_usb|ci13|gadget|vbus" | tail -n 20'
+
 sec "cache files"
 run "list" 'ls -l /cache 2>&1 | head -30'
 

@@ -2596,3 +2596,58 @@ argc5=1                                                     rild 参数仍然完
   如果哪天要确认这颗 modem 的版本，直接读 modem 分区 `0x26ea1f8`，或者看
   `/vendor/bin/kcstate.sh` 的 `modem` 段。
 - 若以后 modem 再被 OTA、或换了主板，需要重新确认这个偏移还有效。
+
+## 20. USB：组合配置写在了一个没人安装的文件里
+
+### 20.1 现象
+
+插上电脑后设备管理器**毫无反应**，手机只在充电，通知栏也不出现"USB 用途"。
+换线、换口、换电脑都一样，而且不是某个版本才有的——移植以来的每一版都这样。
+
+### 20.2 根因
+
+7.1 的框架会把 `persist.sys.usb.config` 写进 `sys.usb.config`：调试关着写 `mtp`，
+打开写 `mtp,adb`。`system/core/rootdir/init.usb.rc` 只应答 `none`、`adb`、
+`accessory`、`audio_source` 几种，**没有 `mtp`**——这本来就该由设备自己补。
+
+我们确实写了一份，但在 `device/kyocera/kc01/rootdir/init.kc01.usb.rc`，而它从来没被
+装进系统：
+
+- `init.rc` 只 `import /init.${ro.hardware}.rc`，`ro.hardware` 是 `qcom`，
+  所以真正生效的板级 init 是 `msm8926-common/rootdir/init.qcom.rc`；
+- `lineage-common.mk` 只 copy 了那一个 rc，`kc01/rootdir/` 下的文件一个都没进 ramdisk；
+- `kc01/device.mk` 的注释自己就写着"rootdir 下的 stock init 文件是给完整 ROM 参考的，
+  不复制进镜像"。
+
+于是一个 `on property:sys.usb.config=mtp` 都没有。gadget 停在 `enable 0`，D+ 不上拉，
+电脑端什么也看不到，Android 侧也没有 connected 事件——自然没有 USB 通知，
+用户也就没有"传输文件"可选。**死循环**。
+
+对照原厂：4.4 的 `boot.img` ramdisk 里有 `init.kyocera.usb.rc`，把 mtp /
+mtp,adb / mass_storage / diag 各种组合写得整整齐齐，PID 是 0a27 / 0a28 / 0a23。
+我们的那份只学了 `mtp,adb`，还把它映射成 `adb`（因为当时以为内核没有 MTP——
+其实 `CONFIG_USB_G_ANDROID=y` 把 `f_mtp.c` 一起编进去了）。
+
+### 20.3 修法
+
+1. 把组合搬进 `msm8926-common/rootdir/init.qcom.rc`：`mtp`、`mtp,adb`、`ptp`、
+   `ptp,adb`、`mass_storage`，PID 用原厂的 0a28 / 0a27 / 0a23，`functions` 照实写
+   `${sys.usb.config}`，不再折成 adb；
+2. `BoardConfigCommon.mk` 加 `ADDITIONAL_DEFAULT_PROPERTIES += persist.sys.usb.config=mtp`。
+   这不是"默认开 adb"——adb 仍然只在打开 USB 调试后才出现，只是让开机有个明确的
+   组合，`init.usb.rc` 的 `on boot && property:persist.sys.usb.config=*` 才会触发；
+3. 删掉 `kc01/rootdir/init.kc01.usb.rc`，`init.kc01.rc` 里那行 `import` 换成注释，
+   免得下次又有人以为它生效；
+4. `kcstate.sh` 加 `usb` 段：`persist/config/state` 三个属性、`enable`/`functions`、
+   以及 dmesg 里 gadget 的行。以后再遇到，一次 dump 就能定位。
+
+### 20.4 已知遗留
+
+`persist.*` 属性一旦在 `/data/property` 里存在，build.prop 里的默认值就不再起作用。
+设备上可能残留旧值（`none` 或 `adb`）：
+
+- `adb`：`init.usb.rc` 有分支，照样能枚举，只是设备名是 18d1:D002；
+- `none`：仍然只充电。需要在系统起来后执行一次
+  `setprop persist.sys.usb.config mtp`，它会写回 `/data/property`，下次开机生效。
+
+要干净验证，可以 `wipe /data` 后刷机，也可以先手动改这一条属性。
