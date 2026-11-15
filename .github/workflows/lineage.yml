@@ -211,21 +211,6 @@ jobs:
           echo "webview.apk: ${size} bytes"
           test "$size" -gt 1048576
 
-      - name: Patch the synced sources
-        run: |
-          set -ex
-          cd "$ROM"
-          # A few files in cm-14.1 are written against CAF kernels that this
-          # device's 3.4 tree forked away from.  The patches live in the device
-          # tree so they are reviewable and reproducible; patching from a YAML
-          # heredoc would bury the one thing that matters in a sea of quoting.
-          # Applying them right after sync also means a stale patch fails in
-          # seconds rather than an hour into bacon.
-          for p in "$GITHUB_WORKSPACE/local/device/kyocera/msm8926-common/patches"/*.patch; do
-            echo "applying $(basename "$p")"
-            patch -p1 --forward --batch < "$p"
-          done
-
       - name: Check the inputs
         run: |
           set -ex
@@ -238,6 +223,12 @@ jobs:
           test -f device/kyocera/msm8926-common/system.prop
           test -f device/kyocera/msm8926-common/rootdir/etc/fstab.qcom
           test -f device/kyocera/msm8926-common/bluetooth/bdroid_buildcfg.h
+          # libbt-vendor comes from hardware/qcom/bt on cm-14.1, which has no
+          # top-level libbt-vendor directory: per-platform trees only, and
+          # msm8226 is served by msm8960.  Checked here because a source tree
+          # that moved would break the Bluetooth vendor build at 49%, and
+          # because this is the path a patch has to name to be applied at all.
+          test -f hardware/qcom/bt/msm8960/libbt-vendor/src/userial_vendor.c
           # wpa_supplicant is built from the synced tree again (see the
           # packages section of lineage-common.mk).  Two things have to be
           # there: the module itself, and the qcwcn static library that

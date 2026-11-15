@@ -1868,3 +1868,304 @@ if (cmd != NULL && os_strncmp(cmd, "LAST_ID=", 8) == 0) {
 
 **不要先怀疑 jar。** 这一轮的教训是：镜像里的每一个手工补丁都要能说出
 "它当时在解决什么问题、那个问题现在还在不在"，说不出来就该删。
+
+## 15. 蓝牙：五层，从"包被禁用"到"两条 SMD 通道"
+
+这一节记的是蓝牙从"开关打不开"到"能被别的设备搜到"的完整路径。
+结论在前：**一共五层，前四层各自都能单独让开关失效，最后一层才是无线电本身。**
+
+### 15.1 五轮现象
+
+| 轮次 | 现象 | 真正卡住的那一层 |
+|---|---|---|
+| fix48 | 开关点了没反应 | 4.4 的 HAL blob 在 linker 里就死了，7.1 的 HAL 从没被加载过 |
+| fix49 | 同上 | 包被 `pm disable` 过，`bindService()` 直接失败，进程都没起 |
+| fix50 | 同上 | `pm` 在本机开机阶段要近 60 s 才可用，修得太晚 |
+| fix51 | 弹"蓝牙共享屡次停止运行" | `timer_create(CLOCK_BOOTTIME_ALARM)` 返回 EINVAL，`alarm.c:157` 断言自杀 |
+| fix52 | 开关能停住，但 `enable timeout` | HCI 后端选错：`got 2, expected 1` |
+| — | **能开、能被搜到** | SMD 两条通道后面确实有活的控制器 |
+
+### 15.2 前三层，一句话一层
+
+**第一层，HAL 加载。** `/vendor/lib/hw/bluetooth.default.so` 是 4.4 的 blob，
+它引用 `_ZN7android10AudioTrack5writeEPKvj`（6.0 之前的二参数形式），
+而这套 ROM 的 libmedia 只导出三参数形式，`dlopen` 直接失败：
+
+```
+E HAL: dlopen failed: cannot locate symbol
+       "_ZN7android10AudioTrack5writeEPKvj" ...
+E BluetoothServiceJni: No Bluetooth Library found
+```
+
+7.1 自己的 `bluetooth.default.so`（1,448,792 B）一直在 `/lib/hw` 里躺着，
+只是 7.1 先找 `/vendor/lib/hw`，同名文件被 4.4 blob 占了位置。fix48 把两边
+都换成 7.1 那份，JNI 也回到构建产出的原版。
+
+**第二层，包被禁用。** fix32 的 `kcwpad` 在 Wi-Fi 出问题时执行过
+`pm disable com.android.bluetooth`，这个状态写在
+`/data/system/users/0/package-restrictions.xml`（`enabled="3"
+enabledCaller="shell:0"`），**不在任何 system 镜像里**，所以后面每一版都受影响。
+被禁用的包不是"打不开的适配器"，是整个包从解析里消失：
+
+```
+E BluetoothManagerService: Fail to bind to:
+       Intent { act=android.bluetooth.IBluetooth }
+```
+
+修法是改文件而不是让 PackageManager 改主意：post-fs-data 早于 zygote，
+那时的改动对整个开机有效，不需要 `pm`、不需要 binder。这就是
+`/system/etc/kcbt.sh pre`，`boot_completed` 那次只做兜底与取证。
+
+**第三层，clock 9。** 3.4 内核没开 alarm clock（`CONFIG_RTC_CLASS`），
+`CLOCK_BOOTTIME_ALARM` 不存在，`timer_create()` 对 clock 9 返回 EINVAL，
+`system/bt/osi/./src/alarm.c:157` 的 `assert("false")` 直接 SIGABRT：
+
+```
+E bt_osi_alarm: timer_create_internal unable to create timer with clock 9
+F libc: alarm_new_internal: assertion "false" failed
+F libc: Fatal signal 6 (SIGABRT) in tid ... (stack_manager)
+```
+
+1.3 s 一次，8 次，就是 UI 上的"屡次停止运行"。修法是 HAL 里两个字节：
+`timer_create_internal()` 把 clock_id 放在 r4 里直接传给 `timer_create()`，
+vaddr `0x10145c`（文件偏移 `0xfd45c`）
+
+```
+04 46   mov  r4, r0     ->     07 24   movs r4, #7
+```
+
+此后所有定时器建在 `CLOCK_BOOTTIME` 上。代价只有一个：不能靠定时器把设备
+从 suspend 里叫醒——这套 port 本来也不 suspend。全库 22 处 `clock_gettime`
+只用 7/1/0，数字 9 整个文件只出现在这一处。
+
+### 15.3 第四层：`got 2, expected 1` 不是 HAL 的 bug
+
+```
+I bt_hci_h4 : hal_open
+I bt_vendor : bt-vendor : BT_VND_OP_USERIAL_OPEN
+E bt_hci_h4 : hal_open opened the wrong number of ports: got 2, expected 1.
+```
+
+这行字看着像 HAL 坏了，其实是**协议栈的两半对这个手机的传输方式判断不一致**：
+
+- `/vendor/lib` 里的 Qualcomm 库按设计打开两条描述符：
+  `fd[0]=/dev/smd3`（命令）、`fd[1]=/dev/smd2`（ACL/事件），返回 2。
+  内核 `arch/arm/mach-msm/smd_tty.c` 里这两个节点注册为
+  `{2,"APPS_RIVA_BT_ACL"}`、`{3,"APPS_RIVA_BT_CMD"}`，同属 `SMD_APPS_WCNSS`。
+- `bluetooth.default.so` 里有两个 HCI 后端，`get_soc_type()` 读
+  `qcom.bluetooth.soc` 决定用哪个：ROME/CHEROKEE/AR3K/**DEFAULT** 走
+  `hci_hal_h4`（单描述符 UART），其余走 `hci_hal_mct`（2 或 4 描述符）。
+  属性没设 → DEFAULT → H4 → H4 按构造拒绝两个 fd。
+
+所以 fix52 只加一行 `setprop qcom.bluetooth.soc smd`。属性在 post-fs-data 设，
+两半都读同一个键。
+
+顺带记一笔容易搞反的地方：库内枚举是 `1=smd 2=ath3k 3=rome 4=cherokee`，
+`smd` 不在 H4 那一串里，所以选定的是 **MCT**，不是 H4。实测日志证实了这一点
+（见下）。`libbt-vendor.so` 自身只认 `rome/cherokee/ath3k`，遇到 `smd` 会打
+`qcom.bluetooth.soc not set, so using default` 并返回 0——和它未设属性时的行为
+一模一样，所以 vendor 侧行为没变，改动只影响 HAL 挑哪个后端。
+
+### 15.4 通道对端是活的：fix52 那一次开机的日志顺序
+
+```
+I bt_vendor: qcom.bluetooth.soc set to smd
+I bt_vendor: BD Address: 3a:9f:f2:c8:21:c4
+I bt_vendor: Hw_config: First Time BT on after boot. Starting hciattach daemon
+I bt_hci_mct: hal_open
+I bt_vendor: Done intiailizing UART
+I bt_hci_mct: hal_open got uart fds: CMD=73, EVT=73, ACL_OUT=74, ACL_IN=74
+I bt_vendor: Bluetooth FW and transport layer are initialized
+D BluetoothAdapterState: 10-> 14   BLE_TURNING_ON
+D BluetoothAdapterState: 14-> 15   BLE_ON
+D BluetoothAdapterState: 15-> 11   TURNING_ON
+D BluetoothAdapterState: 11-> 12   ON
+D BluetoothAdapterProperties: ScanMode = 20 / Scan Mode:21  (可连接 + 可被发现)
+D BluetoothAdapterProperties: Name is: KYL23
+```
+
+`CMD=73, EVT=73` 是同一个 fd——SMD 的命令通道同时承载命令与事件，这正是 H4
+做不到的事。控制器回了命令、回了 LE 特性，堆栈才可能走到 12；
+`Scan Mode:21` 就是"别的设备能搜到"这一件事在日志里的样子。
+
+同一次开机 36 s 后是关机（`ShutdownThread: Disabling Bluetooth...`），
+状态 12→13→15→16 干净走完，没有崩溃。
+
+### 15.5 还剩一处不一致：控制器上报的地址
+
+```
+W bt_btif: BTIF init BDA was c4:21:c8:f2:9f:3a
+W bt_btif: Controller BDA is 00:00:00:00:5a:ad
+D BluetoothAdapterProperties: Address is:00:00:00:00:5A:AD
+```
+
+堆栈最终采用**控制器上报的那个**。两个值都值得怀疑：
+
+- `c4:21:c8:f2:9f:3a` 和这台机器的 Wi-Fi MAC `c4:21:c8:f3:fe:ca` 同段
+  （`c4:21:c8` 是京瓷的 OUI），看起来像真实分配到的地址；
+- `00:00:00:00:5a:ad` 前四字节全零，像是 NVM 里没写地址时的默认值。
+
+同一时刻还有两条命令异常：
+
+```
+E bt_hci  : read_command_complete_header: return status - 0x1
+E bt_btif : bta_dm_ctrl_features_rd_cmpl_cback Ctrl BLE feature read failed: status :255
+D %s VS event found treat it as valid 0x%x: get_waiting_command
+```
+
+`status 255`/`0x1` 不是 HCI 规范里的错误码，更像是等待中的命令被一条
+vendor-specific 事件"顶包"了（CAF 的 `hci_layer` 对 VS 事件有"当作有效"的
+分支）。所以现在还分不清是控制器真的没地址，还是 `Read_BD_ADDR` 的回包串了。
+
+**判据很便宜：看对方手机搜到这台设备时显示的地址。**
+如果是 `00:00:00:00:5A:AD`，就是控制器侧的问题（要写 NVM 或发 VS 写地址命令，
+两者都还没验证过这条路）；如果显示 `C4:21:C8:F2:9F:3A`，就只是日志里的读回失败，
+不影响任何功能。
+
+### 15.6 下次再怀疑蓝牙，按这个顺序
+
+1. `/cache/kcbt.log`：第一行就是 `KCBT soc prop -> 'smd'`，然后是 `smd nodes`。
+   属性不是 smd、或者包状态要重写，这里会直接说。
+2. 日志里认后端名：`bt_hci_h4: hal_open` = 属性没生效；`bt_hci_mct: hal_open` = 选对了。
+3. `got uart fds:` 后面是不是两个描述符；不是的话通道没开。
+4. 状态机有没有到 12，`Scan Mode` 是不是 21 或 23。
+5. 以上都过、但对方搜不到，才轮到无线电与地址（15.5）。
+
+代码位置：`kyl23-extra.rc` 的 post-fs-data 段（`setprop qcom.bluetooth.soc smd`
+与 `exec -- /system/etc/kcbt.sh pre`）、`boot_completed` 段（`kcbt.sh post`），
+脚本本体 `device/kyocera/msm8926-common/prebuilt/kc/kcbt.sh` → `/system/etc/kcbt.sh`
+（`lineage-common.mk` 里用 `PRODUCT_COPY_FILES` 装，权限由 rc 里的 `chmod 0755` 给）。
+
+## 16. 蓝牙的地址：控制器自己不知道，主机知道
+
+fix52 之后蓝牙是能用的——开、搜、配对、传文件、关开、重启都过了。剩下的唯一问题
+在另一台手机上看得到：**它把这台设备显示成 `00:00:00:00:5A:AD`**。
+
+### 16.1 这不是读错，是真地址
+
+堆栈自己就报过这两个值对不上：
+
+```
+W bt_btif: BTIF init BDA was c4:21:c8:f2:9f:3a
+W bt_btif: Controller BDA is 00:00:00:00:5a:ad
+D BluetoothAdapterProperties: Address is:00:00:00:00:5A:AD
+```
+
+一开始还怀疑是 `Read_BD_ADDR` 的回包被 vendor event 顶包了（同一时刻确实有
+`read_command_complete_header: return status - 0x1` 和
+`Ctrl BLE feature read failed: status :255`）。**对端看到的也是这个地址**，
+这条怀疑就排除了：inquiry response 里的 BD_ADDR 是控制器填的，两边一致，
+说明控制器确实以 `00:00:00:00:5A:AD` 在发。
+
+### 16.2 主机其实有正确的那一个
+
+同一次开机更早的一次启动打过这么一行（那次没走到打开传输，直接用了 NV）：
+
+```
+W bt_btif: Read the Vendor BD addr from '/persist/.bt_nv.bin'
+D BluetoothAdapterProperties: Address is:C4:21:C8:F2:9F:3A
+```
+
+`/persist/.bt_nv.bin` 就是这颗芯片的 BT NV 在主机侧的那份拷贝（NV447 = BD_ADDR），
+里面的地址和 Wi-Fi MAC `c4:21:c8:f3:fe:ca` 同段（`c4:21:c8` 是京瓷的 OUI）。
+
+所以缺的不是数据，是**把数据推给控制器的那一步**。7.1 的堆栈只做
+`HCI_Read_BD_ADDR` 然后采用结果（CAF 的逻辑：控制器说了算），它没有任何代码
+去写芯片的 NV。
+
+### 16.3 那一步在 4.4 的镜像里，一直都在
+
+原厂 system.img 里有三样东西：
+
+| 文件 | 作用 |
+|---|---|
+| `/system/bin/btnvtool` | 读写 `/persist/.bt_nv.bin` 的 NV447；`-O` 表示"没有就生成一个稳定的" |
+| `/system/bin/hci_qcomm_init` | 读 NV447，然后往 `/dev/smd3` 发一串 "NV VS set" 命令，**这才是真正写芯片的那一步** |
+| `/system/etc/init.qcom.bt.sh` | 把上面两个串起来的胶水 |
+
+而且 7.1 的 vendor 库**仍然在做同一个握手**，只是没人应答：
+
+```
+W bt_vendor: Hw_config: First Time BT on after boot.Starting hciattach daemon BTStatus=
+```
+
+它 `setprop bluetooth.hciattach true`，然后最多等五秒 `bluetooth.status`。
+fix52 日志里 `BT_VND_OP_POWER_CTRL On`（07:19:00.820）到 `hal_open`
+（07:19:05.828）之间正好空五秒——那就是等超时了。
+
+`hci_qcomm_init` 选端口看 `ro.qualcomm.bt.hci_transport`，这个属性本 ROM 里
+**没有人设**，未设时它用 `/dev/ttyHS0`（这台机器没有这个 UART）。不过实测
+`-e` 模式并不打开这个口，见 §16.5 第 1 条。
+
+### 16.4 fix53 做了什么
+
+1. 把原厂那两个二进制搬回 `/system/bin`（`btnvtool` 9,540 B、
+   `hci_qcomm_init` 129,008 B，一字未改）。它们依赖的 `libbtnv.so`、
+   `libqmi*.so`、`libqcci_legacy.so`、`libstdc++.so` 本来就在镜像里。
+2. `/system/etc/kcbtinit.sh`：只跑 `hci_qcomm_init -e`，把输出记进
+   `/cache/kcbt.log`，然后把 `bluetooth.status` 置 `on`。
+   **没有**跑原厂 `init.qcom.bt.sh`——它的 `config_bt()` 会顺手设一页
+   `ro.qualcomm.bluetooth.*` 的 profile 开关，那会改变 7.1 暴露哪些 profile，
+   而写地址用不到这些。
+3. `kyl23-extra.rc`：
+   - post-fs-data 里 `setprop ro.qualcomm.bt.hci_transport smd`；
+   - `service kcbtinit`（user bluetooth，group bluetooth net_bt_stack）+
+     `on property:bluetooth.hciattach=true` → `start kcbtinit`。
+4. `kcbt.sh` 每次开机把 NV 文件与 `btnvtool -p` 的内容记进日志；
+   只有在 `/persist` 确实是挂载点、且 `.bt_nv.bin` 不存在时，才按原厂做法
+   `btnvtool -O` 生成一个（已有地址绝不覆盖）。
+
+时间窗是硬约束：vendor 库最多等五秒，所以 `kcbtinit.sh` 用
+`timeout 4` 兜住 `hci_qcomm_init`——真卡住就把它杀掉、描述符随进程关闭，
+不会和随后打开同一个端口的堆栈抢。
+
+### 16.5 实测：fix53 回传的那一次启动
+
+`grep KCBTINIT /cache/kcbt.log`，实际拿到的是：
+
+```
+KCBTINIT == start uptime=99.33
+KCBTINIT hci_transport='smd' soc='smd'
+KCBTINIT nv: -rw------- 1 bluetooth bluetooth 17 ... /persist/.bt_nv.bin
+KCBTINIT hci_qcomm_init rc=0
+KCBTINIT   BTS_DEVICE=/dev/ttyHS0;
+KCBTINIT   BTS_ADDRESS=c4:21:c8:f2:9f:3a;
+KCBTINIT   ro.qualcomm.bt.hci_transport: smd
+KCBTINIT programmed address=c4:21:c8:f2:9f:3a device=/dev/ttyHS0 type=qualcomm
+```
+
+两处与当初的预期不同，都记在这里，免得下次再当异常查：
+
+1. **`BTS_DEVICE` 是 `/dev/ttyHS0`，不是 `/dev/smd3`。** 上面 §16.3 推断
+   "属性设成 smd 就走 smd 口"，这条只对了一半：`hci_qcomm_init -e` 先在
+   modem 侧找 `MODEM_NV_BD_ADDR`，找到就直接用 QMI 把地址交给蓝牙核，
+   `/dev/ttyHS0` 只是它在 `-b` 手动模式下才会用的回落口。既然 `rc=0` 且
+   地址写进去了，说明这一次走的是 QMI 那条路，那个不存在的 UART 根本没被打开。
+   这也解释了为什么 `ro.qualcomm.bt.hci_transport=smd` 设不设都能通。
+2. **两条无害告警。** `Failed to open the /sys/devices/platform/wcnss_wlan.0/
+   smd_channel_ready` 是诊断通道节点不在（4.4 的 sysfs 布局），
+   `Diag_LSM_Init ... error = 13` 是同一个原因的下游结果。两条都在写地址
+   之前发生，之后 `rc` 仍是 0，与结果无关。
+
+主日志那边验证通过，三条都对上：
+
+```
+W bt_btif : BTIF init BDA was 00:00:00:00:5a:ad
+W bt_btif : Controller BDA is c4:21:c8:f2:9f:3a
+D BluetoothAdapterProperties: Address is:C4:21:C8:F2:9F:3A
+```
+
+第一条仍是 `00:00:00:00:5a:ad`，那是开关按下之前从 NV 读到的旧值（`HCI_Read_
+BD_ADDR` 在写地址之前发生）；第二条才是写完之后的答案，也是从这之后
+`Address is:` 才变成真地址。**判据看第二、三条，第一条留着不算问题。**
+
+失败时的判读方式：
+
+- `rc=143`（timeout 杀掉）→ 四秒不够，或通道没就绪，把窗口调大再试；
+- `rc` 非零且输出里有 QMI 报错 → 走的是 modem NV 那条路失败，需要 `-b` 显式给地址。
+
+### 16.6 这一层的边界
+
+地址是写进**芯片 NV** 的，正常一次就够，之后每次开机都还在。若某次刷回原厂
+4.4 或清 `/persist`，NV 文件没了，`btnvtool -O` 会生成一个新的（原厂行为），
+那时地址会变，已配对设备需要重新配。

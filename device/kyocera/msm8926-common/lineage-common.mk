@@ -140,7 +140,19 @@ KC_LIBS := libkccabi.so libkcabi.so libkchwc.so
 
 PRODUCT_COPY_FILES += \
     $(LINEAGE_COMMON_PATH)/rootdir/etc/init/kyl23-extra.rc:system/etc/init/kyl23-extra.rc \
-    $(KC_PREBUILT)/kcfix.sh:system/etc/kcfix.sh
+    $(KC_PREBUILT)/kcfix.sh:system/etc/kcfix.sh \
+    $(KC_PREBUILT)/kcbt.sh:system/etc/kcbt.sh \
+    $(KC_PREBUILT)/kcbtinit.sh:system/etc/kcbtinit.sh
+
+# The two stock Bluetooth tools.  They are what programs the WCNSS Bluetooth
+# core's NV (BD_ADDR, reference clock, clock sharing) over /dev/smd3; 7.1 has no
+# equivalent, and without them the controller answers HCI_Read_BD_ADDR with
+# 00:00:00:00:5A:AD -- see docs/DEVICE_NOTES.md §16.  hci_qcomm_init needs the
+# QMI client libraries and libbtnv.so, all already in the vendor blob set.
+KC_BTTOOLS := btnvtool hci_qcomm_init
+
+PRODUCT_COPY_FILES += \
+    $(foreach f,$(KC_BTTOOLS),$(KC_PREBUILT)/bin/$(f):system/bin/$(f))
 
 PRODUCT_COPY_FILES += \
     $(foreach f,$(KC_BINS),$(KC_PREBUILT)/bin/$(f):$(TARGET_COPY_OUT_VENDOR)/bin/$(f))

@@ -223,7 +223,7 @@ run "anr watchdog" '/system/bin/logcat -d -v time -b all 2>/dev/null | grep -E "
 run "faults" '/system/bin/logcat -d -v time -b all 2>/dev/null | grep -E "FATAL|fault addr|signal 11|signal 6" | tail -n 20'
 run "audio death" '/system/bin/logcat -d -v time -b all 2>/dev/null | grep -E "audioserver|AudioService|AudioPolicyService|audio_policy|audio_hw_primary|AudioFlinger" | tail -n 30'
 run "audio live" 'echo "policy=$(service check media.audio_policy 2>/dev/null) flinger=$(service check media.audio_flinger 2>/dev/null) audio=$(service check audio 2>/dev/null)"; echo "hal=$(ls -l /vendor/lib/hw/audio.primary.msm8226.so 2>&1)"; echo "cards=$(cat /proc/asound/cards 2>/dev/null | tr "\n" "|")"; echo "audioserver=$(getprop init.svc.audioserver)"'
-run "bt now" 'echo "bt=$(getprop init.svc.bluetoothd) crash=$(getprop init.svc.vendor.bluetooth)"; echo "iface=$(hciconfig 2>&1 | head -3)"; echo "prop=$(getprop bluetooth.enable_timeout_ms)"; ls -l /vendor/lib/hw/bluetooth.default.so /vendor/lib/libbtfix.so 2>&1'
+run "bt now" 'echo "bt=$(getprop init.svc.bluetoothd) crash=$(getprop init.svc.vendor.bluetooth)"; echo "iface=$(hciconfig 2>&1 | head -3)"; echo "prop=$(getprop bluetooth.enable_timeout_ms)"; ls -l /vendor/lib/hw/bluetooth.default.so 2>&1'
 
 # ---------------------------------------------------------------------------
 # fix25: everything that decides whether the modem and the ADSP can work.
@@ -372,7 +372,7 @@ run "crash count" '/system/bin/logcat -d -b all 2>/dev/null | grep -c "com.andro
 run "recent" '/system/bin/logcat -d -v time -b all -t 2000 2>/dev/null | grep -i -E "bluetooth|btif|bluedroid|bte_conf" | tail -30'
 
 sec "bluetooth"
-run "hal" 'ls -l /vendor/lib/libbtfix.so /vendor/lib/hw/bluetooth.default.so 2>&1'
+run "hal" 'ls -l /vendor/lib/hw/bluetooth.default.so /vendor/lib/libbt-vendor.so /persist/.bt_nv.bin 2>&1; echo "soc=$(getprop qcom.bluetooth.soc) transport=$(getprop ro.qualcomm.bt.hci_transport)"'
 run "log" 'logcat -d -v time -b all -t 2000 2>/dev/null | grep -i -E "bluetooth|Bluetooth|hci" | tail -25'
 
 sec "modem / baseband"

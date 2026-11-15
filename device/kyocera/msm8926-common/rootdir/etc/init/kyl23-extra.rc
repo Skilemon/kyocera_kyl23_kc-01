@@ -6,6 +6,149 @@
 # 7.1, and everything in between is bridged here or in the helpers it starts.
 #
 # ---------------------------------------------------------------------------
+# Bluetooth.  Five layers had to come off one at a time; the full account with
+# the original logs is in docs/DEVICE_NOTES.md §15 (the stack) and §16 (the
+# address).  What this file does is listed at the end of this block; the notes
+# below are only the parts a reader of *this* file needs to not undo them.
+#
+# Layer 1 (fix48), the HAL.  The 4.4 blob cannot load here at all: it is linked
+# against AudioTrack::write(const void*, size_t), and this ROM's libmedia only
+# exports the three-argument form Android 6.0 introduced, so dlopen fails in the
+# linker before any of its code runs.  The 7.1 HAL was in the image all along
+# under /lib/hw and never ran, because 7.1 searches /vendor/lib/hw first.  The
+# port therefore uses 7.1's HAL, JNI and libbt-vendor together, all from one
+# tree, so the vendor interface struct matches by construction.
+#
+# Layer 2 (fix49/fix50), the package.  Bluetooth had been disabled in /data
+# since fix32; a disabled package is never bound, so no HAL is reached at all.
+# See the post-fs-data trigger further down -- it clears the flag before
+# PackageManager reads the file, which is the only window where that works.
+#
+# Layer 3 (fix51), the alarm clock.  With the package enabled the stack finally
+# starts -- and aborts in the same second, over and over, once every 1.3 s for
+# as long as the switch is on, which is what the UI reports as "Bluetooth Share
+# keeps stopping":
+#
+#     E bt_osi_alarm: timer_create_internal unable to create timer with
+#                     clock 9: Invalid argument
+#     E bt_osi_alarm: The kernel might not have support for
+#                     timer_create(CLOCK_BOOTTIME_ALARM)
+#     F libc: system/bt/osi/./src/alarm.c:157: alarm_new_internal:
+#             assertion "false" failed
+#     F libc: Fatal signal 6 (SIGABRT) in tid ... (stack_manager)
+#
+# Clock 9 is CLOCK_BOOTTIME_ALARM.  This device's 3.4 kernel was built without
+# the alarm clocks (they arrive with CONFIG_RTC_CLASS), so timer_create()
+# rejects the id with EINVAL, alarm_new_internal() hits its assert, and the
+# process dies before a single HCI command is ever sent.  Nothing about the
+# radio has been tested yet.
+#
+# The repair is two bytes in the HAL.  timer_create_internal() keeps its
+# clock_id argument in r4 and hands it straight to timer_create(); at 0x10145c
+#
+#       04 46   mov  r4, r0     ->     07 24   movs  r4, #7
+#
+# so everything the stack schedules is created on CLOCK_BOOTTIME, which every
+# kernel since 3.x provides.  The only property given up is waking the device
+# out of suspend -- this port does not suspend -- and no other timing call in
+# the library is touched: all 22 clock_gettime() sites already use 7, 1 or 0,
+# 9 appears exactly once in the whole file, at this call.  Patched HAL md5
+# 4ee10c46..., previously c28859f5..., installed at /lib/hw and /vendor/lib/hw.
+#
+# Layer 4 (fix52), the transport.  With the abort gone the stack got all the way
+# down to it and stopped again -- but at least it said why:
+#
+#     I bt_hci_h4 : hal_open
+#     I bt_vendor : bt-vendor : BT_VND_OP_USERIAL_OPEN
+#     I bt_vendor : Done intiailizing UART
+#     E bt_hci_h4 : hal_open opened the wrong number of ports: got 2, expected 1.
+#     I bt_hci_h4 : hal_close
+#     E bt_hci_h4 : In transmit_data, error writing to the uart serial port: Bad file descriptor
+#     E BluetoothAdapterState: Error enabling Bluetooth (enable timeout)
+#
+# "got 2, expected 1" is the whole bug, and it is not about Bluetooth at all: it
+# is two halves of the stack disagreeing about which transport this phone has.
+#
+# The vendor library in /vendor/lib is the Qualcomm one for this SoC.  It opens
+# two descriptors, /dev/smd3 and /dev/smd2 -- the shared-memory channels to the
+# WCNSS's own Bluetooth core, commands on one and ACL/events on the other:
+#
+#     bt_hci_init_transport()  ->  fd[0] = /dev/smd3, fd[1] = /dev/smd2  -> return 2
+#
+# bluetooth.default.so carries two HCI back ends and picks one at startup:
+#
+#     soc_type = get_soc_type();
+#     if (soc_type == BT_SOC_ROME || BT_SOC_CHEROKEE
+#             || soc_type == BT_SOC_AR3K || soc_type == BT_SOC_DEFAULT)
+#         return hci_hal_h4_get_interface();      // ONE descriptor, UART
+#     else
+#         return hci_hal_mct_get_interface();     // 2 or 4 descriptors, SMD
+#
+# and get_soc_type() reads qcom.bluetooth.soc, with this table in the library:
+#
+#     1 "smd"      2 "ath3k"      3 "rome"      4 "cherokee"
+#
+# The property was never set, so the stack took BT_SOC_DEFAULT, got the UART
+# back end, and that back end refuses two descriptors by construction.  Nothing
+# was broken; the phone's actual transport was never selected.  It could not
+# have worked with any amount of HAL patching, because H4 reads events from the
+# same descriptor it writes commands to, and this hardware delivers them on a
+# different one.
+#
+# fix52 sets qcom.bluetooth.soc=smd at post-fs-data.  One property, read by both
+# halves (the vendor library reads the same key, and answers "Unknown soc type"
+# for "smd" exactly as it already answers for unset -- its behaviour is keyed on
+# its own enum default either way, so nothing changes on that side), and the
+# stack then picks the MCT back end, which is the one written for two
+# descriptors.  See the post-fs-data trigger below.
+#
+# fix52 worked: the stack opened /dev/smd3 for command-and-event and /dev/smd2
+# for ACL, the controller answered, the adapter reached state 12 with
+# "Scan Mode:21", it paired, it sent a file, it survived a toggle and a reboot.
+#
+# One thing was still wrong, and only the *other* end showed it: the address
+# this phone advertises is 00:00:00:00:5A:AD.  Not a bad read -- a real one, on
+# air and in the stack's own log -- because the controller's NV has never been
+# programmed:
+#
+#     W bt_btif: BTIF init BDA was c4:21:c8:f2:9f:3a
+#     W bt_btif: Controller BDA is 00:00:00:00:5a:ad
+#
+# /persist/.bt_nv.bin *does* hold the right one; a boot that never opened the
+# transport says so plainly ("Read the Vendor BD addr from '/persist/.bt_nv.bin'"
+# -> Address is:C4:21:C8:F2:9F:3A).  The host simply has no code that pushes it
+# into the core.  The 4.4 ROM did, and it is still on the stock image:
+#
+#     /system/bin/btnvtool         writes NV447 into /persist/.bt_nv.bin
+#     /system/bin/hci_qcomm_init   reads NV447 and performs the "NV VS set"
+#                                  exchange, which is what programs the
+#                                  controller
+#     /system/etc/init.qcom.bt.sh  the glue that calls both
+#
+# Layer 5 (fix53), the address.  7.1's vendor library still performs the same
+# handshake it always did: on power-up it sets bluetooth.hciattach=true and
+# waits (up to five seconds) for bluetooth.status.  Nothing reacted on this
+# port, so that wait simply timed out -- see the five-second gap between
+# BT_VND_OP_POWER_CTRL and hal_open in the fix52 log.  fix53 ships the two
+# binaries plus a small script of our own (kcbtinit.sh) that runs
+# hci_qcomm_init inside that window.  init.qcom.bt.sh itself is *not* used: its
+# config_bt() sets a page of ro.qualcomm.bluetooth.* profile flags that would
+# change which profiles 7.1 exposes, and none of that is needed to write an
+# address.
+#
+# hci_qcomm_init takes a fallback port from ro.qualcomm.bt.hci_transport (unset
+# means /dev/ttyHS0, a UART this phone does not have), and post-fs-data sets it
+# to "smd".  In practice -e mode never opens that port: it hands the address to
+# the controller over QMI and prints the tty path only as a label.  The verified
+# run ends with
+#
+#     KCBTINIT programmed address=c4:21:c8:f2:9f:3a device=/dev/ttyHS0
+#
+# and the stack log afterwards says "Controller BDA is c4:21:c8:f2:9f:3a".
+# That second line is the one to check on any future boot; the
+# "BTIF init BDA was 00:00:00:00:5a:ad" above it is the read taken before the
+# write and is expected to stay.  Details in docs/DEVICE_NOTES.md §16.5.
+# ---------------------------------------------------------------------------
 # Wi-Fi: finished, and this is the shape it ended in.
 #
 # The device shipped a 4.4 wpa_supplicant (v2.1-devel) that speaks the old
@@ -236,6 +379,13 @@ service kcwifi /vendor/bin/kcwifi
 # ---------------------------------------------------------------------------
 # Bluetooth: stop the crash loop.
 #
+# HISTORICAL -- fix48 replaced the 4.4 HAL with the 7.1 one and reverted the
+# JNI patches described below, so none of this is in effect any more.  It is
+# kept because it is the clearest record of what the blob/framework mismatch
+# actually looked like, and because the "reverting this one patch brings the
+# crashes back" line is still the right warning for anyone tempted to put the
+# 4.4 HAL back.
+#
 # The kernel's user-fault reporter finally caught the crash this time:
 #
 #     USRFLT BluetoothAdapte/3667 addr=0000003c fsr=00005
@@ -307,6 +457,79 @@ service kcadsp /vendor/bin/kcadsp.sh
 # than a phone without sound.
 on property:sys.boot_completed=1
     start kcadsp
+
+# Bluetooth package state: clear the flag before PackageManager reads it.
+#
+# fix32's wpa hook ran `pm disable com.android.bluetooth` to stop the 4.4 crash
+# loop.  The flag is not in any system image; it is in
+# /data/system/users/0/package-restrictions.xml, so it survived every build
+# since.  A package disabled for the user is not "an adapter that fails to
+# open".  Every one of its services becomes unresolvable, so
+# BluetoothManagerService.enable() dies inside bindService() before a process
+# is started and before a HAL is loaded:
+#
+#     D BluetoothManagerService: enable(com.android.settings): mState = OFF
+#     D BluetoothManagerService: MESSAGE_ENABLE(0): mBluetooth = null
+#     E BluetoothManagerService: Fail to bind to:
+#            Intent { act=android.bluetooth.IBluetooth }
+#
+# with no "Start proc ... com.android.bluetooth" afterwards anywhere in the
+# boot, and the profile services failing the same way from the Settings
+# process.  Compare a boot from before fix32, where the same line is followed
+# by "Start proc 13026:com.android.bluetooth/1002 for service ...AdapterService".
+#
+# fix49 tried to clear it with `pm default-state` at boot_completed.  Right
+# idea, wrong clock.  `pm` is a shell wrapper around app_process, and the first
+# one of those costs close to a minute on this device while the boot is still
+# settling.  Measured on the fix49 boot:
+#
+#     boot_completed            05:12:47
+#     first pm process visible  05:13:51
+#     toggle tried by hand      05:13:58   -> still "Fail to bind"
+#
+# Four seconds after the first pm had even started.  Nothing was broken; the
+# repair had not reached the flag yet.
+#
+# So fix50 does not ask PackageManager to change its mind, it changes the file
+# PackageManager reads, and it does it at post-fs-data: before zygote, before
+# system_server, before PackageManagerService parses that file.  The edit is
+# then in force for the whole boot with no pm, no binder, nothing to wait for.
+# kcbt.sh rewrites exactly one package's state flags (enabled, inst, stopped,
+# hidden) and leaves the rest of the file byte for byte, writing back through
+# `cat >` so the inode, owner, mode and SELinux label of the original survive.
+#
+# The boot_completed pass stays as a fallback for the case where post-fs-data
+# ran before /data was readable; it re-reads the file, and only if something is
+# still off does it fall back to `pm`, twice at most.
+on property:sys.boot_completed=1
+    exec -- /system/etc/kcbt.sh post
+
+# ---------------------------------------------------------------------------
+# Bluetooth core bring-up: the address the controller does not have.
+#
+# 7.1's vendor library hands the transport to init the same way the 4.4 one did
+# -- property bluetooth.hciattach=true, then a wait of at most five seconds for
+# bluetooth.status -- and on stock that was the cue to run hci_qcomm_init over
+# /dev/smd3, which is the only thing that programs the WCNSS Bluetooth core's
+# NV (BD_ADDR, reference clock, clock sharing).  Without it the core answers
+# HCI_Read_BD_ADDR with 00:00:00:00:5A:AD: everything works except the identity
+# every other phone sees.  See the header note and kcbtinit.sh.
+#
+# The wait is the deadline: kcbtinit.sh bounds hci_qcomm_init to four seconds so
+# it is out of the way before the stack opens the port, and sets
+# bluetooth.status either way so the stack does not sit out the timeout.
+service kcbtinit /system/bin/sh /system/etc/kcbtinit.sh
+    class late_start
+    user bluetooth
+    group bluetooth net_bt_stack net_bt_admin
+    disabled
+    oneshot
+
+on property:bluetooth.hciattach=true
+    start kcbtinit
+
+on property:bluetooth.hciattach=false
+    setprop bluetooth.status off
 
 # The only supplicant in this build.  It pages its network list correctly, so
 # the framework's unmodified wifi-service.jar works with it -- see the header.
@@ -387,6 +610,24 @@ on post-fs-data
     chmod 0755 /vendor/bin/kcstate.sh /vendor/bin/kcstate-boot.sh
     chmod 0755 /vendor/bin/kcstate-delay.sh /vendor/bin/kc_bootanim.sh
     chmod 0755 /vendor/bin/kccam.sh /system/etc/kcfix.sh
+    chmod 0755 /system/etc/kcbt.sh
+    chmod 0755 /system/etc/kcbtinit.sh
+    chmod 0755 /system/bin/btnvtool /system/bin/hci_qcomm_init
+
+    # This phone's Bluetooth core lives inside the WCNSS and is reached over two
+    # shared-memory channels, not over a UART.  The stack picks its HCI back end
+    # from this property; unset means "default", which means the one-descriptor
+    # UART back end, which cannot work here.  See the header note.
+    setprop qcom.bluetooth.soc smd
+
+    # hci_qcomm_init (the stock tool that programs the controller, see
+    # kcbtinit.sh) picks its port from this one; unset means /dev/ttyHS0.
+    setprop ro.qualcomm.bt.hci_transport smd
+
+    # PackageManager has not started yet, so whatever this writes is what it
+    # will load.  See the note at the boot_completed trigger.
+    exec -- /system/etc/kcbt.sh pre
+
     exec -- /vendor/bin/kcfuse.sh
     exec -- /vendor/bin/kcboot mknod
     mkdir /data/misc/wifi 0770 wifi wifi
