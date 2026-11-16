@@ -2651,3 +2651,301 @@ mtp,adb / mass_storage / diag 各种组合写得整整齐齐，PID 是 0a27 / 0a
   `setprop persist.sys.usb.config mtp`，它会写回 `/data/property`，下次开机生效。
 
 要干净验证，可以 `wipe /data` 后刷机，也可以先手动改这一条属性。
+
+## 21. prebuilt/kernel 停在 11-07：CI 出的整包开不了机
+
+### 21.1 现象
+
+`boot-fix57.img` 是从 CI 产物里原样取出的 boot（内核就是仓库的
+`prebuilt/kernel`），刷进去**黑屏**，没有开机动画，adb 也起不来。整包里那份
+boot 是同一个二进制，所以整包刷同样起不来——它此前从没被真正刷过。
+
+### 21.2 判据：两个内核不是同一批
+
+| | `prebuilt/kernel` | `boot-diag23.img` 里的 |
+|---|---|---|
+| 编译时间 | 2026-11-07 17:14 **#6** | 2026-11-12 14:03 **#20** |
+| 编译目录 | `/workspace/src/kernel` | `/workspace/source/kernel` |
+| md5 | `3d87f8d8…` | `eb39a954…` |
+| 设备树 | `bc64efe7…` | `bc64efe7…`（逐字节相同） |
+
+设备树、gcc 版本、页大小、cmdline 基串都一致，只有内核体不同。把两份 zImage
+里各自的 gzip 段解出来做 `strings` 差集，只在 #20 里存在的串正好对应 11-07 之后
+内核树改过的几批东西：
+
+| 改动 | 时间 | 只在 #20 里的串 |
+|---|---|---|
+| `security/selinux/` 整体换核，24 个文件 +1435/−386 | 11-10 22:59 | `Android master kernel running Android M policy in compatibility mode`、`avtab: entry has extended permissions`、`permissive=%u` |
+| `net/wireless/nl80211.c` 空指针防护 | 11-11 前 | `nl80211: vendor cmd without rdev/dev` |
+| `drivers/gpu/ion/ion.c` 1 GiB 钳位 + 打印 | 11-11 12:51 | `IONBIG`、`IONA`、`IONFAIL` |
+| `drivers/video/msm/mdss/*` pipe 类型回退 + 打印 | 11-11 17:12 | `OSCFB pset: fell back to pipe type` |
+| `drivers/uio/msm_sharedmem.c` 按 reg-names 命名 | 11-12 01:15 | `uio %s registered` |
+| `arch/arm/mm/fault.c` 用户态崩溃现场 | 11-12 | `USRFLT` 十余条 |
+
+反方向，#6 里有、#20 里没有的是 Kyocera 定制 SELinux 的那几条：
+`no permission in … realpath=… dev_name=…`、`no permission mount /system/... by
+non-init process`。
+
+两个 ramdisk 的差异只有 `kcrec`、`adb_keys`、USB 那几个 stanza 和构建指纹，
+`sepolicy`、`file_contexts.bin`、`fstab.qcom`、`ueventd.*` 逐字节相同，都不影响启动。
+
+### 21.3 为什么是黑屏而不是重启
+
+init 在 first stage 就要把 ramdisk 里的 `sepolicy` 交给内核。7.1 这份策略是
+policy version 30，带 extended permissions；#6 的 avtab 是换核之前的老代码，
+认不了这些规则，`policydb_read` 直接失败。init 停在这一步，`adbd` 没起来，
+屏幕当然是黑的，也不会进开机动画——和"卡 logo 后重启"是两回事，后者是
+surfaceflinger 或 wlan 在跑。
+
+### 21.4 处理
+
+用当前内核树重编，`#22`，2026-11-16 00:15：
+
+```bash
+cd kernel && make -j32 ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- zImage
+```
+
+同时做了两件事：
+
+1. **去掉 11-11/11-12 加的诊断**：`USRFLT`（fault.c 整段恢复）、`OSCFB` 两处
+   （`mdss_mdp_pipe.c` 整段恢复，`mdss_mdp_overlay.c` 只留 pipe 回退）、
+   `IONBIG`/`IONA`/`IONFAIL`（只留 1 GiB 钳位，`IONFAIL` 回到原来的 `pr_debug`）。
+   功能性改动全部保留：SELinux 换核、nl80211 防护、ion 钳位、mdss 回退、
+   msm_sharedmem 命名。
+2. **Makefile 加 `-fgnu89-inline`**。gcc 13 默认 `-std=gnu11`，`extern inline`
+   变成"本单元导出定义"、普通 `inline` 变成"别处必须有定义"，老代码两头都会
+   炸：`arch/arm/include/asm/ftrace.h` 的 `extern inline return_address()` 让每个
+   .o 都带一份，链接报 *multiple definition*；`drivers/gpu/msm/kgsl_iommu.c` 的
+   `inline kgsl_iommu_sync_lock()` 没人导出，链接报 *undefined reference*。
+   加这一个 flag 就够，不必改源码。
+
+vermagic 与 #20 完全一致（`3.4.0 SMP preempt mod_unload modversions ARMv7`），
+导出符号没变，所以 `pronto_wlan.ko`、`kc_wp.ko` 不用重编。
+
+### 21.5 教训
+
+CI 不编内核，只搬 `prebuilt/kernel`。这个二进制一旦落后，**整包就是坏的，而且
+CI 自己检查不出来**——workflow 里那道断言只验 `Linux version 3.4`，任何一版
+3.4 内核都能过。以后换 `prebuilt` 前后，比对一下内核体里的特征串
+（`IONBIG`、`OSCFB`、`compatibility mode` 这几条最灵敏）。
+
+## 22. SurfaceFlinger 秒退的根因：Adreno 用相对路径 dlopen 自己的 GL 库
+
+### 22.1 现象
+
+刷完 system 后停在首屏（开机 logo），充电灯亮，`init` 每 4 秒重启一次
+`surfaceflinger`，日志里是 `exited with status 0`，看起来像"正常退出"，很容易
+被当成没崩。真正的证据只有 logcat 里有：
+
+```
+I SurfaceFlinger: SurfaceFlinger's main thread ready to run. Initializing graphics H/W...
+D libEGL  : loaded /vendor/lib/egl/libEGL_adreno.so
+D libEGL  : loaded /vendor/lib/egl/libGLESv1_CM_adreno.so
+D libEGL  : loaded /vendor/lib/egl/libGLESv2_adreno.so
+W Adreno-GSL: <os_lib_map:1303>: os_lib_map error: dlopen failed:
+              library "egl/libGLESv2_adreno.so" not found
+E Adreno-EGL: <egliLoadLibrary:631>: OpenGLES20 lib failed to load
+E Adreno-EGL: <eglFetchClientAPIFunctions:3463>: NO OGL 2 functions
+E Adreno-EGL: <eglCreateClientContextApiFunctions:2230>: Unable to fetch GL functions
+W Adreno-EGL: <qeglDrvAPI_eglCreateContext:2507>: EGL_BAD_ALLOC
+F SurfaceFlinger: EGLContext creation failed
+F libc    : Fatal signal 6 (SIGABRT), code -6 in tid 4879 (surfaceflinger)
+```
+
+`init` 之所以报 `status 0`，是因为 `LOG_FATAL` 之后 SF 在 abort 之前自己退了
+一次，信号 6 是后面 debuggerd 补的，别被这行糊弄。
+
+### 22.2 为什么
+
+`libEGL_adreno.so` 里写死了两个**相对**库名：
+
+```
+143088  egl/libGLESv1_CM_adreno.so
+143292  egl/libGLESv2_adreno.so
+```
+
+dlopen 遇到相对路径是按进程 cwd 解析的，SF 的 cwd 是 `/`，于是去找
+`/egl/libGLESv2_adreno.so`——永远不存在。库其实好好地躺在
+`/vendor/lib/egl/` 下。
+
+老的那份移植包能开机，是因为有人把 `libEGL_adreno.so` 里这两处字符串**就地改短**
+了 4 个字节（`egl/` 前缀删掉、后面补 NUL），改成裸名 `libGLESv2_adreno.so`，
+走的是默认搜索路径。文件大小一个字节都没变，157,836 B，所以谁也没注意。
+
+### 22.3 这次为什么丢了
+
+CI 从 AOSP 重新编/拷贝 `libEGL_adreno.so`，那两处字符串回到带前缀的原样。
+fix56 之前的包是手工换过的二进制，fix57 之后直接取 CI 产物，补丁就没了。
+
+判据：fix56 的 `/vendor/lib/egl/libEGL_adreno.so` mtime 是 2026-11-12 11:39
+（手工换过），md5 `5049999e…`；CI 的是 `d69d77bf…`，两者只差这 49 个字节。
+把 CI 那份按同样方式改短之后，md5 与 fix56 那份**逐字节相同**，等于把当年的
+补丁精确复现出来。
+
+### 22.4 处理
+
+`system-fix60.img` 起，`/vendor/lib/egl/libEGL_adreno.so` 用改短过的那份
+（`5049999e…`），属主 root、0644、SELinux `u:object_r:system_file:s0` 不变。
+`libGLESv1_CM_adreno.so` 里还有一处同样的 `egl/libGLESv2_adreno.so`，那是创建
+GLES1 上下文时才走的，不影响开机，暂不动。
+
+`/vendor/bin/kc_bootanim.sh` 早就用 `cd` 绕过了同一个坑（开机动画能显示、
+SF 起不来，两边症状不一样），所以这处一直没被发现。
+
+### 22.5 教训
+
+1. `exited with status 0` 不等于没崩。init 对 SF 这类 `oneshot` 服务的这条措辞
+   会掩盖 SIGABRT，必须看 logcat 里的 `F/` 行。
+2. 图形栈除错优先看 `Adreno-GSL` 和 `Adreno-EGL` 的 tag——EGL 自己会说清楚
+   哪个库没找到，比反汇编 `libsurfaceflinger.so` 快一百倍。
+3. 老包里手工改过的二进制要在文档里留指纹（这里就是 mtime + md5 + 改了哪 49
+   字节），否则下次从 CI 重新出包必然复发。
+
+## 23. 能开机之后：开机动画、蓝牙、WiFi
+
+第 22 节修好 SurfaceFlinger 之后，系统终于走到开机动画这一步，然后卡在那里。
+这一节记的是从"SF 正常"到"能进桌面"之间的三个问题，以及它们共同的成因：
+**原厂 4.4 的 HAL 把 7.1 编的同名 HAL 挡住了。**
+
+### 23.1 卡在开机动画：desc.txt 缺两个数
+
+logcat 里只有两行：
+
+```
+I libEGL  : loaded /vendor/lib/egl/libEGL_adreno.so
+I Adreno-EGL: <qeglDrvAPI_eglInitialize:410>: EGL 1.4 QUALCOMM
+F libc    : Fatal signal 8 (SIGFPE), code -6, fault addr 0x381 in tid 1057 (BootAnimation)
+F libc    : failed to resend signal during crash: Operation not permitted
+```
+
+`code -6` 是 `SI_TKILL`，不是硬件除零陷阱的 `code 1`（`FPE_INTDIV`），说明信号是
+`raise(8)` 主动发的。`/system/bin/bootanimation` 反汇编里正好有这一段：
+
+```
+000083e4 <__aeabi_idiv0@@Base>:
+    83e4:  push  {r1, lr}
+    83e8:  mov   r0, #8
+    83ec:  bl    364c <raise@plt>
+```
+
+libgcc 的整数除零辅助函数。`debuggerd` 没能留下 tombstone（`/cache/kc_tombstone_*`
+都是 0 字节，进程已经消失），所以只能从二进制反推。
+
+除数是 `/system/media/bootanimation.zip` 里的 `desc.txt`：
+
+| | 原厂（能开机） | CI 产物 |
+|---|---|---|
+| 大小 | 23,894 B | 236,262 B |
+| 第一行 | `540 960 1` | `  60` |
+| 帧图 | `part1/01.jpg` 540×960 | 480 个 **1×1** PNG |
+
+`BootAnimation` 用 `sscanf(line, "%d %d %d") == 3` 判断第一行，`"  60"` 只给得出
+一个数，这行被丢弃，`Animation::fps` 保持构造时的 0，`movie()` 里做帧间隔的 64 位
+取模就撞上 `__aeabi_idiv0`。
+
+**为什么这一崩就永远停在首屏**：`bootanimation` 正常结束时才调
+`SurfaceFlinger::bootFinished()`，那一步才置 `mBootAnimationComplete`，
+`ActivityManagerService` 才会 `startHomeActivity()`。它崩了，AMS 就一直等，
+屏幕停在 bootloader 的 static splash 上，而 `kcbtnled` 照样在跑——所以充电灯亮着，
+人以为系统还在启动。
+
+修法：把原厂那份 `bootanimation.zip` 放回 `prebuilt/media/`，workflow 在 sync 之后
+覆盖 `vendor/lineage/prebuilt/bootanimation/bootanimation.zip`，并当场校验 desc.txt
+第一行是三个数。
+
+### 23.2 蓝牙打不开：加载到了 4.4 的 HAL
+
+```
+E HAL     : load: module=/vendor/lib/hw/bluetooth.default.so
+E HAL     : dlopen failed: cannot locate symbol
+            "_ZN7android10AudioTrack5writeEPKvj" referenced by
+            "/system/vendor/lib/hw/bluetooth.default.so"...
+E BluetoothServiceJni: No Bluetooth Library found
+```
+
+`AudioTrack::write(void const*, unsigned int)` 是 4.4 的签名；7.1 是
+`write(void const*, size_t, bool)`，符号带 `b` 后缀。两个文件同时在镜像里：
+
+| 路径 | 大小 | 来源 | 引用的符号 |
+|---|---|---|---|
+| `/system/lib/hw/bluetooth.default.so` | 1,448,792 | `system/bt` 编的 | `…5writeEPKvjb` |
+| `/vendor/lib/hw/bluetooth.default.so` | 1,212,144 | 原厂 4.4 blob | `…5writeEPKvj` |
+
+`hw_get_module()` 先走 `/vendor/lib/hw`，所以永远是错的那一个。原本靠
+`libkccabi.so` 的 `LD_PRELOAD` 把这个符号补回全局作用域——它确实导出了
+`_ZN7android10AudioTrack5writeEPKvj`（内部转调 7.1 的 `…jb`）——但 `LD_PRELOAD`
+只对 init 直接 exec 的服务（`audioserver`、`mediaserver`）稳，对 zygote fork 出来的
+`com.android.bluetooth` 不可靠，于是 dlopen 时符号仍然缺失。
+
+修法：在 `lineage-common.mk` 里 `filter-out` 掉 vendor mk 对这三个 HAL 的拷贝，
+让 `hw_get_module()` 回退到 `/system/lib/hw`：
+
+```make
+PRODUCT_COPY_FILES := $(filter-out \
+    vendor/.../hw/bluetooth.default.so:% \
+    vendor/.../hw/hwcomposer.msm8226.so:% \
+    vendor/.../hw/gralloc.msm8226.so:%, \
+    $(PRODUCT_COPY_FILES))
+```
+
+`hwcomposer` / `gralloc` 是同一个病：原厂那对（103 KB / 18 KB）和 7.1 那对
+（141 KB / 26 KB）不能混用，第 22 节之前手工覆盖过它们，CI 出包时又会盖回去。
+
+`camera.msm8226.so`、`audio.primary.msm8226.so`、`lights.default.so` 这些在 7.1 树里
+没有对应实现，继续用原厂 blob，不动。
+
+### 23.3 WiFi 打不开：finit_module 在 3.4 上不存在
+
+```
+D WifiHW  : finit_module for "/vendor/lib/modules/pronto/pronto_wlan.ko" failed:
+            Function not implemented
+E WifiStateMachine: Failed to load driver
+E WifiController: WifiControllerWifi turn on failed
+```
+
+`finit_module` 是 3.8 才加的系统调用（ARM 上 `__NR_finit_module` = 379，而 3.4 的
+编号表到 376 为止），3.4 内核回 `ENOSYS`。
+
+`libkccabi.so` 里确实有一个 `finit_module`：
+
+```
+00000418 <finit_module>:
+ 418:  mov  r0, #0
+ 41c:  bx   lr
+```
+
+但框架根本不走这个符号。`libhardware_legacy.so` 的动态符号表里只有
+`syscall@LIBC`，没有 `finit_module`；`wifi.c` 的 `insmod()` 是
+
+```c
+ret = syscall(__NR_finit_module, fd, args, 0);
+```
+
+`syscall()` 是个转发器，`LD_PRELOAD` 覆盖不到，所以 shim 从来没被用过。
+`kcwifi` 提前 `insmod` 能让内核里有 `wlan`，但框架仍会自己再 `finit_module` 一次，
+失败即 `Failed to load driver`，随后把刚加载的模块卸掉。
+
+三条路，按代价排：
+
+1. **给 3.4 内核补 `finit_module`**（syscall 379）。读 fd、`load_module()`，
+   同名模块已加载时返回 0 而不是 `-EEXIST`，这样 `kcwifi` 的前置加载和框架的
+   加载都算成功。改动集中在 `kernel/module.c` + `arch/arm/kernel/calls.S`，
+   需要重编内核、重刷 boot。
+2. **改 `libhardware_legacy.so`**，把 `syscall(__NR_finit_module, …)` 换成先查
+   `/proc/modules`。这是 AOSP 源码，得在 workflow 里打补丁再编，改动面更大。
+3. **让 `kcwifi` 成为唯一加载者**：关掉框架的加载路径。7.1 的 `wifi.c` 没有留开关，
+   实际做不到。
+
+现状：未修，等内核改动排期。
+
+### 23.4 教训
+
+`/vendor/lib/hw` 优先于 `/system/lib/hw` 这件事，在这个移植里踩了三次：
+hwcomposer/gralloc（第 22 节，手工覆盖）、bluetooth（本节）。
+`vendor/kyocera/msm8926-common/msm8926-common-vendor.mk` 是
+`tools/blobs/extract.py` 生成的，不能手改一行——要动就在 `lineage-common.mk` 里
+`filter-out`，这样下次重新抽 blob 也不会被冲掉。
+
+判断某个 HAL 该用哪一份，看它引用的 libmedia / libgui 符号有没有 `b` 后缀、
+看它 NEEDED 里是 `libchrome.so`（7.1 的 Fluoride）还是 `libbt-hci.so`（4.4 的
+bluedroid）。大小差一个数量级的，基本都是版本不同而不是裁剪。

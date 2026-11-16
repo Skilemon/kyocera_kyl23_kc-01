@@ -77,6 +77,11 @@ device_kyocera_kc01/
 Thumbs.db
 .DS_Store
 
+# ...except the boot animation, which is an input the build copies into
+# /system/media (a 24 KB zip of one 540x960 JPEG; vendor/lineage's own is a
+# 1x1 placeholder that makes bootanimation divide by a zero fps).
+!device/**/prebuilt/media/bootanimation.zip
+
 # Python
 __pycache__/
 *.pyc

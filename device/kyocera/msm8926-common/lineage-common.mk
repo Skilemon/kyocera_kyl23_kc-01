@@ -30,6 +30,36 @@ $(call inherit-product, $(SRC_TARGET_DIR)/product/aosp_base_telephony.mk)
 # workflow -- 74 MB of proprietary binaries do not belong in this repository.
 $(call inherit-product, vendor/kyocera/msm8926-common/msm8926-common-vendor.mk)
 
+# ------------------------------------------------------- HAL shadowing
+# msm8926-common-vendor.mk copies the stock 4.4 HALs into
+# $(TARGET_COPY_OUT_VENDOR)/lib/hw.  hw_get_module() walks /vendor/lib/hw
+# before /system/lib/hw, so every one of them shadows the 7.1 build of the
+# same HAL that system/bt and hardware/qcom/display just produced.  Three of
+# those blobs cannot work against this ROM and are filtered out here so the
+# loader falls back to /system/lib/hw:
+#
+#   bluetooth.default.so  the 4.4 blob wants AudioTrack::write(void const*,
+#       unsigned int); 7.1 only has the (void const*, size_t, bool) overload,
+#       so dlopen stops on "cannot locate symbol _ZN7android10AudioTrack5write-
+#       EPKvj" and BluetoothServiceJni reports "No Bluetooth Library found" --
+#       Bluetooth cannot be switched on, ever.  The 7.1 build in /system/lib/hw
+#       is the Fluoride stack and asks for the correct symbol.
+#
+#   hwcomposer.msm8226.so, gralloc.msm8226.so  the 4.4 pair (103 KB / 18 KB)
+#       and the 7.1 pair (141 KB / 26 KB) are not interchangeable: mixing them
+#       leaves SurfaceFlinger with a composer it cannot queue buffers to, and
+#       the panel stays on the boot splash.  The 7.1 pair is what the display
+#       HAL in hardware/qcom/display was built for.
+#
+# Everything else in /vendor/lib/hw (camera, audio.primary, lights, sensors,
+# gps, keystore.qcom ...) has no 7.1 counterpart in this tree and is correct
+# as the stock blob.
+PRODUCT_COPY_FILES := $(filter-out \
+    vendor/kyocera/msm8926-common/proprietary/vendor/lib/hw/bluetooth.default.so:% \
+    vendor/kyocera/msm8926-common/proprietary/vendor/lib/hw/hwcomposer.msm8226.so:% \
+    vendor/kyocera/msm8926-common/proprietary/vendor/lib/hw/gralloc.msm8226.so:%, \
+    $(PRODUCT_COPY_FILES))
+
 PRODUCT_BRAND := Kyocera
 PRODUCT_MANUFACTURER := Kyocera
 PRODUCT_PLATFORM := msm8226

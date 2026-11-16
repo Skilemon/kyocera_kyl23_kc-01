@@ -228,6 +228,36 @@ jobs:
             patch -p1 --forward --batch < "$p"
           done
 
+      - name: Install the boot animation
+        run: |
+          set -ex
+          cd "$ROM"
+          # vendor/lineage ships a placeholder animation whose desc.txt is
+          # "  60\nc 1 0 part0\n..." -- the width and height are missing and
+          # all 480 frames are 1x1 pixels.  bootanimation parses the first
+          # line with sscanf("%d %d %d") == 3, rejects it, leaves
+          # Animation::fps at 0, and movie() then divides by it: SIGFPE about
+          # 90 ms after eglInitialize, before a single frame.
+          #
+          # bootanimation is what calls SurfaceFlinger::bootFinished().  If it
+          # dies, ActivityManagerService never clears mBootAnimationComplete,
+          # startHomeActivity() is never reached, and the panel stays on the
+          # bootloader splash for as long as the battery lasts.  Nothing in
+          # kmsg says so -- the only trace is one F/libc line in logcat
+          # (DEVICE_NOTES 23).
+          #
+          # The stock 4.4 animation is 540x960, a single JPEG, fps 1, looping
+          # with "p 0 0" until the framework is up.  That is what this device
+          # shipped with and what every working image so far has carried.
+          src=device/kyocera/msm8926-common/prebuilt/media/bootanimation.zip
+          dst=vendor/lineage/prebuilt/bootanimation/bootanimation.zip
+          test -f "$src"
+          mkdir -p "$(dirname "$dst")"
+          cp "$src" "$dst"
+          # Fail here rather than 40 minutes later on a phone that boots to a
+          # black screen: first line has to be three numbers.
+          unzip -p "$dst" desc.txt | head -n 1 | tr -d '\r' | grep -Eq '^[0-9]+ [0-9]+ [0-9]+$'
+
       - name: Check the inputs
         run: |
           set -ex
@@ -398,6 +428,12 @@ jobs:
           size=$(stat -c %s "$ZIP")
           test "$size" -gt 157286400 || { echo "package is only $size bytes"; exit 1; }
           unzip -l "$ZIP" | grep -E "boot.img|system.new.dat|system.transfer.list"
+          # The installed animation, not the source file, is what boots.  A
+          # desc.txt without width and height makes bootanimation divide by a
+          # zero fps and the phone never leaves the splash screen; catching it
+          # here costs a second, catching it on the device costs a flash.
+          unzip -p system/media/bootanimation.zip desc.txt | head -n 1 \
+              | tr -d '\r' | grep -Eq '^[0-9]+ [0-9]+ [0-9]+$'
           # The kernel inside boot.img must be the Kyocera 3.4.0 one, not an
           # AOSP default: the 7.1 tree has no msm8226 defconfig for this board.
           unzip -o -q "$ZIP" boot.img -d /tmp/bootcheck
