@@ -1,0 +1,179 @@
+diff --git a/arch/arm/mach-msm/qdsp6v2/adsp-loader.c b/arch/arm/mach-msm/qdsp6v2/adsp-loader.c
+index 0bd20100..89e2ca21 100644
+--- a/arch/arm/mach-msm/qdsp6v2/adsp-loader.c
++++ b/arch/arm/mach-msm/qdsp6v2/adsp-loader.c
+@@ -21,10 +21,27 @@
+ #include <mach/qdsp6v2/apr.h>
+ #include <linux/of_device.h>
+ #include <linux/sysfs.h>
++#include <linux/workqueue.h>
+ 
+ #define Q6_PIL_GET_DELAY_MS 100
+ #define BOOT_CMD 1
+ 
++/*
++ * Nobody on this port writes /sys/kernel/boot_adsp/boot early enough, and the
++ * userspace attempts that do exist (kcadsp.sh, the early-boot line in the rc)
++ * run after post-fs-data, i.e. at ~6 s, which is the very same moment init
++ * starts audioserver.  Instead of racing the audio stack, try from the kernel:
++ * first attempt once /firmware has had time to be mounted, then retry every
++ * couple of seconds.  Every attempt is logged, so one dump is enough to tell a
++ * missing firmware blob from a refused authentication.
++ */
++#define ADSP_BOOT_FIRST_DELAY	(6 * HZ)
++#define ADSP_BOOT_RETRY_DELAY	(2 * HZ)
++#define ADSP_BOOT_MAX_TRIES	20
++
++static struct delayed_work adsp_boot_work;
++static int adsp_boot_tries;
++
+ static ssize_t adsp_boot_store(struct kobject *kobj,
+ 	struct kobj_attribute *attr,
+ 	const char *buf, size_t count);
+@@ -45,47 +62,53 @@ static struct attribute *attrs[] = {
+ 
+ static struct platform_device *adsp_private;
+ 
+-static void adsp_loader_do(struct platform_device *pdev)
++static int adsp_loader_do(struct platform_device *pdev)
+ {
+ 
+ 	struct adsp_loader_private *priv = NULL;
+ 
+ 	const char *adsp_dt = "qcom,adsp-state";
+ 	int rc = 0;
+-	u32 adsp_state;
++	u32 adsp_state = APR_SUBSYS_DOWN;
+ 
+ 	if (!pdev) {
+-		dev_err(&pdev->dev, "%s: Platform device null \n", __func__);
+-		goto fail;
++		pr_err("adsp-loader: no platform device\n");
++		return -ENODEV;
+ 	}
+ 
+ 	if (!pdev->dev.of_node) {
+ 		dev_err(&pdev->dev,
+ 			"%s: Device tree information missing \n", __func__);
+-		goto fail;
++		return -ENODEV;
+ 	}
+ 
+ 	rc = of_property_read_u32(pdev->dev.of_node, adsp_dt, &adsp_state);
+ 	if (rc) {
+ 		dev_err(&pdev->dev,
+ 			"%s: ADSP state = %x\n", __func__, adsp_state);
+-		goto fail;
++		return rc;
+ 	}
+ 
+-	if (adsp_state == APR_SUBSYS_DOWN) {
+-		priv = platform_get_drvdata(pdev);
+-		if (!priv) {
+-			dev_err(&pdev->dev,
+-				" %s: Private data get failed\n", __func__);
+-			goto fail;
+-		}
++	priv = platform_get_drvdata(pdev);
++	if (!priv) {
++		dev_err(&pdev->dev,
++			" %s: Private data get failed\n", __func__);
++		return -ENODEV;
++	}
+ 
++	if (priv->pil_h && !IS_ERR(priv->pil_h)) {
++		dev_info(&pdev->dev, "%s: ADSP already loaded\n", __func__);
++		return 0;
++	}
+ 
++	if (adsp_state == APR_SUBSYS_DOWN) {
+ 		priv->pil_h = subsystem_get("adsp");
+ 		if (IS_ERR(priv->pil_h)) {
+-			dev_err(&pdev->dev, "%s: pil get failed,\n",
+-				__func__);
+-			goto fail;
++			rc = PTR_ERR(priv->pil_h);
++			dev_err(&pdev->dev,
++				"%s: pil get failed, rc=%d\n", __func__, rc);
++			priv->pil_h = NULL;
++			return rc;
+ 		}
+ 
+ 		/* Set the state of the ADSP in APR driver */
+@@ -96,13 +119,31 @@ static void adsp_loader_do(struct platform_device *pdev)
+ 		apr_set_q6_state(APR_SUBSYS_LOADED);
+ 	}
+ 
+-
+ 	dev_info(&pdev->dev, "%s: Q6/ADSP image is loaded\n", __func__);
+-	return;
+-fail:
++	return 0;
++}
++
++static void adsp_boot_work_fn(struct work_struct *work)
++{
++	int rc;
++
++	adsp_boot_tries++;
+ 
+-	dev_err(&pdev->dev, "%s: Q6/ADSP image loading failed\n", __func__);
+-	return;
++	rc = adsp_loader_do(adsp_private);
++	if (!rc) {
++		pr_info("adsp-loader: ADSP came up on attempt %d\n",
++			adsp_boot_tries);
++		return;
++	}
++
++	pr_err("adsp-loader: attempt %d/%d failed, rc=%d\n",
++		adsp_boot_tries, ADSP_BOOT_MAX_TRIES, rc);
++
++	if (adsp_boot_tries < ADSP_BOOT_MAX_TRIES)
++		schedule_delayed_work(&adsp_boot_work, ADSP_BOOT_RETRY_DELAY);
++	else
++		pr_err("adsp-loader: giving up after %d attempts\n",
++			adsp_boot_tries);
+ }
+ 
+ 
+@@ -112,11 +153,15 @@ static ssize_t adsp_boot_store(struct kobject *kobj,
+ 	size_t count)
+ {
+ 	int boot = 0;
++	int rc;
++
+ 	sscanf(buf, "%du", &boot);
+ 
++	pr_info("adsp-loader: userspace requested boot (cmd=%d)\n", boot);
++
+ 	if (boot == BOOT_CMD) {
+-		pr_debug("%s:going to call adsp_loader_do", __func__);
+-		adsp_loader_do(adsp_private);
++		rc = adsp_loader_do(adsp_private);
++		pr_info("adsp-loader: userspace boot done, rc=%d\n", rc);
+ 	}
+ 	return count;
+ }
+@@ -188,6 +233,8 @@ static int adsp_loader_remove(struct platform_device *pdev)
+ 	if (!priv)
+ 		return 0;
+ 
++	cancel_delayed_work_sync(&adsp_boot_work);
++
+ 	if (priv->pil_h) {
+ 		subsystem_put(priv->pil_h);
+ 		priv->pil_h = NULL;
+@@ -210,6 +257,12 @@ static int adsp_loader_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	INIT_DELAYED_WORK(&adsp_boot_work, adsp_boot_work_fn);
++	schedule_delayed_work(&adsp_boot_work, ADSP_BOOT_FIRST_DELAY);
++	dev_info(&pdev->dev,
++		 "will try to boot the ADSP from the kernel in %d s\n",
++		 ADSP_BOOT_FIRST_DELAY / HZ);
++
+ 	return 0;
+ }
+ 

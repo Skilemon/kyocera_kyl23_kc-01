@@ -3280,6 +3280,9 @@ on early-boot
 
 ### 26.4 下一次 dump 要看什么
 
+> **已被 27 节推翻。** 26.3 的 `early-boot` 修法在真机上无效，26.2 关于
+> `apr_register()` 等 1 秒的描述也是错的。结论以 27 节为准。
+
 `kcadsp.sh` 加了四行证据，写进 `/cache/kcadsp.log`：
 
 ```
@@ -3292,3 +3295,124 @@ pil-after / apr-open / cards+4s
 如果 `fw` 那行是 0 个文件，问题就在 modem 分区而不是内核；如果 `loading from`
 一直是 0 而 state 却是 ONLINE，那就是 subsystem 状态和 PIL 对不上，得回头看
 `adsp-loader` 的 `subsystem_get()` 返回值。
+
+## 27. 声音（二）：26 节的结论是错的，触发点搬进内核
+
+26 节给出的修法是"照抄原厂，在 `early-boot` 写一次 `/sys/kernel/boot_adsp/boot`"。
+fix66 就这么做了，设备刷完、dump 交上来，**没有用**。这一节把不对的地方逐条更正。
+
+### 27.1 先说这一版成立的结论
+
+25 节的 `list_add_tail` 补丁确实生效了：整份日志里 `Fatal signal 11` 和
+`USRFLT pc b6430380` 一条都没有，`audioserver` 不再是每五秒 SIGSEGV 一次，而是
+**自己退出**（`exited with status 0`）。所以链表那一层现在是通的，别再改它。
+
+### 27.2 但 audioserver 仍然每五秒退出一次，一直退到 217 秒
+
+```
+#0[   61.849] init: Service 'audioserver' (pid 493) exited with status 0
+#0[   61.851] init: Starting service 'audioserver'...
+#1[   62.339] APR: Wrong parameters
+#1[   62.339] adm_get_params: Failed to Get Params on port 16385
+#0[   62.436] msm_audio_ion_import: DMA Buf name=audio_acdb_client
+#3[   63.171] init: Service 'audioserver' (pid 3397) exited with status 0
+```
+
+同样的四行，33 次，间隔 5 秒，一直到日志末尾。**这就否掉了"时序差几百毫秒"的
+说法**：如果 ADSP 在 8.9 s 就上了线，60 s 之后重启的 audioserver 不可能还撞同一
+堵墙。它一次都没成功，说明 ADSP 到 217 s 仍然是 DOWN。
+
+### 27.3 26.2 那段的更正：`apr_register()` 对 QDSP6 不等 1 秒
+
+26 节写"`apr_register()` 对 `APR_DEST_QDSP6` 只在 `q6 state == DOWN` 时等 1 秒"。
+看 `apr_v2.c:57`：
+
+```c
+if (dest_id == APR_DEST_QDSP6) {
+        if (apr_get_q6_state() != APR_SUBSYS_LOADED) {
+                pr_err("%s: adsp not up\n", __func__);
+                return NULL;
+        }
+```
+
+等 1 秒（`apr_wait_for_device_up`）的是 MODEM 那条分支，QDSP6 是**立刻返回 NULL**。
+而 `adsp_loader_do()` 和 lpass 的 `SUBSYS_AFTER_POWERUP` 通知都会把 q6 置
+`LOADED`。所以 "APR 报错" 的充分条件是 "ADSP 没加载"，没有别的可能。
+
+另外 `adm_get_params()`（`q6adm.c:375`）不检查 `this_adm.apr` 就往下发，所以每次
+audioserver 起来都会先撞出一条 `APR: Wrong parameters` —— 它是**症状**，不是病因，
+别拿它当线索。
+
+### 27.4 `early-boot` 到底落在哪一拍
+
+这份日志把时间轴钉死了：
+
+```
+4.688s  fs_mgr 挂 /firmware（vfat modem 分区，adsp.mdt/adsp.b0* 在这里）
+4.7-5.9s post-fs-data：sysinit、kcbt.sh、kcfuse.sh、kcboot、kcfix、两次 rm
+5.946s  exec 5 退出（kcfix 结束）
+5.996s  kcssr / kcadsp 起  <- 这是 class core，即 boot 阶段，early-boot 紧挨其前
+6.137s  adsprpcd 起
+6.142s  audioserver 起
+```
+
+也就是说 `early-boot` 落在 5.99 s，和 audioserver 之间只有 **150 ms**，而
+`pil_boot()` 要等 `request_firmware()` 把镜像从用户态搬进来、再做认证，本身就要
+好几秒。**用户态没有哪个阶段来得及**，这是结构性的，不是调参数能解决的。
+
+顺带一提：`write` 是同步的，`pil_boot()` 会在 `request_firmware()` 里待到超时
+（默认 60 s），一旦真的慢起来，`early-boot` 之后的所有服务都得跟着等。fix67 把这条
+写操作从 rc 里删掉了。
+
+### 27.5 之前那些"证据"为什么不可信
+
+两件事叠在一起，让 26 节得出了错误结论：
+
+1. **`kcadsp.sh` 按序号轮询，没校验名字。** 它读的是 `subsys0/state`，而
+   `subsysN` 的编号取决于 PIL 各 desc 的注册顺序。日志里
+   `pil-q6v5-lpass` 在 0.967 s、`pil_pronto` 0.971 s、`pil_venus` 0.974 s 依次
+   probe，"subsys0 就是 adsp" 从来没有被验证过。于是脚本 1 秒就报
+   `adsp ONLINE after 1s`，而 `echo 1 > /sys/kernel/boot_adsp/boot` 是丢在子
+   shell 里跑的，成没成功根本没人看。
+2. **`/cache` 的日志 dump 不出来。** 这次 dump 的 `20_cache.img.part` 只有
+   21 MB（`20,000,192` 字节），而 `/cache` 是 480 MB 的 ext4（块 4096、
+   `117248` 块）。更糟的是根目录数据块在 `100631` 块 = 412 MB 处，连目录都读不
+   到 —— `debugfs` 直接报 `Can't read a block bitmap`。所以 `/cache/kcadsp.log`
+   和 `/cache/lc.txt` 无论如何都取不到。
+
+还有一条要记住：`21_log.img` 是裸分区，里面叠着三次开机的内核日志（`#23`、
+`#20`、`#22`），每次只剩两千多行时间戳 —— 有明显丢行。**"日志里没看到"不能当成
+"没发生"**，只能当成"没有证据"。这也是 fix67 要提高日志重复率、并把关键信息往
+内核日志里搬的原因。
+
+### 27.6 fix67 的两件事
+
+内核（`0003-adsp-loader-boot-from-kernel.patch`）：`adsp-loader` 驱动里挂一个
+delayed work，6 s 起、每 2 s 一次、最多 20 次，调 `subsystem_get("adsp")`，每次
+打一行带返回码的日志。ADSP 一起来就停。这样"没人触发"和"触发失败"在 dump 里一眼
+可分，而且不再依赖任何用户态阶段。
+
+用户态（`kcadsp.sh`）：从"驱动加载"改成"观察 + 取证"。
+
+* 按 `name == adsp` 找子系统，不再用 `subsys0`；
+* 观察 20 s，记录 ONLINE 的时刻；
+* 把 `dmesg` 里 `adsp-loader:` / `pil-` / `APR` 的行，以及 `/cache/lc.txt`
+  （KCLED 抓的 logcat）里 `audio|AudioFlinger|AudioPolicy|HAL|tapan` 的最后 20 行，
+  以 `<6>KCADSP` / `<6>KCLOG` 前缀写进 `/dev/kmsg` —— 只有内核日志会进
+  `21_log.img`，logcat 里的真正原因（audioserver 为什么 exit 0）以前从来没被带
+  出来过；
+* 全部输出放在一个后台子 shell 里，最多 32 行：`/dev/kmsg` 的写有可能卡在 console
+  上，卡住的是一个要退出的子进程，不是 init。
+
+### 27.7 下一次 dump 看三样
+
+```
+grep -a "adsp-loader:" 21_log.img        # 试了几次、每次返回码多少
+grep -a "KCADSP"       21_log.img        # 最后状态、卡在哪个子系统
+grep -a "KCLOG"        21_log.img        # audioserver 退出前 AudioFlinger 说了什么
+```
+
+`rc` 的含义：`-2`（`ENOENT`）= 固件没找到，去查 `/firmware/image` 里的
+`adsp.mdt`；`-5`/`-13`/`-22` = 拿到了但被拒（认证/参数），那就是 PIL + TZ 那一层；
+如果 20 次全失败而 `state` 一直是 `OFFLINE`，下一步是把 `pil_boot()` 里的
+`request_firmware_direct()` 返回值也打出来。

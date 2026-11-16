@@ -445,31 +445,31 @@ service kcssr /vendor/bin/kcssr.sh
 #
 #     write /sys/kernel/boot_adsp/boot 1
 #
-# This port only ever did it from the kcadsp service, which init starts at ~6 s
-# -- after audioserver, and after the audio HAL has already asked for an ASM
-# session and been handed a NULL APR handle ("APR: Wrong parameters", once per
-# audioserver start).  Do what stock does.  early-boot runs after mount_all, so
-# /firmware (the vfat modem partition the ADSP image lives on) is already there;
-# kcadsp stays behind as the retry for when PIL is not ready this early.
-on early-boot
-    write /sys/kernel/boot_adsp/boot 1
-
-# The ADSP does load (state=ONLINE), but only from here, and this runs a stage
-# too late for the audio stack; the early-boot write above is the real fix.
-# Keep this as the retry: the SLIMBUS controller is NGSLIM and drives the bus
-# through the ADSP, so no ADSP means no tapan codec, no sound card, no audio
-# calibration, no sensor daemon and no DSP camera post-processing.  kcadsp.sh
-# also leaves the firmware / PIL evidence for the next dump.
+# Copying that line here (fix66) changed nothing: on this port early-boot fires
+# at 5.99 s, because /firmware is only mounted at 4.7 s and post-fs-data eats
+# the second that follows, and init starts audioserver at 6.14 s.  There is no
+# init stage early enough to win that race, and the write itself blocks in
+# pil_boot()/request_firmware() for as long as the load takes, which stalls
+# everything queued behind early-boot.
+#
+# fix67 moves the trigger into the kernel: the adsp-loader driver retries
+# subsystem_get("adsp") from a delayed workqueue (first attempt at 6 s, then
+# every 2 s, 20 tries) and logs each attempt.  Nothing in init writes
+# /sys/kernel/boot_adsp/boot any more - one driver, one log line per attempt,
+# no stage to be too late for.
+#
+# kcadsp is now an observer: it records the ADSP state by name over the first
+# 20 s and mirrors the interesting dmesg lines into the kernel log, so the log
+# partition dump carries them (/cache does not survive the dump, which keeps
+# only the first 20 MB of that filesystem).
 service kcadsp /vendor/bin/kcadsp.sh
     class core
     user root
     group root system
     oneshot
 
-# The first attempt runs at 5 s, before audioserver, because the audio HAL
-# blocks in adev_open() until the sound card exists.  If the ADSP was not ready
-# that early, try again once the framework is up: a late boot is still better
-# than a phone without sound.
+# Second observation pass, after the framework is up: if the first one caught
+# the ADSP still OFFLINE, this one shows whether the retries ever succeeded.
 on property:sys.boot_completed=1
     start kcadsp
 
