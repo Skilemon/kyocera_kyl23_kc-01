@@ -470,20 +470,34 @@ service kcssr /vendor/bin/kcssr.sh
 #
 # The line itself is the first action of the post-fs-data section further down.
 
-# kcadsp is the retry and the witness.  The kernel retry in
-# kernel-patches/0003 only exists in a kernel that was actually flashed; this
-# script has to work on whatever kernel the device is running, so it keeps
-# asking for the boot itself (every 2 s, up to 20 s) and records every attempt
-# and the final state into /dev/kmsg -- the only sink that survives a dump,
-# because the log partition gets 20 MB of a 120 MB /cache.
+# kcadsp is the only thing on this device that runs as root without adb, so it
+# carries three jobs now.  In order:
+#
+#   1. ask for the ADSP again (every 2 s, up to 20 s) and record every attempt,
+#      for a kernel without patch 0003 -- subsystem_get() is refcounted, so this
+#      is safe next to the post-fs-data write;
+#   2. bring USB up itself.  The framework writes sys.usb.config and every value
+#      it can write has a stanza in init.qcom.rc, but if /data ever held a value
+#      with no stanza (e.g. "none") the gadget stays disabled forever and the
+#      phone looks like it is charging from a wall charger.  The script tries
+#      mtp,adb -> adb -> mtp directly through
+#      /sys/class/android_usb/android0 and records what each one did;
+#   3. leave a report and keep sampling for 30 minutes.
+#
+# The report goes to /data/media/0/kcaudio.txt (0644, so a file manager, MTP or
+# recovery can read it without root), to /data/local/tmp/kcaudio.txt, and as
+# KCRPT lines into /dev/kmsg.  A device with no adb and no root still has the
+# first channel -- and if even that is out of reach, the log partition dump
+# carries the KCRPT lines.
 service kcadsp /vendor/bin/kcadsp.sh
     class core
     user root
     group root system
     oneshot
 
-# Second observation pass, after the framework is up: if the first one caught
-# the ADSP still OFFLINE, this one shows whether the retries ever succeeded.
+# Started a second time once the framework is up: the copy from class core may
+# have arrived before /data was ready to take a file.  The script holds a pid
+# file, so the second start is a no-op when the first one is still sampling.
 on property:sys.boot_completed=1
     start kcadsp
 

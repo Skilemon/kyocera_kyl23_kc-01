@@ -3707,3 +3707,107 @@ audio 相关行，说明这台设备**还没有真正播过一次声音**。`aud
 * 放音时 `state: RUNNING`、`hw_ptr` 在动 → PCM 层通了；
 * 停在 `SETUP`/`PREPARED` 不动 → 卡在 DAI/AFE，看 `-- datapath --` 里最后一条 route；
 * `state: RUNNING` 但没声音 → 模拟域（codec 上电、spk/ear 通路、`msm8226_setup_hs_jack`）。
+
+## 31. 没有 root、没有 USB 的时候怎么取证
+
+用户的原话：脚本执行不了（没有 root），机器接到电脑上没有任何反应（没有新设备、没有 adb、
+没有 MTP），但 recovery 和 DL 模式能连。这一节回答两件事：USB 到底缺什么，以及在没有
+root、没有 adb 的情况下日志怎么出来。
+
+### 31.1 先把"脚本跑不了"这件事摆正
+
+`/vendor/bin/kcadsp.sh` 从来不需要用户执行。它是 init 的 service：
+
+```
+service kcadsp /vendor/bin/kcadsp.sh
+    class core
+    user root
+```
+
+init 以 **root** 起它，跟 `su` 没有关系。fix70 那份 dump 里的 `kcaudio.txt` 就是它自己
+生成的——取证一直在工作，缺的只是**把文件拿出来**的通道。所以这一版改的不是"怎么执行"，
+是"写到哪"。
+
+三个地方同时写：
+
+| 路径 | 谁能读 | 怎么拿 |
+|---|---|---|
+| `/data/media/0/kcaudio.txt` | 0644，任何 App / 文件管理器 | 内部存储里直接拷，MTP 通了也能拷 |
+| `/data/local/tmp/kcaudio.txt` | 0644 | recovery 挂 /data 后 `adb pull` |
+| `/dev/kmsg`（`KCRPT` 行） | 内核日志 | dump 20 MB 的 log 分区 |
+
+另外 `/cache/kcaudio.txt` 留一份（recovery 里 `cat /cache/kcaudio.txt` 也行）。
+
+### 31.2 USB 缺的不是驱动，是"没人去设 functions"
+
+把这条链路逐段核对过，**每一段都是完整的**：
+
+| 段 | 状态 | 证据 |
+|---|---|---|
+| gadget 控制器 | 在 | `msm_hsusb`、`ci13xxx_start hw_ep_max = 32`、`android_usb ready` |
+| adb function | 在 | `f_adb.c` 被 `android.c` 直接 `#include`，`adb_function_init` 在 vmlinux 里，节点 `/dev/android_adb` |
+| mtp function | 在 | `mtp_function_init`、`mtp_function_bind`、`ptp_function_init` 都在 vmlinux 里 |
+| adbd | 两种模式都认 | ramdisk 的 `/sbin/adbd` 里同时有 `/dev/android_adb` 和 `/dev/usb-ffs/adb/ep0` 两个字符串 |
+| init 的 stanza | 齐 | `init.qcom.rc` 里有 `mtp` / `mtp,adb` / `ptp` / `ptp,adb` / `mass_storage` 五组，VID/PID 是原厂的 0482:0a28 / 0a27 / 0a23 |
+| 属性 | **这里断的** | `default.prop` 里 `persist.sys.usb.config=mtp`，而 `/data/property` 里存的是上一次的开机值 |
+
+`init.usb.rc` 里唯一的入口是
+
+```
+on boot && property:persist.sys.usb.config=*
+    setprop sys.usb.config ${persist.sys.usb.config}
+```
+
+也就是：**开机时 `sys.usb.config` 的值完全由 `/data/property/persist.sys.usb.config` 决
+定**。它的值只要落在没有 stanza 的那几个上（`none`、`charging`、`rndis`、空），gadget
+就会一直被 `on init` 写的那次 `enable 0` 关着——枚举都没有，电脑那边自然"没有任何动静"，
+连"未知设备"都不会出现。recovery 能连，是因为 recovery 用的是原厂 recovery 内核 + 自己
+的 init，压根不读这个属性。
+
+`21_log.img` 里那一场 #23 是唯一有 USB 记录的开机，它是好的（5.558 `USB_STATE=CONNECTED`
+→ 5.662 `high-speed config #1` → 5.720 `CONFIGURED`），说明**硬件、gadget、host 全都
+正常**，坏的只是"这一场的属性值"。
+
+所以 fix72 不再依赖属性：脚本在 `sys.boot_completed=1` 之后直接写 sysfs，按
+`mtp,adb` → `adb` → `mtp` 顺序试，每次记录
+
+```
+  functions=mtp,adb FAILED: <内核给出的原因>
+  after 3s: enable=1 state=DISCONNECTED func=mtp,adb vid=0482 pid=0a27 adbdev=yes svc.adbd=running
+```
+
+* `functions=... FAILED` → function 注册失败，看内核那句话；
+* 三次之后 `state` 还是 `DISCONNECTED`、`adbdev=no` → gadget 没被 host 枚举（线只充电、
+  host 口是 hub 上的充电口、或者 VBUS 没检测到）；
+* `state=CONFIGURED` 而电脑仍看不到 → host 侧驱动/授权问题，这时 `adbdev=yes` 且
+  `svc.adbd=running`，设备上应该弹出"允许 USB 调试"。
+
+`state` 只有 `CONFIGURED` / `CONNECTED` / `DISCONNECTED` 三种，写进报告的 `usb:` 行。
+
+### 31.3 现在能抓住"放音那一刻"
+
+以前报告是开机时拍一张，`pcm` 段永远是 `closed`。现在脚本写完之后**继续采样 30 分钟**，
+每 2 秒比对一次：`adsp` 状态、`usb` 状态、`adbd`、audioserver 的 pid、以及每个
+`pcm*/sub*/status` 的 `state`。**只在变化时**记一行：
+
+```
+<6>KCEVT t=71.42 adsp=ONLINE usb=CONFIGURED adbd=running audio=1832 pcm= card0/pcm0p/sub0=RUNNING
+```
+
+同时追加到报告的 `===== events =====` 段。所以正确用法是：
+
+1. 开机，等 2 分钟（USB 的三次尝试和报告都在这之前完成）；
+2. 插上 USB，看电脑有没有反应（这本身就验证了 31.2 的三条判据）；
+3. **放一段声音**；
+4. 重启；
+5. 拿文件（三条通道任选）。
+
+重启是因为 `log` 分区只保存**已经结束**的会话；`/data/media/0/kcaudio.txt` 不需要重启，
+它每 2 秒就在更新。
+
+### 31.4 不要再做的事
+
+* 不要 `su`、不要 adb shell 里跑脚本——没有 root 也照样有报告，跑脚本反而会因为没有
+  root 失败；
+* 不要传 `/cache`：480 MB / 251 KB/s；
+* 不要指望 log 分区里的"当前场"：它要等这一场结束才落盘，dump 到的永远是上一场。
