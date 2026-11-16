@@ -246,6 +246,13 @@ A=$(adspdev)
     echo "pcm:   $(cat /proc/asound/pcm 2>/dev/null | head -n 10 | tr '\n' '|')"
     echo "slim:  $(ls /sys/bus/slimbus/devices 2>/dev/null | tr '\n' ',')"
     echo "audioserver start/exit: $(dmesg 2>/dev/null | grep -c "Starting service 'audioserver'") / $(dmesg 2>/dev/null | grep -c "audioserver') exited")"
+    # The audio HAL in /vendor/lib/hw is the KitKat prebuilt (byte-identical to
+    # the stock one), and it passes a 36-byte struct pcm_config.  libtinyalsa
+    # 13580 bytes is the KitKat build that expects those 36 bytes; 26420 bytes
+    # is the 7.1 build, which reads avail_min at offset 36 and silence_size at
+    # 32 -- i.e. past the end of the caller's struct -- and every pcm_open()
+    # then dies in SNDRV_PCM_IOCTL_SW_PARAMS with EINVAL.
+    echo "tinyalsa: $(wc -c </lib/libtinyalsa.so 2>/dev/null) bytes (13580 = matches this HAL, 26420 = 7.1 ABI, breaks every pcm_open)"
 
     sec pcm
     for p in /proc/asound/card*/pcm*p/sub*/status; do

@@ -3942,3 +3942,117 @@ fix73 换三件仪器：
 3. 打开音乐软件放 20 秒，暂停；
 4. 重启进 recovery，挂 /data，`adb pull /data/local/tmp/kcaudio.txt` 和
    `adb pull /data/local/tmp/kclogcat.txt`。
+
+## 34. 声音（六）：找到了。`libtinyalsa` 和音频 HAL 的 ABI 不是一代东西
+
+fix73 的 dump 先证明 §32 是对的：
+
+```
+usb:     enable=1 state=CONFIGURED func=mtp,adb vid=0482 pid=0a27 adbdev=yes svc.adbd=running
+serial:  '5bb64bcc' (ro.serialno='5bb64bcc')
+```
+
+`iSerial` 一写进去，`prop path` 一步就把 `state` 推到 `CONFIGURED`，电脑上 MTP 和 ADB 同时出现。
+USB 这条线结束。
+
+声音这边，这次终于抓到了放音那一刻的 logcat（`kclogcat` 连续落盘生效），而且它不是
+"没进 RUNNING"这种间接证据，是 HAL 自己喊出来的：
+
+```
+V/audio_hw_primary: enable_audio_route: apply mixer path: deep-buffer-playback
+V/audio_hw_primary: start_output_stream: Opening PCM device card_id(0) device_id(0)
+E/audio_hw_primary: start_output_stream: cannot set sw params: Invalid argument
+V/audio_hw_primary: stop_output_stream: enter: usecase(0: deep-buffer-playback)
+```
+
+整份 logcat 里这一组出现 **1445 次**。也就是说 `pcm_open()` 从来没成功过一次，
+播放器每试一次就被打回来一次；`pcm=...=OPEN` 那 4 秒就是"文件开出来了、参数没设成、
+立刻被关掉"，和 §33 里看到的 `OPEN → closed` 完全对上。**声音链路一层都没问题，
+是 HAL 打不开 PCM。**
+
+### 34.1 为什么 `SW_PARAMS` 会 EINVAL
+
+`cannot set sw params` 这句不是 HAL 打的，是 `libtinyalsa` 的 `oops()` 存进
+`pcm->error`，HAL 再用 `ALOGE("%s: %s", __func__, pcm_get_error(pcm))` 打出来，
+所以 tag 是 `audio_hw_primary`。也就是说失败点就在 `pcm_open()` 里那句：
+
+```c
+if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sparams))   /* pcm.c:972 */
+        oops(pcm, errno, "cannot set sw params");
+```
+
+内核侧（`sound/core/pcm_native.c`，3.4）能返回 `-EINVAL` 的只有三条，其中一条是：
+
+```c
+if (params->silence_size >= runtime->boundary) { if (params->silence_threshold != 0) return -EINVAL; }
+else { if (params->silence_size > params->silence_threshold) return -EINVAL; ... }
+```
+
+要触发它，只能是 `silence_size > 0` 而 `silence_threshold == 0`。而 HAL 的
+`pcm_config_deep_buffer` 里这两个字段都是 0。于是问题只能出在**字段错位**上。
+
+错位是真的，而且可以逐字节验证。我们的音频 HAL 是**原厂 KitKat 的预编译库**：
+
+```
+md5(/vendor/lib/hw/audio.primary.msm8226.so) == md5(原厂 system.img:/lib/hw/audio.primary.msm8226.so)
+    4946f586287223153760b4fe5dc57779   （118644 字节，同一个文件）
+导出符号 pcm_config_deep_buffer 的 size = 36 字节
+数据 = {channels 2, rate 48000, period_size 960, period_count 4, S16_LE,
+        start_threshold 240, stop_threshold INT_MAX, silence_threshold 0, avail_min 240}
+```
+
+36 字节 = 9 个字段，也就是 KitKat 的 `struct pcm_config`（**没有** `silence_size`）。
+而 `/lib/libtinyalsa.so` 是 7.1 编的（26420 字节），它的结构体是 10 个字段、40 字节：
+
+| 偏移 | KitKat（HAL 写的） | 7.1（libtinyalsa 读的） |
+|---|---|---|
+| 0..16 | channels/rate/period_size/period_count/format | 同 |
+| 20/24/28 | start_threshold/stop_threshold/silence_threshold | 同 |
+| **32** | **avail_min = 240** | **silence_size = 240** ← |
+| **36** | 越界（下一个全局变量的值 20324） | **avail_min = 20324** ← |
+
+反汇编两头都对得上：7.1 的 `pcm_open` 里 `ldr.w r0,[r9,#36]` 取 `avail_min`、
+`ldr r0,[r9,#32]` 取 `silence_size`；KitKat 的 `pcm_open` 里取 `avail_min` 用的是 `[r5,#32]`。
+
+于是内核看到的请求是 `silence_size=240, silence_threshold=0` → **EINVAL**，一次都过不去。
+即使侥幸过去，`avail_min=20324 > buffer_size=3840` 也会让 `pcm_write` 永远等不到空间。
+
+一句话：**system 里换了 7.1 的 libtinyalsa，而音频 HAL 一直是原厂 KitKat 的预编译库，
+两者的 `struct pcm_config` 差一个字段。** 这不是驱动问题，也不是 ADSP 问题；从换掉
+system 那天起，这个 ROM 就不可能放出声音。
+
+### 34.2 fix74：把 libtinyalsa 换回原厂那一版
+
+只换一个文件：`/lib/libtinyalsa.so` ← 原厂 `system.img:/lib/libtinyalsa.so`
+（13580 字节，md5 `503bb93ba2288146bf94b342f3f59ada`）。理由是这一版就是那批 HAL 的
+编译伙伴，字段语义、`xfer_align`、`pcm_prepare` 的有无全都对得上。
+
+替换前先核过依赖，这个 ROM 里只有四个东西碰 `pcm_*`/`mixer_*`，且**全是原厂预编译**：
+
+| 文件 | 需要的 tinyalsa 符号 | 原厂 lib 是否都有 |
+|---|---|---|
+| `/vendor/lib/hw/audio.primary.msm8226.so` | 21 个（`pcm_open/close/write/read/start/stop/mmap_*/get_htimestamp/...`） | 有（只差 `__aeabi_uidiv`，那是 libc 里的编译器助手） |
+| `/vendor/lib/hw/audio.usb.default.so` | `pcm_open/close/get_error/is_ready/mmap_write` | 有 |
+| `/vendor/lib/hw/audio_policy.msm8226.so`、`audio.a2dp.default.so` | 不用 pcm | — |
+| `/vendor/bin/audio_diag`、`/vendor/lib/libaudioUsbAlert.so` | 也全是原厂 | — |
+
+7.1 那一版多出来的导出（`pcm_prepare`、`pcm_params_*`、`pcm_get_poll_fd`、`pcm_mmap_avail`）
+在这个 ROM 里没有任何**非原厂**调用者，所以换掉不会连锁。反过来说，如果哪天真要接
+7.1 编的 HAL，就得把它连同 ABI 一起换，不能只换一半。
+
+`kcadsp.sh` 的报告里加了一行金丝雀：
+
+```
+tinyalsa: 13580 bytes (matches this HAL, 26420 = 7.1 ABI, breaks every pcm_open)
+```
+
+13580 说明这次的库进去了；再看到 26420 就是刷错了镜像。
+
+### 34.3 下一步怎么判
+
+刷 fix74 的 system（boot 照旧不动），开机放 20 秒，然后看 `kcaudio.txt.ev`：
+
+* 出现 `pcm=card0/pcm0p/sub0=RUNNING` → HAL 起来了，接下来只看喇叭有没有声；
+* 若 `RUNNING` 但没声，问题就落到 mixer/codec 这一段（`deep-buffer-playback` 的
+  `SLIM_0_RX`、`RX1/2/3 MIX`、`SPK` 增益），那时候再抓 `dumpsys media.audio_flinger`
+  里的 thread 和 `AudioMixer` 就够了 —— 报告里已经在放音瞬间拍了一份。
