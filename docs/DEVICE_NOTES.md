@@ -3417,14 +3417,18 @@ grep -a "KCLOG"        21_log.img        # audioserver 退出前 AudioFlinger �
 如果 20 次全失败而 `state` 一直是 `OFFLINE`，下一步是把 `pil_boot()` 里的
 `request_firmware_direct()` 返回值也打出来。
 
-## 28. 声音（三）：fix67 的内核根本没刷进去；而 ADSP 一起来声音就没问题
+## 28. 声音（三）：ADSP 一起来，音频栈就是好的
 
-fix67 把触发搬进了内核、把 `kcadsp` 改成观察者。这份 dump 说明两件事：
-**那版内核不在设备上**，而**只要 ADSP 在 audioserver 之前起来，音频栈就是好的**。
+> **本节 28.1 与 28.6 已被 29 节推翻，保留原文只作记录。** 那两句"boot 分区没写进去"
+> 建立在"低偏移 = 最新"的假设上，而这个日志分区是整块复用的三槽 DBGC 环，还会丢行，
+> 物理顺序和时间顺序无关；设备实际跑的就是 `#24`。真正成立的只有下面这句：
+> **只要 ADSP 在 audioserver 之前起来，音频栈就完全正常**（s1 那段 160 s）。
 
-### 28.1 三次开机，没有一次是 #24
+### 28.1 三次开机，没有一次是 #24（结论已撤回）
 
-`21_log.img` 里三个 `Linux version`（新的在前，环形缓冲回卷后低偏移是最新的）：
+`21_log.img` 里三个 `Linux version`，当时按"环形缓冲回卷后低偏移是最新的"排的序 ——
+这个假设是错的，见 29 节。表格本身（每段的 uptime、`pil_boot`、audioserver 退出次数）
+是从分区里逐行数出来的，仍然有效：
 
 | 段 | 内核 | 构建机 | 最长 uptime | pil_boot | audioserver 退出 | adsprpcd |
 |---|---|---|---|---|---|---|
@@ -3432,9 +3436,10 @@ fix67 把触发搬进了内核、把 `kcadsp` 改成观察者。这份 dump 说�
 | s1 | `#23 Mon Nov 16 13:40:03` | `root@8ded1cdd5b47` | 160 s | **有** | **0 次** | 常驻 |
 | s2 | `#22 Mon Nov 16 00:15:43` | `root@ad17b0cbe76d` | 639 s | 无 | 30 次 | 255 |
 
-`boot-fix67.img` 里确实是 `#24 … 18:26:20`（解 gzip 验过），但设备上三个 session 一个
-`#24` 都没有。**boot 分区没写进去**，所以 `0003` 那个内核重试一次也没跑过——s0 里连
-`adsp-loader:` 这一行都不存在，`loading from` 也没有。
+`boot-fix67.img` 里确实是 `#24 … 18:26:20`（解 gzip 验过），设备上跑着的也是 `#24`。
+~~所以 boot 分区没写进去~~ —— **这句撤回**：这个分区里根本没有当前这次开机的记录，
+"没看到"不等于"没发生"，见 29 节。真正的事实只有一条：这三段里没有 `0003` 的
+`adsp-loader:` 行，所以那三段（#22/#23）确实一个都没跑到内核重试。
 
 > 这台机器的 boot/recovery 有 eMMC 卡级写保护（`docs/FLASHING.md`），`dd` 会报成功但
 > 数据全丢；`kc_wp.ko` 只在本机 Android 启动后清，所以在 TWRP/电脑侧写完必须回头确认。
@@ -3492,15 +3497,15 @@ fix67 把触发搬进了内核、把 `kcadsp` 改成观察者。这份 dump 说�
    下次 dump 第一眼看这一行——如果 `kernel=` 不是 `#25`，说明 boot 又没刷进去，
    后面所有现象都别按 fix68 的前提解释。
 
-### 28.6 刷完先确认这两行
+### 28.6 刷完先确认这两行（第二行已作废，见 29 节）
 
 ```
 adb shell cat /proc/version            # 必须是 #25 SMP PREEMPT ... 19:12:22
-grep -a "KCADSP start" 21_log.img      # kernel=#25 expect=#25
+grep -a "KCADSP start" 21_log.img      # 作废：日志分区不含当前这次开机
 ```
 
-boot 没写进去的表现是：`/proc/version` 还是 `#23`，dump 里没有 `adsp-loader:` 行，
-`KCADSP start` 那行 `kernel=#23`。这种情况下先按 `docs/FLASHING.md` 清写保护再写，
+boot 没写进去的判据只能是 `/proc/version` 和 `/data/local/tmp/kcaudio.txt` 的第一行，
+**不能再用日志分区**。如果确实是旧内核，按 `docs/FLASHING.md` 清写保护再写，
 **中间不要重启**。清的时候给**名字**，不要给 `pN`：
 
 ```bash
@@ -3524,3 +3529,84 @@ echo "autofix boot" > /sys/kernel/kc_wp/run     # boot 是 mmcblk0p9；p11 是 t
 （`recovery boot system`），`wpcheck.sh` 的 `$BOOT` 改成 `mmcblk0p9` 并注明原因。
 
 > 以后任何"刷了没生效"的排查，第一件事都是对 partition 名字而不是编号。
+
+## 29. 日志分区到底是什么：一个会丢行的三槽 DBGC 环，不能用来判断"刷没刷进去"
+
+28 节说"三次开机没有一次是 #24，所以 boot 分区没写进去"。**这个结论是错的，撤回。**
+错在把"`21_log.img` 里没有"当成了"设备上没发生"，而那份分区连当前这一次开机都没装进去。
+下面是把 20 MiB 按结构拆开之后的实情。
+
+### 29.1 结构
+
+```
+0000  "v2.0.0\0"  u32=3(记录数)  01 01 01 01
+0010  "UNKNOWN"                   <- 复位原因字段
+0020  "PWR KEY"
+00b0  "MPSS.DI.2.0.1.c9-00059-M8926DAAAANAZM-1.66647.1"
+0110  记录1 描述符：len=140720, ...
+03d0  记录2 描述符：len=110611
+0530  记录3 描述符：len=127461
+0800  "DBGC" + len + len + 会话文本      <- 记录1
+655c00 "DBGC" ...                        <- 记录2
+980600 "DBGC" ...                        <- 记录3
+```
+
+三个槽的 `len` 与描述符逐字节对得上，会话文本各自带着自己的
+`Linux version 3.4.0 (root@...)`：#23 / #23 / #22。分区里 `#24`、`18:26`
+出现 **0 次**，这一点没错；错的是从这里推出去的那一步。
+
+### 29.2 三件事让"物理顺序 = 时间顺序"不成立
+
+1. **槽是整块复用的。** 槽 3（`0x980600` 起）里叠着三次会话的尾巴：256 s、
+   606 s、639 s 各一次 `Restarting system`。整个分区有 **6 次重启边界**，却只有
+   **3 条 `Linux version`**。所以"偏移小 = 新"、"偏移大 = 新"都不成立。
+2. **写入者会丢行。** 整个 20 MiB 只留下 6616 条带时间戳的行，一次 640 s 的开机
+   正常会有几万行。`Linux version` 这一行本身也会被丢掉——这就是"没有 #24"
+   最可能的解释，而不是"没刷进去"。
+3. **中间不是文本。** 记录之间那几 MB 是二进制噪声（可打印率 0.32，zlib/gzip 都
+   解不开），不是"被截断的会话"。我之前把它当成会话，是误读。
+
+结论：这个分区**只能用来做旁证**（"某次开机里 APR 长什么样"），不能用来判定
+"当前跑的是哪版内核"。要判定，只能问正在跑的系统本身。
+
+### 29.3 `/cache` 也不要再要了
+
+`/cache` 是 480 MB 的 ext4，串口 251 KB/s 意味着整分区要半小时；而上一次那份
+"前 21 MB" 连根目录数据块（块 100631 = 412 MB 处）都不包含，`debugfs` 直接拒绝。
+以后任何"把 cache 给我"的要求都是错的，改为让设备自己吐一个小文件。
+
+### 29.4 现在的取证通道：一个几十 KB 的文本
+
+`/vendor/bin/kcadsp.sh` 改成把整份报告写进
+
+```
+/data/local/tmp/kcaudio.txt      （同时复制一份 /cache/kcaudio.txt）
+```
+
+内容包括：`/proc/version`、`/proc/cmdline`、所有 `msm_subsys` 的 name/state、
+最多 10 次 `boot_adsp` 写入的 rc、`adsp-loader:` / `pil-` / `apr` / `audio` 的
+dmesg 尾部、`/proc/asound/cards`、slimbus、audioserver 启动/退出次数、logcat 里
+audio 相关 40 行、`/cache/lc.txt` 尾部 40 行，以及日志分区的头部（`v2.0.0` 与
+记录数，用来判断这个环有没有在跟着本次开机走）。
+
+**同一个脚本可以手动跑**，不需要刷机——这一条最重要，因为现在的设备上是 #24，
+而 #24 里就有 `0003` 的内核重试，它到底跑没跑、返回码多少，`dmesg` 里就有：
+
+```
+adb push kc_audio.sh /data/local/tmp/
+adb shell su -c 'sh /data/local/tmp/kc_audio.sh'
+adb shell cat /data/local/tmp/kcaudio.txt
+```
+
+没有 adb 就把它拷进设备用终端跑，或者直接看 `/data/local/tmp/kcaudio.txt` 前 40 行
+（`version:` 那行就是真正在跑的内核）。
+
+### 29.5 判定顺序（以后固定这么走）
+
+1. `version:` 行 —— 设备实际内核，一切结论的前提；
+2. `final: state=… asks=…` —— 写了几次、最后 ONLINE 没有；
+3. `-- pil --` / `-- apr --` —— 加载到哪一步、`Q6 Is Up` 有没有；
+4. `cards:` —— 声卡在不在（`msm8226-tapan-snd-card`）；
+5. `audioserver start/exit` —— 次数是否还在涨。
+
+前两项就能把"没触发 / 触发被拒 / 起来了但音频栈没接上"三种情况分开，不用再猜。
