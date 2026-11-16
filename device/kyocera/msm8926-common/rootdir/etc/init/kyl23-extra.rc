@@ -492,11 +492,10 @@ service kcssr /vendor/bin/kcssr.sh
 #      is live -- fix72 opened and closed the output in 3.4 s and a 2 s sampler
 #      could only say "we did not see RUNNING".
 #
-# The report goes to /data/media/0/kcaudio.txt (0644, so a file manager, MTP or
-# recovery can read it without root), to /data/local/tmp/kcaudio.txt, and as
-# KCRPT lines into /dev/kmsg.  A device with no adb and no root still has the
-# first channel -- and if even that is out of reach, the log partition dump
-# carries the KCRPT lines.
+# The report goes to /data/local/tmp/kcaudio.txt (0644) and as KCRPT lines into
+# /dev/kmsg.  fix77 dropped the /data/media/0 and /cache copies: the media copy
+# only existed so that a file manager or MTP could read it, and what it actually
+# did was put a second identical file in every dump handed over for inspection.
 service kcadsp /vendor/bin/kcadsp.sh
     seclabel u:r:init:s0
     class core
@@ -535,6 +534,9 @@ service kclogcat /system/bin/logcat -b main,system,crash,radio -v threadtime -f 
 
 on property:sys.boot_completed=1
     start kclogcat
+    # fix77: the key backlight daemon used to start in class core and light the
+    # keys at ~7.9 s, i.e. during the boot animation.  See the note above it.
+    start kcbtnled
 
 # Bluetooth package state: clear the flag before PackageManager reads it.
 #
@@ -653,11 +655,25 @@ service p2p_supplicant /system/bin/wpa_supplicant \
 # physical offset of each of its log files with FIEMAP, so "the log is missing"
 # can never again be confused with "the log was written past the dump window".
 # ---------------------------------------------------------------------------
+# The fix76 dump settled the flash question.  kcledguard caught exactly one
+# transition in the boot window:
+#
+#     caught v=5 t=7.89 cam= btn=494
+#
+# i.e. 7.89 s, brightness 5, and pidof kcbtnled returned 494 -- the writer was
+# this daemon's own start-up light (it fades 0 -> 255 and holds for its 5 s
+# timeout), not the camera, not a DT line, and not the framework (its lights
+# HAL is dead, see below).  Started from class core it therefore lit the keys
+# in the middle of the boot animation, which is the "flashes twice".
+#
+# fix77 starts it once the framework is up instead.  Nothing needs the keys lit
+# before that, and kcledguard keeps the node at 0 until boot_completed anyway.
 service kcbtnled /vendor/bin/kcbtnled
     seclabel u:r:init:s0
     class core
     user root
     group root system input
+    disabled
 
 # ---------------------------------------------------------------------------
 # Hold the button backlight at 0 across the boot animation, and record what

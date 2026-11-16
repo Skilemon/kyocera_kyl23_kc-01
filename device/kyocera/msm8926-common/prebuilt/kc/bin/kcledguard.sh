@@ -54,6 +54,12 @@ say "start t=$(now) v=$prev"
 # 45 s at 20 ms (the boot animation window), then 200 ms until four minutes.
 # Two loops rather than one with a variable sleep: this shell has no
 # sub-second arithmetic worth trusting.
+#
+# fix77: kcbtnled no longer starts in class core (that was the flash -- the
+# fix76 dump caught v=5 at 7.89 s with pidof kcbtnled = 494), so this no longer
+# has to fight it for the whole boot.  Instead it yields the moment the
+# framework is up: after boot_completed the keys belong to kcbtnled, and
+# holding the node at 0 past that would just look like broken key backlight.
 n=0
 i=0
 while [ "$i" -lt 2250 ]; do
@@ -65,6 +71,25 @@ while [ "$i" -lt 2250 ]; do
         prev=0
     fi
     i=$((i + 1))
+    if [ $((i % 50)) -eq 0 ] && [ "$(getprop sys.boot_completed 2>/dev/null)" = 1 ]; then
+        # kcbtnled starts on this same property and fades the keys up for its
+        # 5 s timeout as part of its own start-up.  Hold six more seconds so
+        # that light is not visible either, then hand the node over.
+        say "boot_completed t=$(now), holding 6 s for kcbtnled start"
+        j=0
+        while [ "$j" -lt 300 ]; do
+            v=$(cat "$B" 2>/dev/null)
+            if [ -n "$v" ] && [ "$v" != "0" ]; then
+                n=$((n + 1))
+                [ "$n" -le 20 ] && say "caught v=$v t=$(now) (post-boot)"
+                echo 0 >"$B" 2>/dev/null
+            fi
+            j=$((j + 1))
+            sleep 0.02
+        done
+        say "releasing t=$(now) corrected=$n"
+        exit 0
+    fi
     sleep 0.02
 done
 

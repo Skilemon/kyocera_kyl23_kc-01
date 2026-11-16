@@ -13,13 +13,17 @@
 #   4. when playback finally starts, take one deep snapshot of AudioFlinger
 #      while the stream is live -- that is the only moment it is true.
 #
-# Where the report goes -- all three, because only one of them may be reachable:
+# Where the report goes -- one file, and only one:
 #
-#   /data/media/0/kcaudio.txt     internal storage, 0644: file manager, MTP,
-#                                 recovery, anything can read it
-#   /data/local/tmp/kcaudio.txt   0644, the old path, still fine
+#   /data/local/tmp/kcaudio.txt   0644, root-owned
 #   /dev/kmsg                     as KCRPT, so a dump of the 20 MB log
 #                                 partition carries it too
+#
+# It used to be written to /data/media/0 as well (and a copy in /cache).  That
+# put a second identical file in the zip handed over after every run and made
+# it ambiguous which one was current, so the media and cache copies are gone
+# as of fix77.  /data/local/tmp is a tmpfs: nothing to clean up, and it is
+# gone on reboot, which is the point -- one run, one file.
 #
 # Why the log partition alone is not enough: it is a v2.0.0 "DBGC" store with
 # three reused slots that drops lines (a 640 s session leaves ~1100 of tens of
@@ -50,10 +54,7 @@
 #   After that the three compositions below are the ones the stock rc had, and
 #   the property path (init.qcom.rc stanzas) works again too.
 
-R1=/data/media/0/kcaudio.txt
-[ -d /data/media/0 ] || R1=/data/local/tmp/kcaudio.txt
-R2=/data/local/tmp/kcaudio.txt
-R3=/cache/kcaudio.txt
+R1=/data/local/tmp/kcaudio.txt
 T=/data/local/tmp/.kcaudio.$$.tmp
 U=/dev/.kcusb.$$.tmp
 UB=/dev/.kcusb.body
@@ -252,22 +253,26 @@ A=$(adspdev)
     # is the 7.1 build, which reads avail_min at offset 36 and silence_size at
     # 32 -- i.e. past the end of the caller's struct -- and every pcm_open()
     # then dies in SNDRV_PCM_IOCTL_SW_PARAMS with EINVAL.
-    tl=
+    tlfile=
     for f in /system/lib/libtinyalsa.so /lib/libtinyalsa.so; do
-        [ -r "$f" ] && tl=$(wc -c <"$f" 2>/dev/null) && break
+        [ -r "$f" ] && tlfile=$f && break
     done
-    echo "tinyalsa: ${tl:-?} bytes (13580 = matches this HAL, 26420 = 7.1 ABI, breaks every pcm_open)"
+    echo "tinyalsa: ${tlfile:-missing} $(wc -c <"$tlfile" 2>/dev/null) bytes"
+    echo "          $(grep -m1 -ao 'kc-tinyalsa7[^\"]*' "$tlfile" 2>/dev/null || echo 'no kc-tinyalsa7 tag -- still the stock 7.1 or KitKat build')"
 
     sec sensors
-    # The kernel half of this is not in doubt: sfh7776 probes at 1.87 s and
-    # registers input6 "light" and input7 "proximity" (the dmesg lines are in
-    # the earlier "input:" listing).  What is in doubt is the bridge to the
-    # framework.  /vendor/lib/hw/sensors.default.so is the factory KitKat
-    # build, and KitKat's struct sensor_t is 36 bytes while 7.1's SensorService
-    # walks the array in 68-byte strides -- the same cross-era ABI that broke
-    # libtinyalsa (section 34) and MonoPipe (36.1).  This section records the
-    # sizes and whatever SensorService is willing to say about its own list.
-    echo "hal:    $(wc -c </vendor/lib/hw/sensors.default.so 2>/dev/null) bytes (factory 38192 = 36-byte sensor_t, 7.1 reads 68)"
+    # fix76's dump retired the 36-vs-68-byte sensor_t theory: SensorService
+    # printed all eight sensors with the right names, vendors and handles, so
+    # the HAL's array is stepped correctly.  What it also printed was
+    #
+    #     Recent Sensor events:            <- nothing, ever
+    #     Active sensors: SFH7776 Proximity Sensor (connections=1)
+    #
+    # and the sysfs enable nodes were still 0.  So the framework asked for the
+    # proximity sensor and the HAL either never wrote enable, or wrote it and
+    # got nothing back.  This section now settles that by hand: write the node
+    # itself, read the event device, write it back.
+    echo "hal:    $(wc -c </vendor/lib/hw/sensors.default.so 2>/dev/null) bytes"
     for d in /sys/class/input/input*; do
         [ -r "$d/name" ] || continue
         n=$(cat "$d/name" 2>/dev/null)
@@ -281,13 +286,46 @@ A=$(adspdev)
             *) echo "$d name=$n" ;;
         esac
     done
+
+    # Direct proof, one sensor at a time: does the driver emit an event when
+    # the enable node is written by hand?  If yes the kernel and the part are
+    # fine and the fault is above (HAL or SensorService); if no, it is below
+    # and no amount of HAL surgery will help.
+    sensprobe() {
+        id=$1      # input6
+        node=$2    # enable_als_sensor
+        d=/sys/class/input/$id
+        ev=
+        for e in "$d"/event*; do [ -e "$e" ] && ev=/dev/input/$(basename "$e"); done
+        [ -e "$d/$node" ] || { echo "  $id: no $node"; return; }
+        echo "  $id $node: before=$(cat "$d/$node" 2>/dev/null) event=${ev:-none}"
+        echo 1 >"$d/$node" 2>/dev/null
+        sleep 1
+        echo "  $id $node: after=$(cat "$d/$node" 2>/dev/null)"
+        if [ -n "$ev" ] && [ -r "$ev" ]; then
+            echo "  $id events (16-byte input_event, raw):"
+            timeout 2 dd if="$ev" bs=16 count=3 2>/dev/null | od -An -tu4 -w16 | head -n 4
+        fi
+        echo 0 >"$d/$node" 2>/dev/null
+    }
+    echo "-- direct probe --"
+    sensprobe input6 enable_als_sensor
+    sensprobe input7 enable_ps_sensor
+
     echo "-- sensorservice --"
-    timeout 5 dumpsys sensorservice 2>/dev/null | head -n 30
+    timeout 8 dumpsys sensorservice 2>/dev/null | head -n 60
 
     sec mic
     echo "capture: $(ls /proc/asound/card*/pcm*c/sub*/status 2>/dev/null | tr '\n' ' ')"
-    echo "-- audio policy --"
-    timeout 5 dumpsys media.audio_policy 2>/dev/null | grep -Ei 'input|Input' | head -n 25
+    echo "-- audio policy (full, first 110 lines) --"
+    # fix76 grepped this for "input" and got three lines, because 7.1 dumps the
+    # whole AudioPolicyConfig as XML and the interesting part -- which input
+    # profile was parsed, with which masks -- is not on a line containing the
+    # word "input".  Dump it whole; it is the only place the parsed profile is
+    # visible without a debugger.
+    timeout 10 dumpsys media.audio_policy 2>/dev/null | head -n 110
+    echo "-- input devices as APM sees them --"
+    timeout 5 dumpsys media.audio_policy 2>/dev/null | grep -Ei 'unreachable|input|Input' | head -n 30
     echo "-- record attempts --"
     grep -Ei 'AudioRecord|open_input|start_input|getInputForAttr|cannot open input|AUDIO_DEVICE_IN' "$LC" 2>/dev/null | tail -n 12
 
@@ -349,9 +387,6 @@ writereport() {
         fi
     } >"$R1" 2>/dev/null
     chmod 0644 "$R1" 2>/dev/null
-    chown media_rw media_rw "$R1" 2>/dev/null
-    cp -f "$R1" "$R2" 2>/dev/null && chmod 0644 "$R2" 2>/dev/null
-    [ -d /cache ] && cp -f "$R1" "$R3" 2>/dev/null && chmod 0644 "$R3" 2>/dev/null
 }
 
 writereport
@@ -423,8 +458,6 @@ audiosnap() {
         dmesg 2>/dev/null | tail -n 60
     } >>"$R1" 2>&1
     chmod 0644 "$R1" 2>/dev/null
-    cp -f "$R1" "$R2" 2>/dev/null && chmod 0644 "$R2" 2>/dev/null
-    cp -f "$R1" "$R3" 2>/dev/null && chmod 0644 "$R3" 2>/dev/null
     kmsg "KCSNAP t=$(up) pcm=$(snap | sed 's/.*pcm=//') full copy at $R1"
 }
 
@@ -466,8 +499,6 @@ done
 
 # one last snapshot, so the file ends with where things settled
 snap | sed "s/^/final@$(up) /" >>"$R1" 2>/dev/null
-cp -f "$R1" "$R2" 2>/dev/null && chmod 0644 "$R2" 2>/dev/null
-cp -f "$R1" "$R3" 2>/dev/null && chmod 0644 "$R3" 2>/dev/null
 kmsg "sampling done up=$(up), report at $R1"
 rm -f "$T" "$U" "$PIDF" 2>/dev/null
 exit 0

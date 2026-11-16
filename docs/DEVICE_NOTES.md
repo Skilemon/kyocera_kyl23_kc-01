@@ -4446,3 +4446,296 @@ mpdecision netmgrd qcamerasvr qmuxd qseecomd rfs_access rmt_storage time_daemon 
   按键与屏幕亮度、guard 日志）；
 * 上一轮那行金丝雀的路径已修（`/system/lib/libtinyalsa.so` 优先），这份 dump 里
   已经打出 `tinyalsa: 13580 bytes`。
+
+## 38. fix76 验收，以及把跨代的那一层库换成自己写的
+
+### 38.1 声音是真的通了，USB 也稳
+
+fix76 的 `kcaudio.txt.ev` 只有七行，但七行全是要的：
+
+```
+105.18 | adsp=ONLINE usb=CONFIGURED adbd=running audio=524 pcm=card0/pcm0p/sub0=RUNNING
+114.40 | ... pcm=none
+131.13 | ... pcm=card0/pcm0p/sub0=SETUP
+135.19 | ... pcm=none
+142.00 | ... pcm=card0/pcm0p/sub0=RUNNING
+151.58 | ... pcm=none
+192.34 | ... pcm=card0/pcm0p/sub0=RUNNING
+```
+
+三段独立播放，每段都进了 `RUNNING`，两次自然收尾回 `none`（用户暂停），第三段还在放。
+`hw_params` = 48000/S16_LE/2ch/period 960/buffer 3840，`cannot set sw params`
+在整个 dump 里 0 次 —— §34 那个 36/40 字节 `pcm_config` 的账结清了。
+
+USB 这一段也干净：`serial: '5bb64bcc' (ro.serialno='5bb64bcc')`、`usb: enable=1
+state=CONFIGURED func=adb`、`svc.adbd=running`，脚本走的是"already CONFIGURED,
+leaving it alone"分支，一次都没重配。
+
+### 38.2 撤回 §37.4：KitKat 的 `sensor_t` 也是 68 字节
+
+§37.4 说 KitKat 的 `struct sensor_t` 是 36 字节、7.1 按 68 字节步进会读错，并拿
+"列表里有 8 个传感器"当反证。这个推断是错的，dump 直接推翻了它：
+
+```
+HAL: Yamaha Sensors module (Yamaha Corporation), version 0000000000
+Total 8 h/w sensors, 8 running:
+0x00000001) BMA250/250E Acceleration Sensor | Bosch Sensortec | ...
+0x00000002) MS-3R (YAS532) Magnetic Sensor | Yamaha Corporation | ...
+0x00000005) SFH7776 Light Sensor | OSRAM Opt Semiconductors | ...
+0x00000008) SFH7776 Proximity Sensor | OSRAM Opt Semiconductors | ...
+```
+
+八个名字、厂商、handle、type 全对。原因很简单，是我数漏了字段：
+
+```c
+/* hardware/libhardware/include/hardware/sensors.h, KitKat */
+struct sensor_t {
+    const char* name;      /* +0  */
+    ...
+    int32_t minDelay;      /* +32 */
+    void* reserved[8];     /* +36 .. +68 */
+};
+```
+
+`sizeof(sensor_t)` 在 4.4 就是 **68**，7.1 只是把 `reserved[8]` 换成了具名字段，
+大小没变。所以传感器 HAL 的 ABI 是对的，`sensors.default.so`（38192 字节，与原厂
+逐字节相同）可以留着，不需要重写。
+
+那问题就剩下 dump 里的另外两行：
+
+```
+Recent Sensor events:                                        <- 一直是空
+Active sensors: SFH7776 Proximity Sensor (connections=1)
+```
+
+SensorService 认为距离传感器有一个连接，但一个事件都没收到，而 sysfs 里
+`enable_als_sensor=0`、`enable_ps_sensor=0` —— 框架要了，HAL 没写下去，或者写了
+没生效。这次不再猜：`kcadsp` 在抓报告时**自己写一次 enable 节点**，读 2 秒
+`/dev/input/eventN`，再写回 0（见 38.7）。事件出来 = 驱动和器件都好，问题在 HAL 以上；
+不出来 = 在 HAL 以下，换 HAL 也没用。
+
+另外记一笔：`nuSensorService starting...` 到 `nuSensorService thread starting...`
+用了 22.9 秒（10:29:33.494 → 10:29:56.363），期间 system_server 一直在
+`Waiting for service sensorservice`。这是开机慢的一大块，等传感器的事定位了一起看。
+
+### 38.3 麦克风：7.1 的 APM 在开机时就把三个输入设备判死了
+
+fix76 的 logcat 只有四行相关，但这四行已经把因果写全了：
+
+```
+V audio_hw_primary: adev_open_input_stream: enter      <- 两次，同一毫秒
+V audio_hw_primary: adev_open_input_stream: enter
+W APM_AudioPolicyManager: Cannot open input stream for device 80000004 on hw module primary
+W APM_AudioPolicyManager: Input device 80000004 unreachable
+W APM_AudioPolicyManager: Input device 80000080 unreachable
+W APM_AudioPolicyManager: Input device 80000040 unreachable
+```
+
+`80000004` BUILTIN_MIC、`80000080` BACK_MIC、`80000040` VOICE_CALL，正好是
+`attached_input_devices` 里那三个。7.1 的 `AudioPolicyManager` 在 `initialize()`
+阶段会为**每个 always-present 输入设备**建一个 input descriptor 并调
+`openInput()`，失败就把它从可用集合里永久删掉 —— 所以开机 0.5 秒内，
+这一整台手机的输入设备就全没了，之后任何 `AudioRecord` 都是 `-22`，与 App 无关。
+
+HAL 侧是静默拒绝：`check_input_parameters()` 只接受 PCM16、1~2 声道、标准采样率，
+不满足就 `return -EINVAL`，一行日志都不打。而 `audio_policy.conf` 的 input profile
+当时是原厂原文：
+
+```
+sampling_rates 8000|11025|12000|16000|22050|24000|32000|44100|48000
+channel_masks AUDIO_CHANNEL_IN_MONO|AUDIO_CHANNEL_IN_STEREO|AUDIO_CHANNEL_IN_FRONT_BACK|AUDIO_CHANNEL_IN_5POINT1
+formats AUDIO_FORMAT_PCM_16_BIT|AMR_NB|AMR_WB|QCELP|EVRC|EVRCB|EVRCNW
+```
+
+7.1 的 APM 不是"挑一个 HAL 能接受的"，它按 profile 组 config。压缩格式和
+5.1/front-back 这两组对一个 capture stream 本来就没意义（它们是给 voice_call
+用的），留着只会让 APM 组出一个 HAL 不收的 config。fix77 把这一段收窄到
+`PCM_16_BIT` + `MONO|STEREO` + 六个标准率，设备列表保留 BUILTIN_MIC / BACK_MIC /
+VOICE_CALL / WIRED_HEADSET / BT_SCO。
+
+这一条是**有依据的修正**，但还没被实测证实。所以 `kcadsp` 的 mic 段改成把
+`dumpsys media.audio_policy` **整段前 110 行**打出来（7.1 会把解析后的
+AudioPolicyConfig 序列化成 XML，input profile 在那里是可见的），而不是像 fix76
+那样 grep "input" —— 那样只能捞到三行标题。
+
+### 38.4 把 libtinyalsa 换成自己写的一份（这是这一轮的主菜）
+
+问题回到 §34：这台机器上 `libtinyalsa.so` 只有两个选择，选哪个都要另一边死。
+
+| | 字节 | `pcm_config` | 谁受不了 |
+|---|---|---|---|
+| KitKat 版 | 13580 | 36 字节，末字段 `avail_min` | 7.1 的 usb / r_submix HAL |
+| 7.1 版 | 26420 | 40 字节，`silence_size` + `avail_min` | 厂商 audio HAL（每个 `pcm_open` 都 EINVAL） |
+
+前八個字段两边完全一样，只有 offset 32 的含义变了。而 `silence_threshold` /
+`silence_size` 这两个字段**只影响 underrun 时补零**，Android 的 HAL 一个都不用；
+偏偏内核 `sound/core/pcm_native.c:541` 就是拿它们互相比较：
+
+```c
+if (params->silence_size >= runtime->boundary) {
+        if (params->silence_threshold != 0) return -EINVAL;
+} else {
+        if (params->silence_size > params->silence_threshold) return -EINVAL;
+        ...
+}
+```
+
+7.1 的库把 offset 32 当 `silence_size` 读，在 36 字节结构里那个位置是
+`avail_min`（deep-buffer 是 240），而 `silence_threshold`（offset 28）是 0，
+于是 `240 > 0`，EINVAL。fix74 之前那 1445 次 `cannot set sw params` 就是这么来的。
+
+所以 fix77 的 `prebuilt/kc/src/tinyalsa7.c` 是一份**从零写的、7.1 符号集完整**的
+实现：
+
+* 导出符号与 7.1 原版逐一对齐（57 个函数，7.1 那份 62 个里差的 5 个是 libgcc 的
+  `__aeabi_*` 除法辅助，bionic 自带）；
+* `pcm_config` **按字段读，永远不碰第 36 字节**：offset 0..31 两边一致，offset 32
+  在合理范围（>0 且 <= period_size*period_count）时当 `avail_min` 用，否则退回
+  `period_size`；
+* `silence_threshold` / `silence_size` **写死 0**，不下发内核 —— 这一对就是唯一
+  会随 ABI 变含义的字段，关掉它，36 和 40 字节就都一样了；
+* `pcm_open` 失败返回 **NULL**（不是半成品对象）：两个时代的 `pcm_is_ready()` 都
+  只是 `pcm != NULL`，KitKat HAL 那份还是头文件里的 inline，返回非 NULL 会被当成
+  成功，下一次 `pcm_write` 就写进一个 `fd = -1` 的句柄；
+* `hw_params` 流程照抄 7.1 原版（直接 `SNDRV_PCM_IOCTL_HW_PARAMS`，不预先
+  `HW_REFINE`），因为这条路径是 fix74 实测通过的，不引入新变量。
+
+编译方式也是这一轮的一部分，写在 `prebuilt/kc/src/build.sh` 里。关键点是
+`-nostdlib` + `-l:libc.so`：
+
+```
+$ arm-linux-gnueabi-gcc -shared -fPIC -O2 -fno-stack-protector -nostdlib \
+      -I$KERNEL/include -I$KERNEL/arch/arm/include \
+      -o libtinyalsa.so tinyalsa7.c \
+      -Wl,-soname,libtinyalsa.so -L stub -l:libc.so -lgcc
+$ readelf -d libtinyalsa.so | grep NEEDED
+ 0x00000001 (NEEDED)  Shared library: [libc.so]
+```
+
+如果按常规方式链 glibc，出来的 `.so` 会带 `DT_NEEDED libc.so.6` 和
+`open64` / `mmap64` / `__ioctl_time64` 三个 bionic 根本没有的符号，加载即
+`cannot locate symbol` —— §37.5 那个手搓的 lights HAL 就是这么死的。所以这里
+所有 libc 调用都自己声明（`open` / `ioctl` / `mmap` / `poll` / `calloc`），
+让它们保持 undefined，由 bionic 在加载时解析；`stub/libc.so` 只是给链接器一个
+符号来源，一行代码都不进镜像。
+
+`asound.h` 用的是 `/workspace/source/kernel` 里**这台机器真正跑的那棵 3.4 树**，
+不是主机的 ALSA 头 —— ioctl 号和 `snd_pcm_hw_params` 的掩码数组大小必须与设备一致。
+
+本地验证（x86 编译同一份源码跑单元测试，`/tmp/t7test`）：
+
+```
+36B: ch=2 rate=48000 per=960 cnt=4 fmt=0 start=240 stop=2147483647 sil_th=0 sil_sz=0 avail=240
+40B: sil_th=0 sil_sz=0 avail=960
+open on a host with no /dev/snd: p=(nil) ready=-1 err=-
+zero period: p=(nil) ready=-1 err=-
+```
+
+36 字节那份跑出来的 `avail_min` 是 240（正是 `pcm_config_deep_buffer` 里的值），
+`silence_*` 归零；失败路径返回 NULL 而不是野对象。
+
+### 38.5 lights HAL：按 7.1 重写，并且这次能加载
+
+fix76 的 `/vendor/lib/hw/lights.default.so` 是 6356 字节、`readelf -d` 里
+**没有 DT_NEEDED**，第一条 libc 调用就死了：
+
+```
+E HAL: dlopen failed: cannot locate symbol "write" referenced by
+       "/system/vendor/lib/hw/lights.default.so"
+```
+
+LightsService 起不来，屏幕亮度完全交给 bootloader 留下的值，通知灯也不亮。
+
+`prebuilt/kc/src/lights7.c` 是重写的一份，结构体按 7.1 的
+`hw_module_t` / `hw_device_t` / `light_device_t`（128 / 64 / 76 字节）摆，
+导出 `HAL_MODULE_INFO_SYM`，只调 `open` / `write` / `close`，并且**声明了
+`DT_NEEDED libc.so`**（同上，`-nostdlib -l:libc.so`）。映射：
+
+| light id | sysfs |
+|---|---|
+| `backlight` | `lcd-backlight/brightness` |
+| `buttons` / `keyboard` | `button-backlight/brightness` |
+| `battery` | `red/brightness` + `green/brightness` |
+| `notifications` / `attention` | `amber/brightness` |
+| `bluetooth` / `wifi` | 这块板子没有，返回 0 |
+
+`set_light` 取 ARGB 里最大的颜色分量当亮度（0..255），`flashMode == 2`（TIMED）
+视为点亮。屏幕亮度这条尤其要看实测：它同时是"lights HAL 活了没有"的判据 ——
+亮度滑条能拖、`/sys/class/leds/lcd-backlight/brightness` 跟着变，就是成了。
+
+### 38.6 开机动画前闪两下：是 kcbtnled 自己点的
+
+fix76 的 `kc_led.log` 只有两行，但够了：
+
+```
+start t=6.70 v=0
+caught v=5 t=7.89 cam= btn=494
+```
+
+`btn=494` 是那一刻 `pidof kcbtnled` 的返回值 —— **写者就是它**。`v=5` 是它
+0→255 淡入的第一步，`cam=` 为空说明相机进程根本没在跑。§36.4 那个"GPIO 34 与
+相机 `CAM_AF_PWDM` 冲突"的猜测早在 fix75 就撤回了（boot 里的 DTB 没有 gpio-leds
+节点，按键背光是 PMIC MPP2，`default-state` 就是 off）。
+
+所以修法不是跟它抢节点，而是**别在开机动画期间启动它**：fix77 把 `kcbtnled`
+从 `class core` 拿掉，改成 `on property:sys.boot_completed=1` 起。同时
+`kcledguard` 增加一个让位条件：第一阶段每 50 次采样（约 1 秒）看一眼
+`sys.boot_completed`，为 1 就记一行 `releasing at boot_completed` 退出，
+把节点交还给 kcbtnled —— 否则它会继续压 0 到四分钟，表现为"按键背光坏了"。
+
+### 38.7 报告通道：只留 `/data/local/tmp`
+
+`kcadsp` 以前同时写 `/data/media/0/kcaudio.txt`（0644，方便文件管理器/MTP 读）
+和 `/cache/kcaudio.txt`。实际效果是每次交上来的 zip 里有两份一模一样的
+`kcaudio.txt`，还要问哪份是这次的。fix77 起**只写 `/data/local/tmp/kcaudio.txt`**，
+另外照旧往 `/dev/kmsg` 打 40 行 `KCRPT`（log 分区那份 dump 能带出来）。
+`/data/local/tmp` 是 tmpfs，重启即清，一次运行一个文件。
+
+`kcadsp` 这一轮新增/改动的段：
+
+* `sensors`：新增 `-- direct probe --`，对 `input6/enable_als_sensor` 和
+  `input7/enable_ps_sensor` 各做一次"写 1 → 等 1 秒 → 读 `/dev/input/eventN`
+  3 个 `input_event`（16 字节，`od -tu4`）→ 写回 0"；`dumpsys sensorservice`
+  从 30 行加到 60 行；
+* `mic`：`dumpsys media.audio_policy` 打**整段前 110 行**（看解析后的 profile），
+  再补一遍 grep 版；
+* `audio`：`tinyalsa` 那行改成打印路径 + 字节数 + `grep -a` 出来的
+  `kc-tinyalsa7/fix77 ...` 标记串 —— 一份 dump 就能确认跑的是哪份库；
+* `led`：不变。
+
+### 38.8 fix77 到底改了什么
+
+镜像 `system-fix77.img.zip`（只刷 system，boot 仍是 fix72 那个与 fix70 逐字节
+相同的 #25 内核）：
+
+| 路径 | 从 | 到 |
+|---|---|---|
+| `/lib/libtinyalsa.so` | 13580，KitKat 版 | 21032，`kc-tinyalsa7/fix77` |
+| `/vendor/lib/hw/lights.default.so` | 6356，无 DT_NEEDED | 6388，7.1 结构 + libc.so |
+| `/etc/audio_policy.conf` | 原厂 input profile | 收窄到 PCM16/MONO/STEREO |
+| `/vendor/bin/kcadsp.sh` | fix76 | 38.7 那几段 |
+| `/vendor/bin/kcledguard.sh` | fix76 | boot_completed 让位 |
+| `/etc/init/kyl23-extra.rc` | fix76 | kcbtnled 延后到 boot_completed |
+
+**没有动的**：`audio.primary.msm8226.so`（厂商 KitKat 二进制，含 ACDB/DSP/tapan
+初始化，没有源码）、`sensors.default.so`（§38.2，ABI 本来就是对的）、boot 镜像。
+
+关于"audio HAL 也统一到 7.1"这件事，得说清楚边界：`audio.primary` 不是"一代库"，
+它是**厂商闭源 HAL**，7.1 没有对应物。能统一的、也是唯一真正造成故障的，是它
+脚下那一层库（`libtinyalsa`）以及与 7.1 框架的接口层（`audio_policy.conf`、
+`lights`/`sensors` HAL）。这两层现在都是 7.1 的了。真要重写 `audio.primary`，
+等价于从零实现一个 msm8226+tapan 的 audio HAL（mixer 路由、ACDB、voice call、
+compress offload），那是另一个量级的工程，而且是拿"已经出声"去换"血统纯正" ——
+不建议在传感器和相机还没收尾的时候做。
+
+### 38.9 这一轮要看的
+
+1. `===== led =====`：`lcd` 是不是能被亮度滑条改动（lights HAL 活了没有），
+   `-- kcledguard --` 里有没有 `releasing at boot_completed`，开机动画前还应
+   完全没有 `caught`；
+2. `===== sensors =====` 的 `-- direct probe --`：写 1 之后
+   `after=` 是不是 1、有没有事件行。有事件 = HAL 的问题；没事件 = 驱动/器件的问题；
+3. `===== mic =====` 的 `dumpsys media.audio_policy` 前 110 行：input profile
+   解析成了什么样，以及开机后还有没有 `unreachable`；
+4. `tinyalsa:` 那行是不是 `kc-tinyalsa7/fix77`，以及播放时 `pcm=` 能不能进
+   `RUNNING`（声音不能因为换库退回去，这是这一轮最大的风险）。
