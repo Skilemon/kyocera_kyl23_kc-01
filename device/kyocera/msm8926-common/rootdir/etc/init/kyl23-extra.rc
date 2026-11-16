@@ -441,10 +441,25 @@ service kcssr /vendor/bin/kcssr.sh
     group root system
     oneshot
 
-# The ADSP never loads on this port, and nothing that needs audio works without
-# it: the SLIMBUS controller is NGSLIM (it drives the bus through the ADSP), so
-# no ADSP means no tapan codec, no sound card, no audio calibration, no sensor
-# daemon and no DSP camera post-processing.  See kcadsp.sh.
+# Stock boots the ADSP from init.qcom.rc, one line, on early-boot:
+#
+#     write /sys/kernel/boot_adsp/boot 1
+#
+# This port only ever did it from the kcadsp service, which init starts at ~6 s
+# -- after audioserver, and after the audio HAL has already asked for an ASM
+# session and been handed a NULL APR handle ("APR: Wrong parameters", once per
+# audioserver start).  Do what stock does.  early-boot runs after mount_all, so
+# /firmware (the vfat modem partition the ADSP image lives on) is already there;
+# kcadsp stays behind as the retry for when PIL is not ready this early.
+on early-boot
+    write /sys/kernel/boot_adsp/boot 1
+
+# The ADSP does load (state=ONLINE), but only from here, and this runs a stage
+# too late for the audio stack; the early-boot write above is the real fix.
+# Keep this as the retry: the SLIMBUS controller is NGSLIM and drives the bus
+# through the ADSP, so no ADSP means no tapan codec, no sound card, no audio
+# calibration, no sensor daemon and no DSP camera post-processing.  kcadsp.sh
+# also leaves the firmware / PIL evidence for the next dump.
 service kcadsp /vendor/bin/kcadsp.sh
     class core
     user root

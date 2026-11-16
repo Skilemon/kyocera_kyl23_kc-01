@@ -68,6 +68,17 @@ else
     say "dt adsp-loader node MISSING"
 fi
 
+# ---- what the firmware side looks like ------------------------------------
+# PIL reads through request_firmware, which on this kernel goes to userspace
+# first; a missing adsp.mdt and a refused load look identical from the audio
+# side.  Record what is actually on the modem partition.
+for d in /firmware/image /system/etc/firmware; do
+    n=$(ls "$d" 2>/dev/null | grep -ci adsp)
+    say "fw $d: $n adsp* files [$(ls "$d" 2>/dev/null | grep -i adsp | tr '\n' ' ')]"
+done
+say "dev adsprpc: $(ls -l /dev/adsprpc-smd 2>&1 | tr '\n' ' ')"
+say "pil-state:   $(dmesg 2>/dev/null | grep -c 'loading from') loading-from lines so far"
+
 # ---- try to boot it -------------------------------------------------------
 try_boot() {
     [ -e "$B" ] || return 1
@@ -108,6 +119,10 @@ else
 fi
 
 say "final adsp state=$(cat $D/subsys0/state 2>/dev/null)"
+say "pil-after:   $(dmesg 2>/dev/null | grep -i 'loading from' | tail -n 3 | tr '\n' ' ')"
+say "apr-open:    $(dmesg 2>/dev/null | grep -i -c 'APR: \|apr_tal\|Unable to open handle')"
+sleep 4
+say "cards+4s: $(cat /proc/asound/cards 2>/dev/null | tr '\n' '|')"
 say "cards: $(cat /proc/asound/cards 2>/dev/null | tr '\n' '|')"
 say "slimbus: $(ls /sys/bus/slimbus/devices 2>/dev/null | tr '\n' ' ')"
 say "--- dmesg (adsp/pil/apr/slim/tapan/sound)"

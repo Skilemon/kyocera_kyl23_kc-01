@@ -3193,3 +3193,102 @@ APR: Wrong parameters      (每五秒一次，跟着 audioserver 的重启周期
 ADSP 没起来，音频 DSP 用不了，HAL 出不了声。崩是因为链表被踩坏，不出声是
 因为 DSP 不在——两件事。把崩止住，系统先恢复可用；ADSP 的 PIL 加载是下一个
 独立问题。
+
+## 26. 声音（一）：卡在 AP R 之前的那一步，和它背后的时序
+
+25 节把 audioserver 五秒一崩止住了。声音还是不出，这一节把"为什么不出"拆开。
+
+### 26.1 崩在哪一步，先钉死
+
+`audio.primary.msm8226.so` 的 `start_output_stream()` 反汇编（`0x8f84`）：
+
+```
+8fdc: ldr  r5, [r4, #184]      ; out->devices
+8ffc: bl   __android_log_print ; "start_output_stream: enter: usecase(%d: %s) devices(%#x)"
+900c: bl   platform_get_pcm_device_id
+9028: bl   calloc              ; 32 字节的 listnode
+905c: mov  r1, r5              ; r1 = 刚 calloc 出来的
+9060: add  r0, r6, #184        ; r0 = adev 里那个长命的链表头
+9064: bl   list_add_tail       ; <-- 就是这里
+9074: bl   select_devices
+90c8: bl   pcm_open
+```
+
+`list_add_tail` **在 `pcm_open` 之前**。所以 25 节那个空指针一崩，HAL 根本走
+不到打开 PCM、更走不到和 ADSP 说话那一步；日志里 "start_output_stream: enter"
+之后紧跟着就是 SIGSEGV，位置完全对得上。先把 25 节的补丁刷上去，这一层才会
+露出下一层。
+
+### 26.2 下一层：ASM 会话拿到的 APR 句柄是 NULL
+
+同一批日志里，每次 audioserver 起来都有且只有一条：
+
+```
+<3>#3[    9.484429] APR: Wrong parameters
+```
+
+来源是 `arch/arm/mach-msm/qdsp6v2/apr.c:271`：
+
+```c
+int apr_send_pkt(void *handle, uint32_t *buf)
+{
+	if (!handle || !buf) {
+		pr_err("APR: Wrong parameters\n");
+		return -EINVAL;
+	}
+```
+
+`handle` 是 `q6asm.c` 里的 `ac->apr`，也就是 `apr_register("ADSP", "ASM", …)`
+的返回值。它不是"ADSP 没起来"（那种情况是下一句 `Still dsp is not Up`），而是
+注册函数已经返回了 NULL、调用方没检查就往下发。没有 ASM 会话，就没有
+`q6asm_open_write`，也就没有 PCM 数据通路——出声的前提是先让这次注册成功。
+
+### 26.3 时序：ADSP 比 audioserver 晚
+
+原厂是这么干的（`init.qcom.rc`，`on early-boot`，一行）：
+
+```
+write /sys/kernel/boot_adsp/boot 1
+```
+
+这一版移植一直只靠 `kcadsp` 服务去写同一个节点，而那个服务是 `post-fs-data`
+里 `start kcadsp` 拉起来的，落到时间轴上：
+
+```
+4.29s  fs_mgr 挂上 /firmware（modem 分区，ADSP 镜像在这里）
+5.40s  audioserver 起
+5.99s  kcadsp 起
+6.4s   adsp ONLINE        <- kcadsp 自己记的 "adsp ONLINE after 2s"
+8.9s   声卡 msm8226tapansnd 注册完成
+```
+
+也就是音频子系统先睁眼、DSP 后上线。`apr_register()` 对 `APR_DEST_QDSP6` 只在
+`q6 state == DOWN` 时等 1 秒（`apr_wait_for_device_up`），等不到就返回 NULL，
+之后那次 `apr_send_pkt` 就是上面那条错误。audioserver 每五秒重来一次，但每次
+都在同一个窗口里撞上同一堵墙。
+
+修法照抄原厂：在 `kyl23-extra.rc` 里加
+
+```
+on early-boot
+    write /sys/kernel/boot_adsp/boot 1
+```
+
+`early-boot` 在 `mount_all` 之后、`class_start main` 之前，`/firmware` 已经挂好，
+比 audioserver 早一整个阶段。`kcadsp` 保留，作为"这一拍 PIL 还没准备好"时的
+重试。
+
+### 26.4 下一次 dump 要看什么
+
+`kcadsp.sh` 加了四行证据，写进 `/cache/kcadsp.log`：
+
+```
+fw /firmware/image: N adsp* files [...]     <- 镜像到底在不在 modem 分区
+dev adsprpc: ...
+pil-state:   N loading from                 <- PIL 有没有真的搬镜像
+pil-after / apr-open / cards+4s
+```
+
+如果 `fw` 那行是 0 个文件，问题就在 modem 分区而不是内核；如果 `loading from`
+一直是 0 而 state 却是 ONLINE，那就是 subsystem 状态和 PIL 对不上，得回头看
+`adsp-loader` 的 `subsystem_get()` 返回值。
