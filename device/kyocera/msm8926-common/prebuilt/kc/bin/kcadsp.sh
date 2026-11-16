@@ -91,6 +91,23 @@ st_of() { [ -n "$1" ] && cat "$1/state" 2>/dev/null; }
     echo "audioserver start/exit: $(dmesg 2>/dev/null | grep -c "Starting service 'audioserver'") / $(dmesg 2>/dev/null | grep -c "audioserver') exited")"
     dmesg 2>/dev/null | grep -E 'audioserver' | tail -n 10
 
+    # ---- did anything actually go through a PCM? ---------------------------
+    # Run this while a sound is playing and the difference is obvious:
+    # state RUNNING + a non-zero hw_ptr means the DSP is being fed.
+    sec pcm
+    for p in /proc/asound/card*/pcm*p/sub*/status; do
+        [ -r "$p" ] || continue
+        echo "$p"
+        sed 's/^/    /' "$p" 2>/dev/null | head -n 8
+    done
+    echo "-- datapath --"
+    dmesg 2>/dev/null | grep -Ei 'msm_pcm|msm-dai|afe_|adm_|asm_|dapm|slimbus|SLIM' | tail -n 30
+
+    sec audioflinger
+    dumpsys media.audio_flinger 2>/dev/null |
+        grep -Ei 'output thread|input thread|standby|sample rate|format|channel|card|hal' |
+        head -n 25
+
     sec logcat_audio
     logcat -d -v brief -t 500 2>/dev/null |
         grep -Ei 'audioflinger|audiopolicy|audio_hw|audiohal|tapan|adm_|asm_|afe_' |

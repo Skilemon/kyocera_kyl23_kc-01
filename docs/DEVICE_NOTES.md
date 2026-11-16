@@ -3639,3 +3639,71 @@ logstore: magic=v2.0.0 records=N                         <- 环有没有在跟�
 ```
 
 `records` 比上一次大，说明环在跟着走；不变就说明这个环根本不记当前开机，那以后只走 adb。
+
+## 30. 声音（四）：链路通了，#25 是第一次 ADSP 早于 audioserver 的开机
+
+fix70 的 dump 同时给了 `kcaudio.txt` 和 `21_log.img`。前者是本次开机，后者又一次证实
+"这个分区只装上一场"。
+
+### 30.1 本次开机的时间线（来自 kcaudio.txt，可信）
+
+```
+5.234  adsp-loader: userspace requested boot (cmd=1)      <- rc 的 post-fs-data 写入
+5.316  pil-q6v5-lpass: adsp: loading from 0x0dc00000      <- 开始搬镜像
+5.682  pil-q6v5-lpass: adsp: Brought out of reset
+5.737  adsp: Power/Clock ready interrupt received
+5.760  apr_tal:Q6 Is Up                                   <- ADSP 上线
+5.760  adsp-loader: userspace boot done, rc=0
+6.146  asoc: tapan_rx1 <-> msm-dai-q6-dev.16384 mapping ok <- 走 ADSP 的 DAI 起来了
+6.173  input: msm8226-tapan-snd-card Headset Jack
+6.219  adsp-loader: ADSP came up on attempt 1             <- 内核那一路也跑到了，发现已上线
+6.989  init: Starting service 'audioserver'
+59 s   audioserver start/exit = 1 / 0
+```
+
+ADSP 比 audioserver 早 **1.23 s**，而之前每一次都是晚（或者根本没起）。声卡
+`card0 [msm8226tapansnd]` 在，`slimbus: sb-1 tapan-slim-ifd tapan-slim-pgd` 三个设备
+都绑上了，`/proc/asound/pcm` 里 MultiMedia1/2、CS-Voice、VoIP、LPA、SLIMBUS_0 全都在。
+**音频链路这一层已经不需要再改了。**
+
+三层触发里，真正起作用的是 `on post-fs-data` 那一行（5.234 的 cmd=1）；内核那一路在
+6.219 只是确认。所以 0003 的 retry 可以留着当保险，但别指望它救场——它比 audioserver
+只早 0.77 s，靠的是 post-fs-data 已经把 ADSP 拉起来了。
+
+### 30.2 日志分区：这次更清楚了，它装的是"上一场"
+
+`21_log.img` 的三个槽：#23 / #23 / **#24**（`root@be411d766fb9`，uptime 到 780 s 才重启）。
+本次 #25 的 `KCRPT` 行一条都没有——因为**这个环在会话结束时才落盘**，dump 到的永远是
+上一场。所以要它包含本次，必须再重启一次再 dump。
+
+上一份 dump 的第三槽是 #22，这一份变成 #24，两次都落后一场，规律一致。
+
+⚠️ 也正因为会丢行：那场 #24 里 `Q6 Is Up` 计数为 0，但同一场 7.89 s 就有
+`tapan-slim tapan-slim-pgd: Looking up qcom,cdc-micbias4-cfilt-sel`，说明 codec/slimbus
+是通的，ADSP 大概率也起着，只是那行被丢了。**计数 0 只能说明"没抓到"，不能说明"没发生"**
+——这条教训在 29 节写过一次，这里再记一次。
+
+### 30.3 剩下三条报错的性质
+
+| 报错 | 结论 |
+|---|---|
+| `sound-9302.43: probe failed with error -16` | DT 里有两个 `msm8226-asoc-tapan` 节点（`sound.42` 与 `sound-9302.43`）。第二个抢 `tapan mclk gpio 440` 失败（第一个已占），于是 probe 返回 EBUSY。**card0 是 `sound.42`，正常工作**，这条只影响那个多余的节点，属噪声。 |
+| `msm8226_setup_hs_jack: Failed to request tapan us-euro gpio -22` | 老问题：驱动把 `gpio_get_value` 风格的负返回值往 `u32` 里塞，`-22`=`EINVAL` 其实是 DT 没有 `qcom,us-euro-gpios`。影响的是 EU/JP 耳机类型判定那一路，插孔本身（Headset Jack / Button Jack 两个 input）已注册。 |
+| `APR: Wrong parameters` @8.461，全场一条 | 声卡初始化时 mixer 在 `port_id` 未设的情况下查 dolby dap 参数，之前每次都有，不致命。 |
+
+### 30.4 还缺的证据：没人放过音
+
+整份 dmesg 在 6.989 之后没有任何 `msm_pcm` / `afe` / `adm` / `asm` 活动，logcat 里也没有
+audio 相关行，说明这台设备**还没有真正播过一次声音**。`audioserver 1/0` 只证明 HAL 活得
+好，不证明能出声。
+
+所以 kcadsp.sh 又加了一段（不改内核，手动就能跑）：`sec pcm` 会把每个
+`/proc/asound/card*/pcm*/sub*/status` 打出来，`-- datapath --` 抓 30 行
+`msm_pcm|msm-dai|afe_|adm_|asm_|dapm`，`sec audioflinger` 抓
+`dumpsys media.audio_flinger` 里的 output thread。
+
+判据：
+
+* 放音时 `state: RUNNING`、`hw_ptr` 在动 → PCM 层通了；
+* 停在 `SETUP`/`PREPARED` 不动 → 卡在 DAI/AFE，看 `-- datapath --` 里最后一条 route；
+* `state: RUNNING` 但没声音 → 模拟域（codec 上电、spk/ear 通路、`msm8226_setup_hs_jack`）。
