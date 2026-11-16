@@ -349,6 +349,12 @@ audiosnap() {
         done
         echo "-- foreground --"
         dumpsys activity activities 2>/dev/null | grep -m3 -E 'mResumedActivity|mFocusedActivity'
+        echo "-- stream volume / mode --"
+        # A silent phone with a healthy PCM path is usually this: STREAM_MUSIC
+        # at 0, or a headset/jack state that routed the mix elsewhere.
+        dumpsys audio 2>&1 | grep -E 'STREAM_MUSIC|Muted|Current|Mode:|Ringing|Devices' | head -n 24
+        echo "-- jack --"
+        echo "h2w=$(cat /sys/class/switch/h2w/state 2>/dev/null) name=$(cat /sys/class/switch/h2w/name 2>/dev/null)"
         echo "-- AudioFlinger --"
         dumpsys media.audio_flinger 2>&1 | head -n 220
         echo "-- logcat (audio, last 120) --"

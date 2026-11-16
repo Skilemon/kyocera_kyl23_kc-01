@@ -3922,7 +3922,9 @@ fix73 换三件仪器：
 1. **1 秒采样**（前 10 分钟），状态机每一次跃迁都进 `KCEVT`；
 2. **放音瞬间的深照**：进入 busy 的第一秒、以及 busy 期间每次状态变化，各拍一次
    `dumpsys media.audio_flinger`（220 行）+ 忙着的 `hw_params` + 前台 Activity +
-   最近的 audio/media logcat。这一段只有流还活着的时候才有意义；
+   `dumpsys audio` 里的 STREAM_MUSIC 音量与耳机口 `h2w` 状态 + 最近的 audio/media
+   logcat。这一段只有流还活着的时候才有意义；一个"PCM 正常但没声"的常见原因就是
+   STREAM_MUSIC 被摁到 0，或者插着耳机把混音送去了别处，这两条都得当场看；
 3. **连续 logcat 落盘**：新服务 `kclogcat`
    （`-b main,system,crash,radio -v threadtime -f /data/local/tmp/kclogcat.txt -r 4096 -n 2`），
    从 `boot_completed` 一直写到关机，recovery 挂 /data 后 `adb pull` 即可。
