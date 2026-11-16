@@ -298,7 +298,8 @@ A=$(adspdev)
         ev=
         for e in "$d"/event*; do [ -e "$e" ] && ev=/dev/input/$(basename "$e"); done
         [ -e "$d/$node" ] || { echo "  $id: no $node"; return; }
-        echo "  $id $node: before=$(cat "$d/$node" 2>/dev/null) event=${ev:-none}"
+        was=$(cat "$d/$node" 2>/dev/null)
+        echo "  $id $node: before=$was event=${ev:-none}"
         echo 1 >"$d/$node" 2>/dev/null
         sleep 1
         echo "  $id $node: after=$(cat "$d/$node" 2>/dev/null)"
@@ -306,7 +307,9 @@ A=$(adspdev)
             echo "  $id events (16-byte input_event, raw):"
             timeout 2 dd if="$ev" bs=16 count=3 2>/dev/null | od -An -tu4 -w16 | head -n 4
         fi
-        echo 0 >"$d/$node" 2>/dev/null
+        # put back whatever was there: if the framework had already enabled it
+        # for the phone app, forcing 0 would quietly take proximity away.
+        echo "${was:-0}" >"$d/$node" 2>/dev/null
     }
     echo "-- direct probe --"
     sensprobe input6 enable_als_sensor
