@@ -2949,3 +2949,45 @@ hwcomposer/gralloc（第 22 节，手工覆盖）、bluetooth（本节）。
 判断某个 HAL 该用哪一份，看它引用的 libmedia / libgui 符号有没有 `b` 后缀、
 看它 NEEDED 里是 `libchrome.so`（7.1 的 Fluoride）还是 `libbt-hci.so`（4.4 的
 bluedroid）。大小差一个数量级的，基本都是版本不同而不是裁剪。
+
+### 23.5 fix62 的"蓝牙共享已停止运行"：HAL 换对了，补丁丢了
+
+fix61 那一版加载的是原厂 4.4 的 HAL，死在 `AudioTrack::write` 的符号上（23.2）。
+fix62 把 `/vendor/lib/hw/bluetooth.default.so` 换成 7.1 编的那份（1,448,792 B），
+符号问题确实没了，但一开蓝牙就弹"蓝牙共享已停止运行"——症状换了，仍然不能用。
+
+拿 fix56（蓝牙能开的那一版）逐字节比同一个文件，两份的差别只有 **2 字节**，
+在文件偏移 `0xfd45c`：
+
+```
+fix56 : 07 24   movs r4, #7      ; CLOCK_BOOTTIME
+fix62 : 04 46   mov  r4, r0      ; 编译器原样：沿用调用者给的 clockid（9）
+```
+
+`vaddr 0x10145c` 正是 15.2 里那个 `timer_create_internal()` 的入口。也就是说
+15.2 的修法从 fix52 起一直是**对手工拼出来的镜像打字节补丁**——它从来没写进源码。
+而 fix57 之后每一版都是从 CI 产物直接转的镜像：fix58–fix60 手工覆盖的是显示栈，
+fix61 用的是原厂 HAL（连 `timer_create()` 都没走到），直到 fix62 才第一次把 7.1
+编的 HAL 放回那个位置，于是 `mov r4, r0` 又回来了：clock 9 依旧不存在，
+`timer_create()` 回 EINVAL，`lazy_initialize()` 退栈，第一次 `alarm_set()` 断言，
+SIGABRT。UI 上就是"蓝牙共享已停止运行"。
+
+所以不是这一版把蓝牙修坏了，是**这个补丁一直只活在某一版镜像的两个字节里**。
+
+修法：把它写进源码。`patches/0002-bt-alarm-drop-clock-nine.patch` 把
+
+```c
+#if defined(KERNEL_MISSING_CLOCK_BOOTTIME_ALARM) && (KERNEL_MISSING_CLOCK_BOOTTIME_ALARM == TRUE)
+static const clockid_t CLOCK_ID_ALARM = CLOCK_BOOTTIME;
+#else
+static const clockid_t CLOCK_ID_ALARM = CLOCK_BOOTTIME_ALARM;
+#endif
+```
+
+改成无条件 `CLOCK_BOOTTIME`。上游其实为这种内核留了
+`KERNEL_MISSING_CLOCK_BOOTTIME_ALARM` 这个开关，只是 14.1 的构建里没有任何地方
+设它，所以那份代码永远走 `#else`。改完之后 CI 直出的 HAL 自带这个行为，不必再
+每版手工改字节。
+
+同时 fix63 镜像里两份 `bluetooth.default.so`（`/lib/hw` 和 `/vendor/lib/hw`）已经
+按 fix56 改好，md5 `4ee10c46…`，可以立刻刷。

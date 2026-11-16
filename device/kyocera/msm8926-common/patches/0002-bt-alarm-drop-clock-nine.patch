@@ -1,0 +1,26 @@
+--- a/system/bt/osi/src/alarm.c
++++ b/system/bt/osi/src/alarm.c
+@@ -94,11 +94,19 @@
+ // unit tests to run faster. It should not be modified by production code.
+ int64_t TIMER_INTERVAL_FOR_WAKELOCK_IN_MS = 3000;
+ static const clockid_t CLOCK_ID = CLOCK_BOOTTIME;
+-#if defined(KERNEL_MISSING_CLOCK_BOOTTIME_ALARM) && (KERNEL_MISSING_CLOCK_BOOTTIME_ALARM == TRUE)
++/* Kyocera's 3.4 kernel predates CLOCK_BOOTTIME_ALARM: clockid 9 only learned
++ * to create timers in mainline 3.10 and this tree never backported it, so
++ * timer_create(9, ...) returns EINVAL.  timer_create_internal() then fails,
++ * lazy_initialize() unwinds, and the first alarm_set() asserts -- the SIGABRT
++ * behind "Bluetooth share keeps stopping", before the stack is even up
++ * (DEVICE_NOTES 15.3).
++ *
++ * Upstream anticipated exactly this and left KERNEL_MISSING_CLOCK_BOOTTIME_ALARM
++ * for it, but nothing in the 14.1 build sets that flag.  CLOCK_BOOTTIME (7)
++ * has been there since 2.6.39, so take it unconditionally.  The only loss is
++ * waking the device out of suspend with a timer, and this port never suspends;
++ * every other timer in this file already runs on CLOCK_ID anyway. */
+ static const clockid_t CLOCK_ID_ALARM = CLOCK_BOOTTIME;
+-#else
+-static const clockid_t CLOCK_ID_ALARM = CLOCK_BOOTTIME_ALARM;
+-#endif
+ // This mutex ensures that the |alarm_set|, |alarm_cancel|, and alarm callback
+ // functions execute serially and not concurrently. As a result, this mutex
+ // also protects the |alarms| list.
