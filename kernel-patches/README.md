@@ -195,7 +195,7 @@ ARM 上 `__NR_finit_module` 是 379，这棵 3.4 树的编号表到 377 为止�
 
 ## 补丁 0003：让内核自己去启动 ADSP
 
-`0003-adsp-loader-boot-from-kernel.patch`，一个文件，99 行。
+`0003-adsp-loader-boot-from-kernel.patch`，一个文件，183 行。
 
 ADSP 在这套移植上从来没起来过。原厂靠 `init.qcom.rc` 的
 
@@ -205,22 +205,29 @@ on early-boot
 ```
 
 把 `adsp_loader_do()` 叫起来，而这一步要求 `/firmware`（vfat 的 modem 分区）已经挂
-好、`ueventd` 已经在跑（`pil_boot()` 最终走 `request_firmware()`）。这套移植上这两
-个条件分别落在 4.7 s 和更早，但 `early-boot` 真正被触发是 5.99 s —— `post-fs-data`
-里的 e2fsck、kcboot、kcfix 把那段吃掉了，而 init 在 6.14 s 就已经把 audioserver 拉
-起来。fix66 照抄那一行，改的只是几十毫秒。
+好、`ueventd` 已经在跑（`pil_boot()` 最终走 `request_firmware()`）。这套移植上
+`/firmware` 挂在 4.688 s，但 `early-boot` 真正被触发是 5.99 s —— `post-fs-data` 里的
+e2fsck、kcboot、kcfix 把那段吃掉了，而 init 在 6.06 s 就把 audioserver 拉起来了。
+fix66 照抄那一行，改的只是几十毫秒，日志里连一次 `pil_boot()` 都没有。
 
-改法：把触发搬进内核。`adsp_loader_probe()` 里挂一个 delayed work，第一次 6 s，之后
-每 2 s 一次，最多 20 次，每次打一行
+改法：把触发搬进内核。`adsp_loader_probe()` 里挂一个 delayed work，第一次 5 s，之后
+每 1 s 一次，最多 60 次，每次打一行
 
 ```
-adsp-loader: attempt 3/20 failed, rc=-2
+adsp-loader: attempt 3/60 failed, rc=-2
 adsp-loader: ADSP came up on attempt 4
 ```
 
 `adsp_loader_do()` 顺手改成返回 `int`（原来 `void`，失败与成功只靠一句日志区分），
-`pdev` 为空时的 `dev_err(&pdev->dev, ...)` 是空指针解引用，一并修掉。sysfs 那条
-写入路径保留，只加了日志 —— 用户态若还想写，仍然能写。
+`pdev` 为空时的 `dev_err(&pdev->dev, ...)` 是空指针解引用，一并修掉。DT 里
+`qcom,adsp-state` 不是 DOWN 时打一行 `dt adsp-state=%u, not booting it`，这条是为了
+区分"驱动以为已经加载"和"真的加载了"。sysfs 那条写入路径保留，只加了日志 ——
+用户态若还想写，仍然能写。
+
+**这个补丁只有在内核真的被刷进去时才生效。** fix67 的 dump 里三次开机全是 `#23`，
+一次 `#24` 都没有，`pil_boot()` 也一次都没跑 —— 见 `docs/DEVICE_NOTES.md` §28。
+所以 init 那边的触发（`on post-fs-data`）和 `kcadsp.sh` 的重试都保留，三者叠加是安全
+的：`subsystem_get()` 有引用计数，`adsp_loader_do()` 在 `priv->pil_h` 非空时直接返回。
 
 这样做的另一个好处是归因：以前 dump 里既没有 `Q6/ADSP image is loaded`，也没有
 `pil-...: Failed to locate adsp`，无法判断是"没人触发"还是"触发失败"。现在每一次

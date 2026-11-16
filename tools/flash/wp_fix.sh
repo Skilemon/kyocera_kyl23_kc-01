@@ -1,18 +1,21 @@
 #!/sbin/sh
 # 手动兜底：怀疑写保护没解时补一刀。
 #
-# 正常情况下不需要跑这个 —— kc_wp.ko 的 `parts` 默认值就是
-# "mmcblk0p12 mmcblk0p11 mmcblk0p19"（recovery / boot / system），insmod 后
-# 4 秒它自己在 delayed work 里清完，不依赖 init.rc。
+# 正常情况下不需要跑这个 —— kc_wp.ko 的 `parts` 默认值是按**名字**给的
+# "recovery boot system"，insmod 后 4 秒它自己在 delayed work 里清完，
+# 不依赖 init.rc。
 #
 # aboot 每次上电都会用 CMD28 把 boot / recovery / system 三片区域按 WP group
 # 置上保护，保护位是易失的、只在卡上，换内核不影响。写的时候不会报错，
 # 数据被丢弃 —— 表现为 dd / package_extract_file 返回成功、回读没变。
 #
-# 分区号取自 docs/DEVICE_NOTES.md：
-#   mmcblk0p11 = boot    (16 MiB)
+# 分区号取自 docs/DEVICE_NOTES.md §6：
+#   mmcblk0p9  = boot    (16 MiB)   <- 不是 p11！p11 是 tzbak，1 MiB
 #   mmcblk0p12 = recovery(16 MiB)
 #   mmcblk0p19 = system  (1404 MiB)
+#
+# 这里用名字而不是编号：编号随批次/GPT 变，写错一个数字就等于清了个无关分区，
+# 而 boot 仍然带着保护 —— 刷进去的内核会被静默丢弃。
 #
 # init 阶段没有 /tmp（TWRP 起来后会重挂），日志一律走 kernel log，
 # `dmesg | grep kc_wp_fix` 就能看到结果。
@@ -24,13 +27,13 @@ if [ ! -d /sys/kernel/kc_wp ]; then
     exit 0
 fi
 
-for p in mmcblk0p12 mmcblk0p11 mmcblk0p19; do
+for p in recovery boot system; do
     n=0
     while [ ! -e /dev/block/$p ] && [ $n -lt 10 ]; do
         sleep 1
         n=$((n + 1))
     done
-    if [ ! -e /dev/block/$p ]; then
+    if [ ! -e /dev/block/platform/msm_sdcc.1/by-name/$p ]; then
         log "$p missing, skip"
         continue
     fi

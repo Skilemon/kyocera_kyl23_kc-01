@@ -1,47 +1,45 @@
 #!/system/bin/sh
 #
-# kcadsp -- watch the ADSP come up and leave the evidence where a dump can see
-# it.  It does NOT drive the load any more; the kernel does (patch
-# kernel-patches/0003-adsp-loader-boot-from-kernel.patch, adsp-loader.c):
-# trying to race init and audioserver from here was the mistake of fix24..fix66.
+# kcadsp -- boot the ADSP, and leave the evidence where a dump can see it.
 #
-# Why the kernel owns it now:
+# Why it still writes /sys/kernel/boot_adsp/boot itself:
 #
-#   * Every userspace hook available on this port runs late.  /firmware is
-#     mounted at 4.7 s, post-fs-data burns another 1.2 s (e2fsck, kcboot,
-#     kcfix, ...), so "on early-boot" fires at 5.99 s - 150 ms before init
-#     starts audioserver and before the ASoC card has probed.  There is no
-#     userspace stage early enough.
-#   * adsp_loader_do() -> subsystem_get("adsp") -> pil_boot() -> 
-#     request_firmware() needs a live ueventd and a mounted /firmware, but it
-#     does not need Android: a workqueue retry from the loader driver covers
-#     the whole window and prints every attempt, so one dump says whether the
-#     blob is missing, whether the authentication was refused, or whether it
-#     simply had not been tried yet.
+#   fix67 moved the trigger into the kernel (kernel-patches/0003) and made this
+#   script a pure observer.  The dump from that build proves the idea failed in
+#   practice for a boring reason: the kernel it needs was never flashed.  All
+#   three boots in 21_log.img are "#23 Mon Nov 16 13:40:03", none is "#24", and
+#   the newest one has no pil_boot() at all -- nothing ever called
+#   subsystem_get("adsp").  audioserver then exits every 5 s, 32 times.
 #
-# What this script is for now:
+#   So the userspace trigger has to stay until a dump shows a kernel newer than
+#   the one that shipped the retry.  The kernel path (first attempt 5 s, then
+#   every 1 s, 60 tries) and this one are safe together: subsystem_get() is
+#   refcounted and adsp_loader_do() returns early once priv->pil_h is set.
 #
-#   1. record the ADSP subsystem state over the first 20 s (by NAME - the
-#      fix66 version polled subsys0, which is the *modem*, so it reported
-#      "ONLINE after 1s" while the ADSP had never been touched at all);
-#   2. copy the interesting part of dmesg to the kernel log, so the log
-#      partition dump carries it (the /cache copy is unreadable: the dump tool
-#      only keeps the first 20 MB of a 120 MB filesystem);
-#   3. stay out of the load path, so the kernel log shows exactly one driver
-#      behind every attempt.
+# Timing, measured: the load itself takes ~0.5 s (pil "loading from" 5.516 ->
+# "Q6 Is Up" 6.020) and audioserver starts at 6.06 s.  The rc now asks at
+# post-fs-data (4.70 s).  This script runs later, at class_start core, and is
+# the retry for when that first ask lost or was refused.
 #
-# /dev/kmsg writes are the risk this script has to live with: a printf to
-# /dev/kmsg can block on the console.  Everything below is emitted from one
-# background child after the observation window, at most 24 short lines, so a
-# block costs a sleeping child and never init.
+# Everything goes to /dev/kmsg from the foreground: init SIGKILLs the process
+# group of a oneshot service as soon as the script exits, so the background
+# child the fix67 version used for its report was dead before it could write a
+# single line -- which is why that dump has no KCADSP line in it.
 
 L=/cache/kcadsp.log
 D=/sys/bus/msm_subsys/devices
 B=/sys/kernel/boot_adsp/boot
+K=/dev/kmsg
 
-say() {
-    echo "$*" >> $L 2>/dev/null
-}
+# The kernel that has the in-driver retry.  Printed on every boot so the next
+# dump answers "did the boot partition actually get written?" without guessing:
+# if "kernel=" here is older than this string, the flash did not take and
+# nothing else in the log means what it looks like.
+EXPECT="#25"
+
+say() { echo "$*" >> $L 2>/dev/null; }
+kmsg() { printf '<6>KCADSP %s\n' "$*" >> $K 2>/dev/null; }
+up() { cut -d' ' -f1 /proc/uptime 2>/dev/null; }
 
 adsp_dev() {
     for d in $D/subsys*; do
@@ -55,78 +53,55 @@ adsp_dev() {
 }
 
 : > $L 2>/dev/null
-say "=== kcadsp observe $(date) uptime $(cat /proc/uptime 2>/dev/null)"
-
-for d in $D/subsys*; do
-    [ -d "$d" ] || continue
-    say "$(basename $d) name=$(cat $d/name 2>/dev/null) state=$(cat $d/state 2>/dev/null) level=$(cat $d/restart_level 2>/dev/null) fw=$(cat $d/firmware_name 2>/dev/null)"
-done
-
-if [ -d /sys/kernel/boot_adsp ]; then
-    say "boot_adsp present: $(ls /sys/kernel/boot_adsp 2>/dev/null | tr '\n' ' ')"
-else
-    say "boot_adsp MISSING"
-fi
-say "boot attr: $(ls -l $B 2>/dev/null)"
-
-for d in /firmware/image /firmware /system/etc/firmware /vendor/firmware; do
-    n=$(ls "$d" 2>/dev/null | grep -ci '^adsp')
-    [ "$n" = "0" ] || say "fw $d: $n adsp* files [$(ls "$d" 2>/dev/null | grep -i '^adsp' | tr '\n' ' ')]"
-done
 
 A=$(adsp_dev)
-say "adsp subsystem: ${A:-<none>} state=$(cat $A/state 2>/dev/null)"
+st=$(cat $A/state 2>/dev/null)
 
+kmsg "start up=$(up) state=${st:-none} kernel=$(sed -n 's/.*\(#[0-9][0-9]*\) SMP.*/\1/p' /proc/version 2>/dev/null) expect=$EXPECT"
+kmsg "dev=${A:-none} fw_adsp=$(ls /firmware/image 2>/dev/null | grep -ic '^adsp') bootattr=$([ -e $B ] && echo yes || echo no)"
+say "=== kcadsp $(date) up=$(up) state=${st:-none}"
+
+# ---- ask for the boot, repeatedly -----------------------------------------
+# The write blocks in request_firmware() for as long as the load takes, so the
+# state read that follows it is already the post-load one.
+tries=0
 i=0
-while [ $i -lt 20 ]; do
+while [ $i -lt 10 ]; do
     st=$(cat $A/state 2>/dev/null)
-    case "$st" in
-        ONLINE)
-            say "adsp ONLINE at uptime $(cat /proc/uptime 2>/dev/null) (poll $i)"
-            break
-            ;;
-    esac
-    sleep 1
+    [ "$st" = "ONLINE" ] && break
+
+    if [ ! -e $B ]; then
+        kmsg "no $B, cannot boot the ADSP"
+        break
+    fi
+
+    tries=$((tries + 1))
+    echo 1 > $B 2>/dev/null
+    rc=$?
+    st=$(cat $A/state 2>/dev/null)
+    kmsg "boot #$tries rc=$rc state=${st:-none} up=$(up)"
+    say "boot #$tries rc=$rc state=${st:-none} up=$(up)"
+
+    [ "$st" = "ONLINE" ] && break
+    sleep 2
     i=$((i + 1))
 done
 
 st=$(cat $A/state 2>/dev/null)
-say "adsp final state=${st:-<none>} after ${i}s"
+kmsg "final state=${st:-none} tries=$tries up=$(up)"
 
-say "cards: $(cat /proc/asound/cards 2>/dev/null | tr '\n' '|')"
-say "slimbus: $(ls /sys/bus/slimbus/devices 2>/dev/null | tr '\n' ' ')"
-say "loader: $(dmesg 2>/dev/null | grep -c 'adsp-loader:') adsp-loader lines"
+# ---- what the kernel and the DSP had to say -------------------------------
+for d in $D/subsys*; do
+    [ -d "$d" ] || continue
+    kmsg "$(basename $d) $(cat $d/name 2>/dev/null) $(cat $d/state 2>/dev/null)"
+done
 
-# ---- why does audioserver quit? -------------------------------------------
-# It exits with status 0 about a second after every start, and the reason is
-# only in logcat: ALOG goes to logd, never to the kernel log, and the log
-# partition dump therefore never carried it.  KCLED already dumps logcat to
-# /cache/lc.txt, but /cache does not survive the dump, so copy the audio part
-# into the kernel log while we are here.
-log_src=/cache/lc.txt
-if [ ! -s "$log_src" ]; then
-    log_src=/cache/kcadsp-lc.txt
-    logcat -d -v brief -t 4000 > $log_src 2>/dev/null
-fi
-say "logcat $log_src: $(grep -ic audio "$log_src" 2>/dev/null) audio lines"
+dmesg 2>/dev/null | grep -E 'adsp-loader:|pil-q6v5-lpass|apr_tal|Q6 Is Up' |
+    tail -n 12 | while IFS= read -r l; do kmsg "| $l"; done
 
-# ---- one bounded report into the kernel log -------------------------------
-{
-    printf '<6>KCADSP adsp=%s state=%s uptime=%s\n' \
-        "${A:-none}" "${st:-none}" "$(cat /proc/uptime 2>/dev/null | cut -d' ' -f1)" >>/dev/kmsg 2>/dev/null
-    for d in $D/subsys*; do
-        [ -d "$d" ] || continue
-        printf '<6>KCADSP %s name=%s state=%s\n' "$(basename $d)" \
-            "$(cat $d/name 2>/dev/null)" "$(cat $d/state 2>/dev/null)" >>/dev/kmsg 2>/dev/null
-    done
-    dmesg 2>/dev/null | grep -E 'adsp-loader:|pil-|pil_|APR|apr' | tail -n 12 |
-        while IFS= read -r l; do
-            printf '<6>KCADSP | %s\n' "$l" >>/dev/kmsg 2>/dev/null
-        done
-    grep -i -E 'audio|AudioFlinger|AudioPolicy|HAL|tapan' "$log_src" 2>/dev/null | tail -n 20 |
-        while IFS= read -r l; do
-            printf '<6>KCLOG %s\n' "$l" >>/dev/kmsg 2>/dev/null
-        done
-} &
+# audioserver dies or survives on this: keep the length bounded, it is one line
+kmsg "cards=$(cat /proc/asound/cards 2>/dev/null | tr '\n' '|')"
+kmsg "slim=$(ls /sys/bus/slimbus/devices 2>/dev/null | tr '\n' ',')"
+kmsg "audioserver_exits=$(dmesg 2>/dev/null | grep -c "audioserver') exited")"
 
 exit 0

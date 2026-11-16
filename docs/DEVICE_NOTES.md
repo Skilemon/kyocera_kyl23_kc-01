@@ -3416,3 +3416,111 @@ grep -a "KCLOG"        21_log.img        # audioserver 退出前 AudioFlinger �
 `adsp.mdt`；`-5`/`-13`/`-22` = 拿到了但被拒（认证/参数），那就是 PIL + TZ 那一层；
 如果 20 次全失败而 `state` 一直是 `OFFLINE`，下一步是把 `pil_boot()` 里的
 `request_firmware_direct()` 返回值也打出来。
+
+## 28. 声音（三）：fix67 的内核根本没刷进去；而 ADSP 一起来声音就没问题
+
+fix67 把触发搬进了内核、把 `kcadsp` 改成观察者。这份 dump 说明两件事：
+**那版内核不在设备上**，而**只要 ADSP 在 audioserver 之前起来，音频栈就是好的**。
+
+### 28.1 三次开机，没有一次是 #24
+
+`21_log.img` 里三个 `Linux version`（新的在前，环形缓冲回卷后低偏移是最新的）：
+
+| 段 | 内核 | 构建机 | 最长 uptime | pil_boot | audioserver 退出 | adsprpcd |
+|---|---|---|---|---|---|---|
+| s0 | `#23 Mon Nov 16 13:40:03` | `root@8ded1cdd5b47` | 509 s | **无** | **32 次** | 255 |
+| s1 | `#23 Mon Nov 16 13:40:03` | `root@8ded1cdd5b47` | 160 s | **有** | **0 次** | 常驻 |
+| s2 | `#22 Mon Nov 16 00:15:43` | `root@ad17b0cbe76d` | 639 s | 无 | 30 次 | 255 |
+
+`boot-fix67.img` 里确实是 `#24 … 18:26:20`（解 gzip 验过），但设备上三个 session 一个
+`#24` 都没有。**boot 分区没写进去**，所以 `0003` 那个内核重试一次也没跑过——s0 里连
+`adsp-loader:` 这一行都不存在，`loading from` 也没有。
+
+> 这台机器的 boot/recovery 有 eMMC 卡级写保护（`docs/FLASHING.md`），`dd` 会报成功但
+> 数据全丢；`kc_wp.ko` 只在本机 Android 启动后清，所以在 TWRP/电脑侧写完必须回头确认。
+
+### 28.2 s1：唯一一次 ADSP 起来过，音频就全好了
+
+```
+#2[ 5.516550] pil-q6v5-lpass fe200000.qcom,lpass: adsp: loading from 0x0dc00000 to 0x0f000000
+#2[ 5.938020] pil-q6v5-lpass fe200000.qcom,lpass: adsp: Brought out of reset
+#0[ 6.014453] adsp-loader qcom,msm-adsp-loader.41: adsp_loader_do: Q6/ADSP image is loaded
+#0[ 6.020727] apr_tal:Q6 Is Up
+#1[ 6.062816] init: Starting service 'audioserver'...
+#0[ 6.702727] msm8226-asoc-tapan sound.42: msm8226_setup_hs_jack: Failed to request tapan us-euro gpio -22
+#0[ 7.407217] APR: Wrong parameters            <- 只有这一条
+```
+
+这一整段 160 s 里 audioserver **一次都没退出**（s0 是 32 次），`adsprpcd` 没再 255 退出，
+`APR: Wrong parameters` 只有 7.407 那一条——那是声卡初始化时
+`msm_routing_get_dolby_dap_param_to_get_control` 在 `port_id` 还没设时的一次查询，不是
+致命错误。**这是第一个声音链条完整的开机。**
+
+### 28.3 结论：全部问题就是"约 0.5 s 的窗口"
+
+- 触发（`echo 1 > /sys/kernel/boot_adsp/boot`）到 `Q6 Is Up` 是 **0.504 s**
+  （5.516 → 6.020）；
+- audioserver 在 **6.06 s** 起来（`class_start main`）；
+- 所以触发的死线是 **~5.5 s**。s1 那次 `kcadsp` 在 5.394 s 起，刚好赶上；
+- s0（fix67）没有任何人写，ADSP 永远是 DOWN，audioserver 每次起来都在
+  `adm_get_params` 上撞 `this_adm.apr == NULL`，退出、重启、再撞，5 s 一轮到日志末尾。
+
+这也解释了 26 节那次"ADSP 8.9 s 才上线"却仍然崩到底：那次的触发是 5.99 s 的
+`early-boot`，加载完已经 6.5 s 之后了。**ADSP 晚上线 = 永久坏，不是"慢一点"**：
+`q6afe`/`q6adm` 的 APR 句柄在声卡 probe 那一拍注册，拿到 NULL 就一直 NULL。
+
+### 28.4 fix67 那份 dump 为什么一条 `KCADSP` 都没有
+
+脚本把整段报告放在一个后台子 shell 里（`{ ... } &` 然后 `exit 0`）。oneshot 服务退出
+时 init 会把整个进程组杀掉，子 shell 还没来得及写第一行就没了。这一版改成**前台顺序
+执行、写完再退**，总共十几行，都是同步 `write()`。
+
+### 28.5 fix68 做了什么
+
+1. **`on post-fs-data` 写一次 `boot_adsp`**（4.70 s，`/firmware` 在 4.688 s 挂好）。
+   这是最早能工作的钩子，留 1.3 s 余量而不是负的。写入是同步的，init 会在
+   `request_firmware()` 里等 ~0.5 s——正好，init 被挡住，audioserver 就起得晚，
+   ADSP 就起得早。
+2. **`kcadsp.sh` 自己重试**：每 2 s 写一次，最多 10 次；每次把
+   `boot #n rc=… state=… up=…` 写进 `/dev/kmsg`，最后再补 `final state`、
+   各子系统状态、`dmesg` 里 `adsp-loader|pil-q6v5-lpass|apr_tal|Q6 Is Up` 的最后 12 行、
+   声卡、slimbus、audioserver 退出次数。
+3. **内核 retry 提前**（`0003`）：第一次 5 s（原来 6 s），间隔 1 s（原来 2 s），
+   60 次（原来 20 次）；DT 的 `adsp-state` 不是 DOWN 时打一行说明，免得"驱动以为
+   已经加载"被当成成功。内核 `#25`。
+4. **脚本每次开机报内核号**：`KCADSP start up=… state=… kernel=#25 expect=#25`。
+   下次 dump 第一眼看这一行——如果 `kernel=` 不是 `#25`，说明 boot 又没刷进去，
+   后面所有现象都别按 fix68 的前提解释。
+
+### 28.6 刷完先确认这两行
+
+```
+adb shell cat /proc/version            # 必须是 #25 SMP PREEMPT ... 19:12:22
+grep -a "KCADSP start" 21_log.img      # kernel=#25 expect=#25
+```
+
+boot 没写进去的表现是：`/proc/version` 还是 `#23`，dump 里没有 `adsp-loader:` 行，
+`KCADSP start` 那行 `kernel=#23`。这种情况下先按 `docs/FLASHING.md` 清写保护再写，
+**中间不要重启**。清的时候给**名字**，不要给 `pN`：
+
+```bash
+echo "autofix boot" > /sys/kernel/kc_wp/run     # boot 是 mmcblk0p9；p11 是 tzbak（见 §6 的订正）
+```
+
+本份日志里 kc_wp 解析出来的就是 `.../by-name/boot`，`start_sect=157696`、复查
+`0054555555555555`、起始 WP 组 `0 -> 0`——也就是说 Android 这边保护已经是干净的，
+问题只可能出在**刷机那一步没有落到 boot 分区**（或者在保护还没清的那一侧写）。
+写之前 `cat /proc/version`，写完立刻再 `cat` 一次并要求看到 `#25`，是最省事的判据。
+
+### 28.7 顺手修掉一个一直存在的隐患：脚本清的是 tzbak，不是 boot
+
+§6 早就订正过 `boot = mmcblk0p9`、`mmcblk0p11` 是 1 MiB 的 tzbak，但
+`tools/flash/wp_fix.sh`、`tools/flash/wpcheck.sh` 和 `docs/FLASHING.md` 里还留着
+`mmcblk0p11`。也就是说：**一旦走这两条脚本清保护，被清掉的是 tzbak，boot 仍然带保护，
+随后写进去的内核会被静默丢弃**——症状和这次 dump 一模一样。
+
+`kc_wp.ko` 自己是按 by-name 解析的（日志里就是 `.../by-name/boot`、
+`start_sect=157696`），所以问题只在这几个外壳脚本。现在三个地方都改成按名字
+（`recovery boot system`），`wpcheck.sh` 的 `$BOOT` 改成 `mmcblk0p9` 并注明原因。
+
+> 以后任何"刷了没生效"的排查，第一件事都是对 partition 名字而不是编号。

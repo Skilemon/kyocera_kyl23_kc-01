@@ -39,7 +39,7 @@ adb shell "su -c 'readlink -f /dev/block/platform/msm_sdcc.1/by-name/recovery'"
 ### 2. 确认写保护已被清掉
 
 **在 TWRP 里：镜像自己会做。** `kc_wp.ko` 已经打进 `/sbin`，由 stock `init.rc` 的
-`on init` 段 `insmod`，模块起来后 4 秒自己扫一遍 `mmcblk0p12` / `mmcblk0p11`：
+`on init` 段 `insmod`，模块起来后 4 秒自己扫一遍 recovery / boot / system（按 by-name，不按编号）：
 
 ```bash
 adb shell "dmesg | grep kc_wp"
@@ -189,8 +189,8 @@ TWRP 也是被 aboot 拉起来的，aboot 每次上电都会把 boot / recovery�
 除非先把保护清掉。
 
 本仓库产出的镜像**不需要手动做这一步**：`kc_wp.ko` 已经打进 `/sbin`，由 stock `init.rc` 的
-`on init` 段 `insmod`，模块自己起一个 delayed work，4 秒后把 `mmcblk0p12`（recovery）和
-`mmcblk0p11`（boot）扫一遍清掉，失败每 500 ms 重试，最多 15 次。日志进内核缓冲区：
+`on init` 段 `insmod`，模块自己起一个 delayed work，4 秒后把 recovery、boot（**mmcblk0p9**，
+不是 p11——p11 是 1 MiB 的 tzbak）和 system 扫一遍清掉，失败每 500 ms 重试，最多 15 次。日志进内核缓冲区：
 
 ```bash
 # TWRP 终端里，确认自清跑过
@@ -201,7 +201,7 @@ dmesg | grep kc_wp
 需要手动补一刀时（比如换了分区、自清没赶上）：
 
 ```bash
-echo "autofix mmcblk0p12 mmcblk0p11" > /sys/kernel/kc_wp/run   # 清保护
+echo "autofix recovery boot" > /sys/kernel/kc_wp/run   # 清保护，给名字最稳
 echo "info"                          > /sys/kernel/kc_wp/run   # 看 EXT_CSD 的 WP 组状态
 ```
 

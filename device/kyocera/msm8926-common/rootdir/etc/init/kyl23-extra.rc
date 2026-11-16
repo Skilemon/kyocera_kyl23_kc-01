@@ -445,23 +445,37 @@ service kcssr /vendor/bin/kcssr.sh
 #
 #     write /sys/kernel/boot_adsp/boot 1
 #
-# Copying that line here (fix66) changed nothing: on this port early-boot fires
-# at 5.99 s, because /firmware is only mounted at 4.7 s and post-fs-data eats
-# the second that follows, and init starts audioserver at 6.14 s.  There is no
-# init stage early enough to win that race, and the write itself blocks in
-# pil_boot()/request_firmware() for as long as the load takes, which stalls
-# everything queued behind early-boot.
+# Two measured facts, and one correction of what this file said in fix66/67:
 #
-# fix67 moves the trigger into the kernel: the adsp-loader driver retries
-# subsystem_get("adsp") from a delayed workqueue (first attempt at 6 s, then
-# every 2 s, 20 tries) and logs each attempt.  Nothing in init writes
-# /sys/kernel/boot_adsp/boot any more - one driver, one log line per attempt,
-# no stage to be too late for.
+#   1. The trigger has to happen before init starts audioserver, which is at
+#      6.06 s (class_start main).  pil_boot() then takes ~0.5 s (load 5.516 ->
+#      "Q6 Is Up" 6.020 in the boot that worked), so anything later than ~5.5 s
+#      loses the race.
+#   2. early-boot is *after* post-fs-data, i.e. 5.99 s here, and it lost: fix66
+#      wrote there and the log shows no pil_boot() at all (no "loading from",
+#      no "Q6/ADSP image is loaded").  post-fs-data starts at 4.70 s, half a
+#      second after /firmware -- where adsp.mdt lives -- is mounted at 4.688,
+#      so that is the earliest hook that can work, and it leaves ~1.3 s of
+#      margin instead of -0.1 s.
 #
-# kcadsp is now an observer: it records the ADSP state by name over the first
-# 20 s and mirrors the interesting dmesg lines into the kernel log, so the log
-# partition dump carries them (/cache does not survive the dump, which keeps
-# only the first 20 MB of that filesystem).
+# The write is synchronous: init blocks in request_firmware() for the ~0.5 s
+# the load takes.  That is the point -- init is blocked, so audioserver starts
+# later, while the ADSP comes up earlier.
+#
+# If this ever hangs the boot instead (no /firmware, corrupt blob), the log
+# will stop right after "on post-fs-data" and the fix is to drop that line and
+# let the kernel retry (kernel-patches/0003, first attempt 5 s, every 1 s, 60
+# tries) do it alone.  The two are safe together: subsystem_get() is
+# refcounted and adsp_loader_do() returns early once the ADSP is up.
+#
+# The line itself is the first action of the post-fs-data section further down.
+
+# kcadsp is the retry and the witness.  The kernel retry in
+# kernel-patches/0003 only exists in a kernel that was actually flashed; this
+# script has to work on whatever kernel the device is running, so it keeps
+# asking for the boot itself (every 2 s, up to 20 s) and records every attempt
+# and the final state into /dev/kmsg -- the only sink that survives a dump,
+# because the log partition gets 20 MB of a 120 MB /cache.
 service kcadsp /vendor/bin/kcadsp.sh
     class core
     user root
@@ -601,6 +615,11 @@ service kcbtnled /vendor/bin/kcbtnled
 # to bring up /storage/emulated/0, otherwise /sdcard stays empty forever.
 # ---------------------------------------------------------------------------
 on post-fs-data
+    # See the long note above the kcadsp service: this is the earliest hook
+    # that can work (4.70 s, right after /firmware is mounted at 4.688), and it
+    # blocks for the ~0.5 s the load takes, which is exactly what we want.
+    write /sys/kernel/boot_adsp/boot 1
+
     # This file is parsed from /system/etc/init, which init only reads once
     # /system is mounted -- that happens *after* the "init" trigger, so an
     # on-init export here would never run.  post-fs-data is the last trigger

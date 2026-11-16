@@ -28,7 +28,7 @@ IMG=${IMG:-/sdcard/twrp-kyl23-wp6.img}
 [ -f "$IMG" ] || IMG=/sdcard/twrp-kyl23-wp5.img
 KO=${KO:-/sdcard/kc_wp.ko}
 DEV=/dev/block/mmcblk0p12
-BOOT=/dev/block/mmcblk0p11
+BOOT=/dev/block/mmcblk0p9   # p11 是 tzbak（1 MiB），不是 boot
 MAGIC=4b4357504f4b3031
 
 say() { echo; echo "===== $* ====="; }
@@ -64,9 +64,9 @@ fi
 echo "新模块已加载"
 dmesg | tail -6
 
-say "2 清理 p12 / p11"
-for p in mmcblk0p12 mmcblk0p11; do
-    if [ -e /dev/block/$p ]; then
+say "2 清理 recovery / boot"
+for p in recovery boot; do
+    if [ -e /dev/block/platform/msm_sdcc.1/by-name/$p ]; then
         echo "--- autofix $p"
         printf 'autofix %s' "$p" > /sys/kernel/kc_wp/run
         sleep 1
@@ -96,7 +96,7 @@ if [ "$got" != "$MAGIC" ]; then
     dmesg | grep kc_wp | tail -50
     echo
     echo "把上面 autofix 的 基线 / 复查 两行、以及 EXT_CSD 发回来。"
-    echo "（p11 没动，recovery 还是现在这个能进的版本）"
+    echo "（boot 没动，recovery 还是现在这个能进的版本）"
     exit 2
 fi
 
