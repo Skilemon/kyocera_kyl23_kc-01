@@ -72,8 +72,11 @@ make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- \
 `3.4.0 SMP preempt mod_unload modversions ARMv7`，而写保护仍然要靠它（见 §12.6）。
 内核 release 差一个字符，`insmod` 就报 `version magic ... should be ...`。
 
-产物 `arch/arm/boot/zImage`，5,730,752 B，MD5 `3d87f8d8c7a3153be3064c2560fa3a98`
-（原厂 5,808,608 B / `40aada0058c8b0aadd00f5a5bc75166a`）。
+产物 `arch/arm/boot/zImage`，当前这一版 5,734,352 B，MD5
+`521ea557784950bea9841326326e44b0`（源码树刚编出来的第一版是 5,730,752 B /
+`3d87f8d8c7a3153be3064c2560fa3a98`；原厂 5,808,608 B /
+`40aada0058c8b0aadd00f5a5bc75166a`）。尺寸和 MD5 每加一条补丁都会变，认版本看
+`prebuilt/kernel` 的 MD5 而不是这张表。
 
 原厂那套工具链是 gcc 4.8 era，直接拿 gcc 13 编会死在十几个点上，改动见 patch。
 
@@ -153,12 +156,53 @@ Makefile 里没有 `ccflags-y`。发布包像是漏了一批 `-I`，共 12 个�
 `.config` 打开 `CONFIG_DEBUG_SECTION_MISMATCH=y`（仅用于看报告）。
 `CONFIG_SECURITY_SELINUX_KC` 保持 `=y` —— 钩子函数还在，只是空实现。
 
+## 补丁 0002：把 finit_module(2) 补回 3.4（ARM 379 号）
+
+`0002-arm-add-finit-module-syscall-379.patch`，三个文件，102 行。
+
+`finit_module` 是 3.8 加的：Android 6.0 起 `libhardware_legacy` 的 `insmod()` 不再
+fork `insmod(8)`，而是
+
+```c
+syscall(__NR_finit_module, fd, args, 0);
+```
+
+ARM 上 `__NR_finit_module` 是 379，这棵 3.4 树的编号表到 377 为止，于是每次调用
+都被 `cmp scno, #NR_syscalls` 挡掉、返回 `ENOSYS`。框架的日志是
+`finit_module for ".../pronto_wlan.ko" failed: Function not implemented`，
+随后 `WifiStateMachine` 放弃并卸掉 kcwifi 事先加载的模块（DEVICE_NOTES 23.3）。
+
+改动：
+
+| 文件 | 改动 |
+|---|---|
+| `arch/arm/include/asm/unistd.h` | `__NR_finit_module = __NR_SYSCALL_BASE + 379`（378 留给 3.5 的 `kcmp`） |
+| `arch/arm/kernel/calls.S` | 378 → `sys_ni_syscall`，379 → `sys_finit_module`；`NR_syscalls` 随之从 378 变成 380 |
+| `kernel/module.c` | 新 syscall 实现，另加 `#include <linux/file.h>`（`fget`/`fput` 在那里） |
+
+实现上跟上游 3.8 有两点不同，都是为了这棵树：
+
+1. **不用 mmap。** 这棵树的 `load_module()` 要的是一个能 `copy_from_user()` 的
+   用户指针，而不是 3.8 的"loader 自己 mmap 文件"。所以把整个文件读进 vmalloc，
+   抬 `KERNEL_DS` 再交给 `sys_init_module()`——跟当年 `insmod(8)` 拿 mmap 指针
+   调用 `init_module(2)` 是一回事。代价是每次加载多拷一份 2 MB 的模块。
+2. **`-EEXIST` 报成功。** `kcwifi` 在开机时先 `insmod` 一次让 wlan0 起来，
+   框架随后再加载同一个文件；"已经在了"正是调用方想要的状态，报错反而会让
+   Android 把接口拆掉。
+
+`flags` 必须是 0：`MODULE_INIT_IGNORE_VERMAGIC` 会让不匹配的内核也能装模块，
+而这套移植之所以重编内核，就是因为 vermagic 必须和原厂预编译模块一致。
+
 ## 复核方法
 
 ```sh
 python3 tools/image/check_image.py twrp-kyl23.img --max-size 16777216 --max-fonts 1
 arm-linux-gnueabi-nm vmlinux | grep selinux_kernel_setup_load_info
 arm-linux-gnueabi-objdump -d --start-address=0xc02ff124 --stop-address=0xc02ff12c vmlinux
+
+# 379 号真的进了表：sys_call_table[379] 应该等于 sys_finit_module 的地址
+arm-linux-gnueabi-nm vmlinux | grep -E "sys_call_table|sys_finit_module|sys_ni_syscall"
+arm-linux-gnueabi-objdump -s -j .data vmlinux | grep -A2 "c0105a44"
 ```
 
 ## 下一步

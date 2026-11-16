@@ -1,0 +1,143 @@
+diff --git a/arch/arm/include/asm/unistd.h b/arch/arm/include/asm/unistd.h
+index 512cd147..5f22e59a 100644
+--- a/arch/arm/include/asm/unistd.h
++++ b/arch/arm/include/asm/unistd.h
+@@ -404,6 +404,8 @@
+ #define __NR_setns			(__NR_SYSCALL_BASE+375)
+ #define __NR_process_vm_readv		(__NR_SYSCALL_BASE+376)
+ #define __NR_process_vm_writev		(__NR_SYSCALL_BASE+377)
++					/* 378 is kcmp, which arrived in 3.5 */
++#define __NR_finit_module		(__NR_SYSCALL_BASE+379)
+ 
+ /*
+  * The following SWIs are ARM private.
+diff --git a/arch/arm/kernel/calls.S b/arch/arm/kernel/calls.S
+index 463ff4a0..c004fcf6 100644
+--- a/arch/arm/kernel/calls.S
++++ b/arch/arm/kernel/calls.S
+@@ -387,6 +387,8 @@
+ /* 375 */	CALL(sys_setns)
+ 		CALL(sys_process_vm_readv)
+ 		CALL(sys_process_vm_writev)
++/* 378 */	CALL(sys_ni_syscall)		/* reserved for kcmp, 3.5 */
++		CALL(sys_finit_module)
+ #ifndef syscalls_counted
+ .equ syscalls_padding, ((NR_syscalls + 3) & ~3) - NR_syscalls
+ #define syscalls_counted
+diff --git a/kernel/module.c b/kernel/module.c
+index 0e1fd29a..7cfd9d0a 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -25,6 +25,7 @@
+ #include <linux/init.h>
+ #include <linux/kallsyms.h>
+ #include <linux/fs.h>
++#include <linux/file.h>
+ #include <linux/sysfs.h>
+ #include <linux/kernel.h>
+ #include <linux/slab.h>
+@@ -3098,6 +3099,104 @@ SYSCALL_DEFINE3(init_module, void __user *, umod,
+ 	return 0;
+ }
+ 
++/*
++ * finit_module(2): load a module straight from a file descriptor.
++ *
++ * Added in 3.8 as ARM syscall 379; this is the 3.4 backport.  Android's Wi-Fi
++ * HAL stopped going through insmod(8) in 6.0 -- libhardware_legacy's insmod()
++ * is
++ *
++ *     syscall(__NR_finit_module, fd, args, 0);
++ *
++ * so without an entry in sys_call_table every attempt returns ENOSYS, which
++ * the framework logs as
++ *
++ *     finit_module for "/vendor/lib/modules/pronto/pronto_wlan.ko" failed:
++ *     Function not implemented
++ *
++ * and then unloads whatever the early-boot helper had already loaded.
++ *
++ * Upstream has the loader mmap the file and read it in place.  This tree's
++ * load_module() instead insists on a user pointer it can copy_from_user()
++ * from, so read the file into vmalloc and pass that with KERNEL_DS raised,
++ * which is exactly how the old sys_init_module() path treated an mmap'ed
++ * image.  One extra copy of a 2 MB module, once per boot.
++ *
++ * Two deliberate departures from upstream:
++ *
++ *  - flags must be zero.  MODULE_INIT_IGNORE_VERMAGIC would let a module
++ *    built against a different kernel load, and the reason this kernel is
++ *    rebuilt from Kyocera's GPL tree at all is that vermagic has to match the
++ *    stock prebuilts (mmc_protect.ko, kc_wp.ko); nothing on this device
++ *    passes either flag.
++ *
++ *  - -EEXIST is reported as success.  /vendor/bin/kcwifi insmods "wlan"
++ *    during early boot so the driver is up before the framework asks, and the
++ *    framework then loads the same file again.  "Already loaded" is the state
++ *    the caller asked for; returning -EEXIST makes WifiStateMachine tear the
++ *    interface back down.
++ */
++SYSCALL_DEFINE3(finit_module, int, fd, const char __user *, uargs, int, flags)
++{
++	struct file *fp;
++	struct inode *inode;
++	mm_segment_t old_fs;
++	char *buf;
++	unsigned long size;
++	long err;
++
++	if (flags != 0)
++		return -EINVAL;
++
++	if (!capable(CAP_SYS_MODULE) || modules_disabled)
++		return -EPERM;
++
++	fp = fget(fd);
++	if (!fp)
++		return -EBADF;
++
++	inode = fp->f_path.dentry->d_inode;
++	size = inode ? i_size_read(inode) : 0;
++	if (size == 0 || size > 64UL * 1024 * 1024) {
++		err = -EINVAL;
++		goto out_fput;
++	}
++
++	buf = vmalloc(size);
++	if (!buf) {
++		err = -ENOMEM;
++		goto out_fput;
++	}
++
++	err = kernel_read(fp, 0, buf, size);
++	fput(fp);
++	fp = NULL;
++
++	if (err != (long)size) {
++		if (err >= 0)
++			err = -EIO;
++		goto out_free;
++	}
++
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
++	err = sys_init_module((void __user *)buf, size, uargs);
++	set_fs(old_fs);
++
++	if (err == -EEXIST) {
++		pr_info("%s: module already loaded, reporting success\n",
++			__func__);
++		err = 0;
++	}
++
++out_free:
++	vfree(buf);
++out_fput:
++	if (fp)
++		fput(fp);
++	return err;
++}
++
+ static inline int within(unsigned long addr, void *start, unsigned long size)
+ {
+ 	return ((void *)addr >= start && (void *)addr < start + size);

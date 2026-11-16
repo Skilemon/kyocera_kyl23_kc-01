@@ -2936,7 +2936,7 @@ ret = syscall(__NR_finit_module, fd, args, 0);
 3. **让 `kcwifi` 成为唯一加载者**：关掉框架的加载路径。7.1 的 `wifi.c` 没有留开关，
    实际做不到。
 
-现状：未修，等内核改动排期。
+现状：已按第一条走，见第 24 节（fix64 内核）。
 
 ### 23.4 教训
 
@@ -2991,3 +2991,76 @@ static const clockid_t CLOCK_ID_ALARM = CLOCK_BOOTTIME_ALARM;
 
 同时 fix63 镜像里两份 `bluetooth.default.so`（`/lib/hw` 和 `/vendor/lib/hw`）已经
 按 fix56 改好，md5 `4ee10c46…`，可以立刻刷。
+
+## 24. WiFi 的第二件事：把 finit_module 补进 3.4 内核
+
+23.3 列的第三条路（"等内核改动排期"）就是现在这一条：给 3.4 加 syscall 379。
+
+### 24.1 为什么必须在内核里补
+
+框架那一侧的调用改不了。7.1 的 `libhardware_legacy.so` 里只有
+
+```c
+ret = syscall(__NR_finit_module, fd, args, 0);
+```
+
+`syscall()` 是个转发器：它把编号塞进 r7 直接 `svc 0`，不查任何符号表。所以
+`libkccabi.so` 里那个 `finit_module`（`mov r0, #0; bx lr`）从来没被调用过——
+它能骗过的只有 `dlsym()`，骗不过 `svc`。内核没有 379 号入口，
+`cmp scno, #NR_syscalls` 就把这次调用变成 `-ENOSYS`，logcat 里是
+`Function not implemented`。
+
+`NR_syscalls` 是 `calls.S` 里数出来的（每条 `CALL()` 加一），所以补入口要同时改
+三处：编号表、调用表、实现。编号用 379 而不是"下一个空位"，是因为 bionic 的
+`__NR_finit_module` 写死 379；378 是 3.5 的 `kcmp`，这棵树没有，放 `sys_ni_syscall`
+占位，免得以后有人把 378 当成 finit_module。
+
+### 24.2 实现要点
+
+上游 3.8 是让 loader 自己 `mmap` 文件；这棵树的 `load_module()` 签名是
+`(void __user *umod, unsigned long len, const char __user *uargs)`，内部
+`copy_and_check()` 先 `copy_from_user()` 一整份到 vmalloc。所以这里反过来做：
+先把文件读进内核缓冲，抬 `KERNEL_DS`，再调 `sys_init_module()`——和当年
+`insmod(8)` 拿着 mmap 出来的指针调 `init_module(2)` 完全等价。
+
+两个刻意的偏离：
+
+- **`flags` 必须是 0。** `MODULE_INIT_IGNORE_VERMAGIC` 会让 vermagic 不匹配的模块
+  也装进来；这套移植重编内核的前提就是 vermagic 要和原厂 `mmc_protect.ko`、
+  `kc_wp.ko` 对得上（见 kernel-patches/README），这个口子不能开。
+- **`-EEXIST` 当成功。** `kcwifi` 开机先 insmod 一次把 wlan0 拉起来，框架随后
+  再加载同一个文件。同名模块已经在那里，正是调用方想要的状态；照上游返回
+  `-EEXIST`，`WifiStateMachine` 会认为加载失败并把接口拆掉。
+
+### 24.3 验证（不用刷机就能确认一半）
+
+`sys_call_table[379]` 必须等于 `sys_finit_module`：
+
+```
+c0105a44 T sys_call_table
+c01d6198 T sys_finit_module
+377 0xc023af60  sys_process_vm_writev
+378 0xc01a834c  sys_ni_syscall
+379 0xc01d6198  sys_finit_module      <- 对上了
+```
+
+`strings vmlinux | grep "3.4.0 SMP preempt"` 仍是
+`3.4.0 SMP preempt mod_unload modversions ARMv7`，和原厂预编译模块的 vermagic
+逐字相同，`pronto_wlan.ko`、`kc_wp.ko` 都不需要重编。
+
+镜像：`prebuilt/kernel` 换成这一版（5,734,352 B，md5 `521ea557…`），
+`boot-fix64.img` 由 `boot-fix58.img` 的 ramdisk + QCDT + cmdline 原样重封，
+只换 kernel 和头里的 SHA1（8,431,616 B）。
+
+### 24.4 刷完该看到什么
+
+驱动加载这一步应该从
+
+```
+D WifiHW  : finit_module for ".../pronto_wlan.ko" failed: Function not implemented
+E WifiStateMachine: Failed to load driver
+```
+
+变成没有这两行：`wifi_load_driver()` 拿到 0，`wlan.driver.status` 置 `ok`，
+接着是 supplicant 起来、扫描出列表。如果还有别的失败，那至少是**下一层**的
+问题（firmware、MAC、supplicant 控制口），不再是 syscall 缺失。
