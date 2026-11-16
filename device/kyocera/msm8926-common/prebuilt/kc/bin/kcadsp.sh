@@ -252,7 +252,11 @@ A=$(adspdev)
     # is the 7.1 build, which reads avail_min at offset 36 and silence_size at
     # 32 -- i.e. past the end of the caller's struct -- and every pcm_open()
     # then dies in SNDRV_PCM_IOCTL_SW_PARAMS with EINVAL.
-    echo "tinyalsa: $(wc -c </lib/libtinyalsa.so 2>/dev/null) bytes (13580 = matches this HAL, 26420 = 7.1 ABI, breaks every pcm_open)"
+    tl=
+    for f in /system/lib/libtinyalsa.so /lib/libtinyalsa.so; do
+        [ -r "$f" ] && tl=$(wc -c <"$f" 2>/dev/null) && break
+    done
+    echo "tinyalsa: ${tl:-?} bytes (13580 = matches this HAL, 26420 = 7.1 ABI, breaks every pcm_open)"
 
     sec pcm
     for p in /proc/asound/card*/pcm*p/sub*/status; do

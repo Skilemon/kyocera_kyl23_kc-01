@@ -4056,3 +4056,60 @@ tinyalsa: 13580 bytes (matches this HAL, 26420 = 7.1 ABI, breaks every pcm_open)
 * 若 `RUNNING` 但没声，问题就落到 mixer/codec 这一段（`deep-buffer-playback` 的
   `SLIM_0_RX`、`RX1/2/3 MIX`、`SPK` 增益），那时候再抓 `dumpsys media.audio_flinger`
   里的 thread 和 `AudioMixer` 就够了 —— 报告里已经在放音瞬间拍了一份。
+
+## 35. 声音（七）：fix74 实测出声，链路全通
+
+刷 fix74 后，同样的操作（开机等 2 分钟 → 放 20 秒），`kcaudio.txt.ev` 里出现了
+三段时间不短的 `RUNNING`：
+
+```
+ 84.07 | adsp=ONLINE usb=CONFIGURED adbd=running audio=510 pcm=card0/pcm0p/sub0=RUNNING
+ 89.35 | ... pcm=none
+123.97 | ... pcm=card0/pcm0p/sub0=RUNNING
+151.15 | ... pcm=none
+160.80 | ... pcm=card0/pcm0p/sub0=RUNNING
+167.01 | ... pcm=none
+```
+
+放音瞬间拍到的 `hw_params` 就是 §34 推算的那组参数，一个不差：
+
+```
+access: RW_INTERLEAVED   format: S16_LE   channels: 2
+rate: 48000 (48000/1)    period_size: 960   buffer_size: 3840
+```
+
+也就是 KitKat HAL 的 `pcm_config_deep_buffer`（960×4）终于被内核接受了 —— 7.1 那个库
+读出来的 `silence_size=240` 已经不存在。其他可以对照的：
+
+* `grep -c 'cannot set sw params'` = **0**（fix73 那一轮是 1445）；
+* `start_output_stream: exit` 正常返回，`out_standby` 正常收尾；
+* `Normal mixer raw underrun counters: partial=0 empty=0` —— 一次欠载都没有，
+  说明送数节奏是健康的，不是"能开但喂不上"；
+* 音源设备 `devices(0x2)` = speaker，前台是 `com.cyanogenmod.eleven`。
+
+§33/§34 那条链到此闭合：ADSP 起来（§30）→ HAL 能开 PCM（§34）→ 出声（本节）。
+
+### 35.1 报告里那行金丝雀写错了路径
+
+fix75 起改成先试 `/system/lib/libtinyalsa.so` 再试 `/lib/libtinyalsa.so`：
+
+```
+/vendor/bin/kcadsp.sh[279]: can't open /lib/libtinyalsa.so: No such file or directory
+tinyalsa:  bytes (13580 = ...)
+```
+
+设备上 system 挂在 `/system`，脚本里少了这个前缀。只是报告文本，不影响任何行为。
+
+### 35.2 顺带解释：这次 `usb:` 行是 `func=adb` 而不是 `mtp,adb`
+
+不是回退。logcat 里两次设置都在：
+
+```
+09:04:26.479  UsbDeviceManager: Setting USB config to adb
+09:05:03.899  UsbDeviceManager: Setting USB config to mtp,adb
+```
+
+报告写在 63.9 s（约 09:04:5x），正好落在两句之间，框架还没把 MTP 加回去；
+`kcadsp.sh` 看到 `state=CONFIGURED` 就"leaving it alone"，不再插手。
+再过半分钟 `sys.usb.config` 自己会变成 `mtp,adb`。两条路（我们写 / 框架写）都通，
+先到先得，不冲突。
