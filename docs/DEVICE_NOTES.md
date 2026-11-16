@@ -3064,3 +3064,132 @@ E WifiStateMachine: Failed to load driver
 变成没有这两行：`wifi_load_driver()` 拿到 0，`wlan.driver.status` 置 `ok`，
 接着是 supplicant 起来、扫描出列表。如果还有别的失败，那至少是**下一层**的
 问题（firmware、MAC、supplicant 控制口），不再是 syscall 缺失。
+
+## 25. audioserver 每五秒崩一次：libkccabi 的 list_* 参数顺序反了
+
+刷上能开机、WiFi 和蓝牙都正常的版本之后，手机开机就烫、整机卡。这一次
+不是显示也不是无线，是音频。
+
+### 25.1 现场
+
+`cache` 里的 logcat，同一次开机：
+
+```
+10:12:46.830 F/libc (  493): Fatal signal 11 (SIGSEGV), code 1, fault addr 0x0 in tid 1021 (AudioOut_D)
+10:12:48.193 F/libc ( 3397): Fatal signal 11 ... tid 3410 (AudioOut_D)
+10:12:52.381 F/libc ( 3473): Fatal signal 11 ... tid 3486 (AudioOut_D)
+10:12:57.213 F/libc ( 3607): Fatal signal 11 ... tid 3623 (AudioOut_D)
+   ... 每五秒一次，pid 一路往上加
+```
+
+pid 一直变大，说明每次都是新起的 audioserver，崩了被 init 拉回来，再崩。
+后果是连锁的：
+
+```
+E/ActivityManager: ANR in com.android.settings
+E/ActivityManager:   Reason: Input dispatching timed out (... Wait queue head age: 12643.5ms.)
+E/ActivityManager: Load: 15.87 / 5.03 / 1.77
+E/ActivityManager:   87% 518/sh: 5.5% user + 81% kernel
+E/ActivityManager:   86% 423/sh: 5% user + 81% kernel
+W/AudioService: Long monitor contention ... setStreamVolumeIndex ... for 34.292s
+```
+
+四核机器 load 15.87、两个核被吃满、AudioService 的锁一持有就是 34 秒——
+点什么都慢，电池跟着掉。烫是 CPU 跑出来的，不是电池或充电。
+
+### 25.2 崩在哪
+
+诊断内核（#20）留下的 `USRFLT` 记录把地址钉死了：
+
+```
+USRFLT pc b6430380 in libkccabi.so off=00000380
+```
+
+`libkccabi.so` 的 `list_add_tail` 只有 5 条指令（0x378 起），0x380 是其中
+第三条：
+
+```
+0378: ldr  r3, [r0, #4]     ; r3 = head->prev
+037c: stm  r1, {r0, r3}     ; item->next = head; item->prev = head->prev
+0380: str  r1, [r3]         ; head->prev->next = item   <-- fault addr 0x0
+0384: str  r1, [r0, #4]     ; head->prev = item
+```
+
+`r3` 是 0。按这个顺序，`r3` 来自 `head->prev`，而 `head` 是 r1。调用点
+（`audio.primary.msm8226.so` 0x4470）是：
+
+```
+4438: bl   calloc              ; r0 = calloc(1, 12) -> r6，一个全新的 listnode + 4 字节数据
+4464: add  r0, r4, #248        ; r0 = ctx + 0xf8
+4468: mov  r1, r6              ; r1 = calloc 出来的
+4470: bl   list_add_tail
+```
+
+r0 是 ctx 里那个长命的链表头，r1 是刚 calloc 出来的项。`calloc` 的
+`prev` 当然是 0——**如果实现把 r1 当 head 来读，就必然空指针**。
+
+### 25.3 为什么反了
+
+4.4 和 7.1 的这个 API 同名、同结构体，参数顺序相反：
+
+```c
+/* android-4.4.4_r1 libcutils/list.c —— 头在前 */
+void list_add_tail(struct listnode *head, struct listnode *item)
+{
+    item->next = head;
+    item->prev = head->prev;
+    head->prev->next = item;
+    head->prev = item;
+}
+
+/* android-7.1 cutils/list.h —— 变成 inline，而且项在前 */
+static inline void list_add_tail(struct listnode *node, struct listnode *head)
+```
+
+4.4 的 blob 编译时看到的是前者，所以 r0 = 头、r1 = 项；libkccabi 是照着
+7.1 的原型写的（r0 = 项、r1 = 头），寄存器全反。`list_add_head` 一样反。
+`list_init` 和 `list_remove` 只有一项参数，没这个问题。
+
+这也是为什么它只崩音频：`audio.primary.msm8226.so` 是镜像里唯一还引用
+`list_add_tail` 的 4.4 blob（另一个引用者是 libkccabi 自己）。
+
+### 25.4 修法
+
+参数的角色在库内部交换，两个函数各自还是 20 字节，原地改，文件大小、符号
+表、其他函数一律不动：
+
+```
+list_add_tail(head=r0, item=r1)
+0378: ldr  r3, [r0, #4]     ; r3 = head->prev
+037c: stm  r1, {r0, r3}     ; item->next = head; item->prev = head->prev
+0380: str  r1, [r3]         ; head->prev->next = item
+0384: str  r1, [r0, #4]     ; head->prev = item
+
+list_add_head(head=r0, item=r1)
+038c: ldr  r3, [r0]         ; head->next
+0390: str  r3, [r1]         ; item->next = head->next
+0394: str  r0, [r1, #4]     ; item->prev = head
+0398: str  r1, [r3, #4]     ; head->next->prev = item
+039c: str  r1, [r0]         ; head->next = item
+```
+
+`tools/blobs/fix_kccabi_list.py` 做这件事，幂等，`--check` 只检查不写。
+`libkccabi.so`（现在 preload 的那个，5972 B，改后 md5 `d639f118…`）和
+`libkcabi.so`（早期的同名库，5680 B，今天没人加载，一并改掉免得以后踩）。
+
+### 25.5 刷完该看到什么
+
+`Fatal signal 11 ... (AudioOut_D)` 应该一条都没有，audioserver 的 pid
+稳定不变，`Load:` 回到个位数。
+
+**声音仍然要另说**：同一次开机里还有
+
+```
+subsys0 name=adsp state=OFFLINE
+init: Service 'adsprpcd' (pid 550) exited with status 255
+APR: Wrong parameters      (每五秒一次，跟着 audioserver 的重启周期)
+```
+
+ADSP 没起来，音频 DSP 用不了，HAL 出不了声。崩是因为链表被踩坏，不出声是
+因为 DSP 不在——两件事。把崩止住，系统先恢复可用；ADSP 的 PIL 加载是下一个
+独立问题。
