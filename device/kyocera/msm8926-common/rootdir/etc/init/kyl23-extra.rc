@@ -660,24 +660,22 @@ service kcbtnled /vendor/bin/kcbtnled
     group root system input
 
 # ---------------------------------------------------------------------------
-# Hold the button backlight at 0 while the camera probes.
+# Hold the button backlight at 0 across the boot animation, and record what
+# somebody else writes to it.
 #
-# In this DT the button backlight and the camera's autofocus power are the same
-# line: msm8926-qrd-skug.dtsi binds gpio-leds to <&msmgpio 34 0>, and
-# msm8226-camera-sensor-qrd.dtsi lists the same 34 as CAM_AF_PWDM for the
-# ov12830.  Camera power-up and power-down therefore blink the keys -- twice,
-# one per sensor -- right around the time qcamerasvr starts at 6.2 s, which is
-# what "the keys flash just before the boot animation" is.
+# Section 36.4 blamed this on a DT collision (gpio-leds on GPIO 34 vs the
+# camera's CAM_AF_PWDM).  That was wrong, and the dump that disproved it is
+# simply the boot image's own DTB: it has no gpio-leds node at all --
+# qcom,leds@a100 is "okay" and the button backlight is PMIC MPP2 with
+# default-state off, exactly as the factory built it.  So the flashing is
+# software writing brightness, and the writers are kcbtnled and the framework's
+# lights HAL.
 #
-# The factory DT has no gpio-leds node at all: its button backlight is PMIC
-# MPP2 (qcom,led_mpp_2 in qcom,leds@a100).  Restoring that means rebuilding the
-# boot image; until then this service holds the node down and records every
-# value it had to correct, so the next dump says whether the camera was really
-# the one driving it.  See kcledguard.sh.
+# Started from post-fs-data rather than class core, because class core runs at
+# ~7 s and the flash is over by then.  See kcledguard.sh for what it records.
 # ---------------------------------------------------------------------------
 service kcledguard /vendor/bin/kcledguard.sh
     seclabel u:r:init:s0
-    class core
     user root
     group root system
     oneshot
@@ -795,6 +793,12 @@ on post-fs-data
     # never run at all -- which is exactly what happened to kcssr in fix23.
     start kcssr
     start kcadsp
+
+    # Before class core starts kcbtnled.  The keys flash in the window that
+    # opens here (~4.3 s), not after the boot animation, so the guard has to
+    # own the node first; it then holds it at 0 for four minutes and writes a
+    # timestamped line for every value it had to undo.
+    start kcledguard
 
     # /cache is where every one of these scripts leaves its transcript, and
     # the bluetooth process (uid 1002) needs to be able to write next to it.

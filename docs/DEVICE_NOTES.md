@@ -4295,3 +4295,154 @@ KLEDGUARD done uptime 126.4 corrected=2 v=0
 flash 不闪了；如果日志里出现 `caught`，36.4 这段就得到证实，下一轮直接按"方案一"改 DT；
 如果一行都没有，说明闪的不是这个节点，那就再查（比如 LK 阶段遗留电平或 `wled`）。
 代价：开机两分钟内按触摸键不会点亮按键灯，两分钟后服务退出，`kcbtnled` 照旧接管。
+
+## 37. fix75 验收：r_submix 干净了，adsprpcd 自己好了，麦克风查到了断点
+
+### 37.1 已解决的两件
+
+**r_submix**：整份 logcat 里 `r_submix` 出现 **0 次**（fix74 是每次开机四行
+`couldn't load audio hw module` / `error -22`）。删声明这条路是对的。
+
+**adsprpcd**：这一轮它是**活的**，报告里写着：
+
+```
+adsprpc: svc=running nodes=/dev/adsprpc-smd  last=[]
+```
+
+它照样打 `apps_std fopen failed: ./oemconfig.so`、`rfsa/adsp/voiceproc_tx.so`
+之类的 E 行（那是 ADSP 侧没有 factory 测试库，不是失败），但进程一直在跑。
+所以"退 255"这条暂时不用再抓日志了；等哪天又挂，`last=[...]` 会第一时间说出来。
+
+### 37.2 §36.4 撤回：DT 是原厂的，根本没有 gpio-leds
+
+把 boot 镜像里的 QCDT 拆开看（8 个 DTB，board-id `08 00` 与 `08 02` 两族），
+**每一个** 都是 `qcom,leds@a100 { status = "okay" }`，按键背光是 PMIC MPP2
+（`qcom,led_mpp_2`, `linux,name="button-backlight"`, `default-state="off"`），
+`grep gpio-leds` 全部为 0 命中。
+
+也就是说 boot 里的 DT 一直是原厂那份（我们换的是 zImage，DTB 原样保留），
+`msm8926-qrd-skug.dtsi` 里那个 GPIO 34 的 gpio-leds 节点**从未进过这台机器**。
+§36.4 把源码树里的一套 DT 当成了设备上的 DT，结论作废。
+
+所以"闪两下"是**软件写 brightness**，这个 ROM 里只有两个写者：`kcbtnled`
+（启动时 level=255、timeout=5000，即开机点灯 5 秒）和框架的 lights HAL
+（下一节说，它是坏的）。至于是不是它俩，fix76 让 `kcledguard` 用 20 ms 的
+时间分辨率把每一次跳变记下来，下一份 dump 直接看时间点。
+
+### 37.3 麦克风：不是录音参数，是 APM 开机时连输入流都打不开
+
+`kclogcat` 里第一次录音尝试（09:42:00，44100/mono/PCM16）：
+
+```
+E AudioRecord: Could not get audio input for session 33, record source 1 ...
+E AudioRecord-JNI: Error creating AudioRecord instance: initialization check failed with status -22.
+E APM::AudioPolicyEngine: getDeviceForInputSource() no default device defined
+W APM_AudioPolicyManager: getInputForAttr() could not find device for source 1
+```
+
+但真正的原因在开机第 3 秒就写下来了：
+
+```
+V audio_hw_primary: adev_open_input_stream: enter
+W APM_AudioPolicyManager: Cannot open input stream for device 80000004 on hw module primary
+W APM_AudioPolicyManager: Input device 80000004 unreachable     (BUILTIN_MIC)
+W APM_AudioPolicyManager: Input device 80000080 unreachable     (BACK_MIC)
+W APM_AudioPolicyManager: Input device 80000040 unreachable     (VOICE_CALL)
+```
+
+7.1 的 APM 在 `initialize()` 里对**每个输入 profile 打开一次输入流**，成功才把
+该设备标记为 attached（`AudioPolicyManager.cpp`，`openInput(... AUDIO_SOURCE_MIC ...)`
+那一段）；失败就打 `Cannot open input stream`，随后 `Input device ... unreachable`
+把它从表里删掉。于是 Engine 没有任何输入设备，任何 `AudioRecord` 都拿不到 device，
+回归 -22。也就是说：**不是录音参数不对，是这台机器的输入通路在 APM 眼里根本不存在。**
+
+HAL 只打了 `enter`，没有 `exit`、没有 `ALOGE`。对照 KitKat 的 QCOM HAL 源码，这正是
+`check_input_parameters()` 的分支：
+
+```c
+ALOGV("%s: enter", __func__);
+*stream_in = NULL;
+if (check_input_parameters(config->sample_rate, config->format, channel_count) != 0)
+        return -EINVAL;                      /* 静默返回，什么也不打 */
+```
+
+它只接受 `PCM_16_BIT`、1/2/6 声道、8k/11.025k/12k/16k/22.05k/24k/32k/44.1k/48k。
+APM 传进去的是 profile 的"默认配置"，而 `/etc/audio_policy.conf` 的输入段是原厂的
+原文（`channel_masks ...MONO|STEREO|FRONT_BACK|5POINT1`，`formats` 里还有
+AMR/QCELP/EVRC 一串）。4.4 的 APM 取默认配置的方式和 7.1 不同，7.1 取到的
+组合落在这三类之外，HAL 就静默 EINVAL 了。
+
+下一份 dump 里 fix76 新增了 `===== mic =====` 段：`dumpsys media.audio_policy`
+里与 input 相关的行、以及 logcat 里所有 `AudioRecord/open_input/getInputForAttr`，
+那时就能看到 APM 究竟把哪一组参数递给了 HAL。**在此之前不动 `audio_policy.conf`**：
+它是原厂原文，4.4 上能用，盲改只会把已经能用的输出也带歪。
+
+### 37.4 光线/距离传感器：内核侧是全好的，断在 HAL 与框架之间
+
+内核日志（`21_log.img`，每一场开机都一样）：
+
+```
+1.315 [ALS_PS]sfh7776_probe regulator min_uV = 2800000 ...
+1.324 input: light as /devices/virtual/input/input6
+1.325 input: proximity as /devices/virtual/input/input7
+6.101 KCBOOT misc=[... psals_sensor ...]
+```
+
+驱动 probe 成功、两个 input 设备注册成功、sysfs 属性组建在
+`/sys/class/input/input6|7/`（`enable_als_sensor`、`als_poll_delay`、`als_ratio`、
+`enable_ps_sensor`、`ps_crosstalk`）。所以 DT、i2c、供电、中断都没问题。
+
+问题在 userspace：`/vendor/lib/hw/sensors.default.so` 是**原厂 KitKat 的预编译**
+（38192 字节，与原厂 system.img 逐字节相同）。而 7.1 的 `SensorService` 按
+**68 字节**一步走 `sensor_t` 数组，KitKat 的 `sensor_t` 只有 **36 字节**
+（`name/vendor/version/handle/type/maxRange/resolution/power/minDelay` 九项）。
+5.0 起加进来的 `fifoReservedEventCount/fifoMaxEventCount/stringType/
+requiredPermission/maxDelay/flags/reserved[2]` 在原厂那份里不存在。
+
+这和 §34（KitKat HAL + 7.1 libtinyalsa）、§36.1（KitKat HAL + 7.1 libnbaio）是
+同一族错误，只是这次坏在传感器。另一个旁证：`SensorService` 的构造函数从
+18.21 s 卡到 41.20 s（23 秒），才吐出 "thread starting"。
+
+修法只有两条：写一个 7.1 的 sensors HAL（把这台机器的 input 事件翻译成
+`sensor_t`/`sensors_event_t`），或者写一个 shim 去 dlopen 原厂那支、把 36 字节
+的结构体按 68 字节重新排布后转发。两条都要先确认一件事：`dumpsys sensorservice`
+现在到底列出了几个传感器、名字是不是乱码。fix76 的报告里加了 `===== sensors =====`
+段（HAL 字节数、input6/7 的名字与属性、`dumpsys sensorservice` 前 30 行），
+下一份 dump 就能定案，然后按定案写 HAL。
+
+### 37.5 顺带发现：`lights.default.so` 自己就没加载成功
+
+```
+E HAL: load: module=/vendor/lib/hw/lights.default.so
+E HAL: dlopen failed: cannot locate symbol "write" referenced by "/system/vendor/lib/hw/lights.default.so"
+```
+
+这支 6356 字节的模块是"KYL23 sysfs lights"（早期手写的那支），`readelf -d` 显示
+它**没有 DT_NEEDED**：`write/open/close/strcmp` 全是未定义，却没有任何依赖库声明，
+所以 bionic 找不到 `write`。后果是 `LightsService` 起不来 —— 屏幕亮度调节、
+通知灯都归它管。于是"自动亮度不工作"其实是两个独立故障叠在一起：光线传感器没数据
+（37.4），亮度这条路本身也断着。修它要重编这支 .so（链接时补上 libc.so），
+和 37.4 的 HAL 一起做。
+
+### 37.6 SELinux 域告警：我们自己的 10 个已消，剩下 15 个在 ramdisk
+
+fix75 给 `kcadsp kcbtnled kcdiag kcdiag2 kchalt kcshut kcssr kcstate kctail kcwifi`
+补了 `seclabel u:r:init:s0`，这十个不再报。剩下的 `adsprpcd bootanim irsc_util
+mpdecision netmgrd qcamerasvr qmuxd qseecomd rfs_access rmt_storage time_daemon uimd`
+定义在 **ramdisk 的 init.qcom.rc / init.rc** 里，改它们要重打 boot 镜像
+（QCDT + ramdisk，1.4 MB cpio.gz）。当前是 permissive，init 用继承域照样把它们跑起来，
+所以只是日志噪音。这一轮不动 boot：为了几行日志去冒一次刷 boot 的风险不划算，
+等 37.4/37.5 那批 userspace 的活干完，若还需要动 boot（比如换 DT），一起做。
+
+### 37.7 fix76 改了什么
+
+* `kcledguard` 由 `class core` 改成 `post-fs-data` 里显式 `start`（class core 在
+  4.3 s 之后，闪已经过去了），前 45 s 每 20 ms 采一次，之后 200 ms 到四分钟，
+  **每一次跳变**记一行到 `/data/local/tmp/kc_led.log` + `/cache/kc_led.log` +
+  `KLEDGUARD`（kmsg），并把非 0 写回 0；
+* `kcadsp` 报告新增三段：`sensors`（HAL 字节数、input6/7 名字与属性、
+  `dumpsys sensorservice` 前 30 行）、`mic`（`dumpsys media.audio_policy` 的
+  input 行、logcat 里的录音尝试、capture 节点）、`led`（`/sys/class/leds` 全表、
+  按键与屏幕亮度、guard 日志）；
+* 上一轮那行金丝雀的路径已修（`/system/lib/libtinyalsa.so` 优先），这份 dump 里
+  已经打出 `tinyalsa: 13580 bytes`。

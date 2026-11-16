@@ -1,57 +1,83 @@
 #!/system/bin/sh
 #
-# kcledguard.sh -- hold the button backlight at 0 while the camera probes.
+# kcledguard.sh -- hold the button backlight at 0 across the boot animation,
+# and write down every value that somebody else tried to set.
 #
-# The double blink just before the boot animation is a DT collision, not a
-# userspace race:
+# Why: with fix74/75 the keys flash twice in the second or two before the boot
+# animation.  The first guess (section 36.4) was a DT collision -- a gpio-leds
+# node on GPIO 34 fighting the camera's CAM_AF_PWDM -- and that guess is wrong.
+# The boot image's own DTB has no gpio-leds node at all: qcom,leds@a100 is
+# "okay" and the button backlight is PMIC MPP2 (qcom,led_mpp_2,
+# linux,name="button-backlight", default-state off), exactly like the factory
+# build.  So the flashing comes from software writing brightness, not from the
+# camera driving a shared line, and there are only three writers in this ROM:
+# kcbtnled (our daemon, level 255 for 5 s at start), the framework's lights HAL
+# (dead: lights.default.so fails to load, see section 37), and the kernel's
+# default-state.
 #
-#   msm8926-qrd-skug.dtsi   gpio-leds { keypad-backlight { gpios = <&msmgpio 34 0> } }
-#   msm8226-camera-sensor-qrd.dtsi
-#                           qcom,camera@6c { gpios = <... 34>; qcom,gpio-af-pwdm = <4>; }
-#                           qcom,gpio-req-tbl-label = ... "CAM_AF_PWDM"
+# This cannot say *who* wrote, so it records when: a timestamped line per
+# transition, at 20 ms resolution through the boot window, in three places
+# (/data/local/tmp survives to the next boot; /cache is dumped; kmsg is the
+# one that survives a crash).  The next dump then says whether the flash is
+# kcbtnled's 5 s light, two short writes from somewhere else, or the panel
+# backlight rather than the keys.
 #
-# Both claim GPIO 34.  The camera's power sequence drives it whenever
-# qcamerasvr brings a sensor up or down, and the LED -- which is wired to that
-# same line in this DT -- follows: two sensors, two blinks.  The factory build
-# does not do this because its button backlight is PMIC MPP2
-# (qcom,led_mpp_2 under qcom,leds@a100, linux,name = "button-backlight",
-# default-state off) and the qrd gpio-leds node does not exist there.
-#
-# Putting the DT back the factory way means rebuilding the boot image, so until
-# that happens this holds the node at 0 through the window in which the camera
-# probes.  It also writes down every value it had to correct, which is what
-# proves or disproves the paragraph above: after fix75 a dump either has
-# KLEDGUARD lines (camera was driving the line) or none (something else is).
-#
-# What this costs: for the first two minutes, touching the keys will not light
-# them.  After that the service exits and kcbtnled owns the node again.
+# It also holds the node at 0 the whole time, so the flash is not visible in
+# the meantime.  Cost: for the first four minutes touching the keys does not
+# light them; after that this exits and kcbtnled owns the node again.
 #
 B=/sys/class/leds/button-backlight/brightness
-L=/cache/kc_led.log
+L1=/data/local/tmp/kc_led.log
+L2=/cache/kc_led.log
 
 say() {
-    echo "$*" >> $L 2>/dev/null
+    for f in $L1 $L2; do echo "$*" >> $f 2>/dev/null; done
     echo "KLEDGUARD $*" > /dev/kmsg 2>/dev/null
 }
 
-[ -e "$B" ] || { say "no $B -- nothing to guard"; exit 0; }
+now() { cut -d' ' -f1 /proc/uptime 2>/dev/null; }
 
-say "start uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null) v=$(cat $B 2>/dev/null)"
-
-# 120 s at 100 ms.  The camera is up by 6.2 s and its retries are done well
-# before a minute; the rest of the window is margin for a slow boot.
+# /system is mounted by now but the LED class device appears when qpnp probes,
+# which is ~1 s into the kernel boot -- long before init gets here.  Still, wait
+# rather than give up: "no node at this instant" is not "no node".
 i=0
+while [ ! -e "$B" ] && [ "$i" -lt 600 ]; do
+    sleep 0.05
+    i=$((i + 1))
+done
+[ -e "$B" ] || { say "no $B after 30 s"; exit 0; }
+
+echo 0 >"$B" 2>/dev/null
+prev=$(cat "$B" 2>/dev/null)
+say "start t=$(now) v=$prev"
+
+# 45 s at 20 ms (the boot animation window), then 200 ms until four minutes.
+# Two loops rather than one with a variable sleep: this shell has no
+# sub-second arithmetic worth trusting.
 n=0
-while [ "$i" -lt 1200 ]; do
-    v=$(cat $B 2>/dev/null)
+i=0
+while [ "$i" -lt 2250 ]; do
+    v=$(cat "$B" 2>/dev/null)
     if [ -n "$v" ] && [ "$v" != "0" ]; then
         n=$((n + 1))
-        # Only the first few, so a stuck line cannot fill the kernel ring.
-        [ "$n" -le 8 ] && say "caught v=$v at $(cut -d' ' -f1 /proc/uptime 2>/dev/null) cam=$(pidof qcamerasvr 2>/dev/null) mm=$(pidof mm-qcamera-daemon 2>/dev/null)"
-        echo 0 > $B 2>/dev/null
+        [ "$n" -le 20 ] && [ "$v" != "$prev" ] && say "caught v=$v t=$(now) cam=$(pidof qcamerasvr 2>/dev/null) btn=$(pidof kcbtnled 2>/dev/null)"
+        echo 0 >"$B" 2>/dev/null
+        prev=0
     fi
     i=$((i + 1))
-    sleep 0.1
+    sleep 0.02
 done
 
-say "done uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null) corrected=$n v=$(cat $B 2>/dev/null)"
+i=0
+while [ "$i" -lt 585 ]; do
+    v=$(cat "$B" 2>/dev/null)
+    if [ -n "$v" ] && [ "$v" != "0" ]; then
+        n=$((n + 1))
+        [ "$n" -le 20 ] && say "caught v=$v t=$(now) (slow phase)"
+        echo 0 >"$B" 2>/dev/null
+    fi
+    i=$((i + 1))
+    sleep 0.2
+done
+
+say "done t=$(now) corrected=$n v=$(cat "$B" 2>/dev/null)"

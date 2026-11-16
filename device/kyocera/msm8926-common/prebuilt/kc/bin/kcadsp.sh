@@ -258,6 +258,46 @@ A=$(adspdev)
     done
     echo "tinyalsa: ${tl:-?} bytes (13580 = matches this HAL, 26420 = 7.1 ABI, breaks every pcm_open)"
 
+    sec sensors
+    # The kernel half of this is not in doubt: sfh7776 probes at 1.87 s and
+    # registers input6 "light" and input7 "proximity" (the dmesg lines are in
+    # the earlier "input:" listing).  What is in doubt is the bridge to the
+    # framework.  /vendor/lib/hw/sensors.default.so is the factory KitKat
+    # build, and KitKat's struct sensor_t is 36 bytes while 7.1's SensorService
+    # walks the array in 68-byte strides -- the same cross-era ABI that broke
+    # libtinyalsa (section 34) and MonoPipe (36.1).  This section records the
+    # sizes and whatever SensorService is willing to say about its own list.
+    echo "hal:    $(wc -c </vendor/lib/hw/sensors.default.so 2>/dev/null) bytes (factory 38192 = 36-byte sensor_t, 7.1 reads 68)"
+    for d in /sys/class/input/input*; do
+        [ -r "$d/name" ] || continue
+        n=$(cat "$d/name" 2>/dev/null)
+        case "$n" in
+            light|proximity)
+                echo "$d name=$n"
+                for a in enable_als_sensor als_poll_delay als_ratio enable_ps_sensor ps_crosstalk drvstr; do
+                    [ -r "$d/$a" ] && echo "    $a=$(cat "$d/$a" 2>/dev/null)"
+                done
+                ;;
+            *) echo "$d name=$n" ;;
+        esac
+    done
+    echo "-- sensorservice --"
+    timeout 5 dumpsys sensorservice 2>/dev/null | head -n 30
+
+    sec mic
+    echo "capture: $(ls /proc/asound/card*/pcm*c/sub*/status 2>/dev/null | tr '\n' ' ')"
+    echo "-- audio policy --"
+    timeout 5 dumpsys media.audio_policy 2>/dev/null | grep -Ei 'input|Input' | head -n 25
+    echo "-- record attempts --"
+    grep -Ei 'AudioRecord|open_input|start_input|getInputForAttr|cannot open input|AUDIO_DEVICE_IN' "$LC" 2>/dev/null | tail -n 12
+
+    sec led
+    echo "leds:   $(ls /sys/class/leds 2>/dev/null | tr '\n' ' ')"
+    echo "button: $(cat /sys/class/leds/button-backlight/brightness 2>/dev/null) of $(cat /sys/class/leds/button-backlight/max_brightness 2>/dev/null)"
+    echo "lcd:    $(cat /sys/class/leds/lcd-backlight/brightness 2>/dev/null)"
+    echo "-- kcledguard --"
+    sed 's/^/    /' /data/local/tmp/kc_led.log 2>/dev/null | head -n 20
+
     sec pcm
     for p in /proc/asound/card*/pcm*p/sub*/status; do
         [ -r "$p" ] || continue
