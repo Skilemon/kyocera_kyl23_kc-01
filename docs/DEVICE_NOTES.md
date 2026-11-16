@@ -3610,3 +3610,32 @@ adb shell cat /data/local/tmp/kcaudio.txt
 5. `audioserver start/exit` —— 次数是否还在涨。
 
 前两项就能把"没触发 / 触发被拒 / 起来了但音频栈没接上"三种情况分开，不用再猜。
+
+### 29.6 两条交付通道，选一条就行
+
+报告现在同时写两个地方，哪条通走哪条：
+
+| 通道 | 取什么 | 大小 / 耗时 |
+|---|---|---|
+| adb | `adb pull /data/local/tmp/kcaudio.txt` | 约 10–30 KB，秒级 |
+| 串口 + DL 模式 | `dd` 读 `by-name/log` 整个分区 | 20 MB，251 KB/s 约 83 s |
+
+第二条之所以可行，是因为报告会**逐行以 `<6>KCADSP KCRPT| ` 写进 `/dev/kmsg`**（前 120 行，
+单行截到 190 字符）。这样它落在内核日志里，和 DBGC 槽"保留哪些行"无关——那个环会丢行，
+但我们自己的行是在 dump 前刚刚写进去的。3.4 的 ring 是 128 KB，120 行约 20 KB，占 15%，
+不会把别的刷掉。
+
+**`/cache` 永远不要再传**：480 MB / 251 KB/s 是半小时，而且前 20 MB 连根目录数据块
+（412 MB 处）都不含，`debugfs` 打不开。
+
+判读只看第一段 `=== SUMMARY ===`：
+
+```
+version: Linux version 3.4.0 (...) #25 SMP PREEMPT ...   <- 实际在跑的内核
+adsp:    state=ONLINE dev=... asks=2                     <- 问了几次、最后什么状态
+card:    0 [msm8226-tapan-snd-card] ...                  <- 声卡在不在
+audio:   audioserver start/exit = 1 / 0                  <- 还在不在崩
+logstore: magic=v2.0.0 records=N                         <- 环有没有在跟着本次开机走
+```
+
+`records` 比上一次大，说明环在跟着走；不变就说明这个环根本不记当前开机，那以后只走 adb。

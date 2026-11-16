@@ -1,30 +1,34 @@
 #!/system/bin/sh
 #
-# kcadsp -- ask for the ADSP early, then leave ONE SMALL FILE that says what
-#           happened.  Runs as the kcadsp oneshot service at class_start core,
-#           and can also be run by hand on a live device:
+# kcadsp -- ask for the ADSP early, then leave ONE SMALL REPORT that says what
+#           happened.  Two copies, on purpose:
+#
+#             /data/local/tmp/kcaudio.txt   (pull over adb: a few tens of KB)
+#             /dev/kmsg                     (first 120 lines, so a dump of the
+#                                            20 MB "log" partition carries it)
+#
+#           Runs as the kcadsp oneshot service at class_start core.  It can also
+#           be run by hand on a live device, no flashing needed:
 #
 #               adb push kc_audio.sh /data/local/tmp/
 #               adb shell su -c 'sh /data/local/tmp/kc_audio.sh'
 #               adb shell cat /data/local/tmp/kcaudio.txt
 #
-# Why a file and not the log partition:
+# Why not just read the log partition:
 #
 #   /dev/block/bootdevice/by-name/log is a 20 MB v2.0.0 "DBGC" store with three
-#   fixed slots.  A slot is rewritten whole, the writer keeps only a subset of
-#   the kernel lines (a 640 s session leaves ~1100 of them, out of tens of
-#   thousands), and a slot only appears in a dump once it has been completed --
-#   so the session the device is running right now is usually not in it at all.
-#   "Linux version" is one of the lines that can be dropped.  Verdict: absence
-#   from that partition proves nothing and must never be used to judge the build
-#   that is running.
+#   reused slots.  The writer drops lines (a 640 s session leaves ~1100 of tens
+#   of thousands) and "Linux version" is one of the droppable ones, so absence
+#   of a build string there proves nothing.  That is why the report is pushed
+#   into kmsg with its own KCRPT tag: it does not depend on which lines the
+#   store happened to keep.
 #
-#   This file is a few tens of KB, so it survives a slow link, can be read on
-#   screen, or photographed.  It starts with the kernel that is actually
-#   running, so no conclusion can be built on a build that is not there.
+#   The report starts with the kernel that is actually running, so no
+#   conclusion can be built on a build that is not there.
 
 R1=/data/local/tmp/kcaudio.txt
 R2=/cache/kcaudio.txt
+T=$R1.tmp
 D=/sys/bus/msm_subsys/devices
 B=/sys/kernel/boot_adsp/boot
 K=/dev/kmsg
@@ -36,11 +40,8 @@ sec() { echo; echo "===== $* ====="; }
 kmsg() { printf '<6>KCADSP %s\n' "$*" >>$K 2>/dev/null; }
 st_of() { [ -n "$1" ] && cat "$1/state" 2>/dev/null; }
 
+# ---- body ------------------------------------------------------------------
 {
-    echo "kcadsp report  uptime=$(up)"
-    echo "version: $(cat /proc/version)"
-    echo "cmdline: $(cat /proc/cmdline)"
-
     sec subsys
     for d in $D/subsys*; do
         [ -d "$d" ] || continue
@@ -101,24 +102,44 @@ st_of() { [ -n "$1" ] && cat "$1/state" 2>/dev/null; }
         echo "-- $f ($(wc -c <"$f" 2>/dev/null) bytes) --"
         tail -n 40 "$f" 2>/dev/null | cut -c1-200
     done
+} >"$T" 2>&1
 
-    # ---- is the log store even tracking this boot? -------------------------
-    sec logstore
-    if [ -r "$LOGDEV" ]; then
-        echo "header magic: $(dd if=$LOGDEV bs=1 count=7 2>/dev/null)"
-        echo "record count: $(od -An -tu4 -j 8 -N 4 $LOGDEV 2>/dev/null | tr -d ' ')"
-    else
-        echo "log device not readable"
-    fi
-} >"$R1" 2>&1
+# ---- summary first, so a truncated copy is still useful --------------------
+A=""
+for d in $D/subsys*; do
+    [ -d "$d" ] || continue
+    [ "$(cat $d/name 2>/dev/null)" = adsp ] && A=$d
+done
+lrec=$(od -An -tu4 -j 8 -N 4 "$LOGDEV" 2>/dev/null | tr -d ' ')
+{
+    echo "=== SUMMARY ==="
+    echo "version: $(cat /proc/version)"
+    echo "uptime:  $(up)  android: $(getprop ro.build.version.release 2>/dev/null) $(getprop ro.build.type 2>/dev/null)"
+    echo "adsp:    state=$(st_of "$A") dev=${A:-MISSING} asks=$tries"
+    echo "card:    $(cat /proc/asound/cards 2>/dev/null | tr '\n' '|')"
+    echo "audio:   audioserver start/exit = $(dmesg 2>/dev/null | grep -c "Starting service 'audioserver'") / $(dmesg 2>/dev/null | grep -c "audioserver') exited")"
+    echo "logstore: magic=$(dd if="$LOGDEV" bs=1 count=7 2>/dev/null) records=${lrec:-?}"
+    cat "$T"
+} >"$R1" 2>/dev/null
 
-# a second copy where recovery/DL tooling usually looks first
+rm -f "$T"
+
 if [ -d /cache ]; then
     cp -f "$R1" "$R2" 2>/dev/null && chmod 0644 "$R2" 2>/dev/null
 fi
 chmod 0644 "$R1" 2>/dev/null
 
-kmsg "report $(wc -l <"$R1" 2>/dev/null) lines: $R1"
-kmsg "version=$(cat /proc/version | cut -c1-42) adsp=$(st_of "$A") cards=$(cat /proc/asound/cards 2>/dev/null | tr '\n' ' ')"
+# ---- mirror into kmsg: first 120 lines, that is all a 20 MB dump needs -----
+n=0
+while IFS= read -r l; do
+    n=$((n+1))
+    [ $n -gt 120 ] && { kmsg "KCRPT| ... report truncated, full copy in $R1"; break; }
+    case "$l" in
+        "====="*) kmsg "KCRPT| $l" ;;
+        *)        kmsg "KCRPT| $(printf '%s' "$l" | cut -c1-190)" ;;
+    esac
+done <"$R1"
+
+kmsg "report $(wc -l <"$R1" 2>/dev/null) lines: $R1 (also in kmsg as KCRPT)"
 
 exit 0
