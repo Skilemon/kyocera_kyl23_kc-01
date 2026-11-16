@@ -295,6 +295,13 @@ writereport() {
         echo "card:    $(cat /proc/asound/cards 2>/dev/null | tr '\n' '|')"
         echo "audio:   start/exit = $(dmesg 2>/dev/null | grep -c "Starting service 'audioserver'") / $(dmesg 2>/dev/null | grep -c "audioserver') exited")"
         echo "logstore: magic=$(dd if="$LOGDEV" bs=1 count=7 2>/dev/null) records=${lrec:-?}"
+        # adsprpcd is the factory KitKat daemon started by init.qcom.rc:271.  It
+        # exits 255 within half a second, twice, and then stops being restarted.
+        # Two candidates, and this line tells them apart: the device node it
+        # opens (/dev/adsprpc-smd, a misc device, and this kernel is built with
+        # devtmpfs off so ueventd has to create it) or something inside the
+        # daemon itself.
+        echo "adsprpc: svc=$(getprop init.svc.adsprpcd 2>/dev/null) nodes=$(ls /dev/adsprpc* 2>/dev/null | tr '\n' ' ') last=[$(dmesg 2>/dev/null | grep "Service 'adsprpcd'" | tail -1 | sed 's/^.*\] //')]"
         cat "$T"
         if [ -s "${R1}.ev" ]; then
             sec events

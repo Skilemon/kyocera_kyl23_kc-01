@@ -4113,3 +4113,185 @@ tinyalsa:  bytes (13580 = ...)
 `kcadsp.sh` 看到 `state=CONFIGURED` 就"leaving it alone"，不再插手。
 再过半分钟 `sys.usb.config` 自己会变成 `mtp,adb`。两条路（我们写 / 框架写）都通，
 先到先得，不冲突。
+
+## 36. 三件"小问题"的账，和按键背光的真正来历
+
+### 36.1 `audio.r_submix` 加载失败：又是跨代 ABI，这次方向反过来
+
+```
+E HAL: load: module=/vendor/lib/hw/audio.r_submix.default.so
+E HAL: dlopen failed: cannot locate symbol "_ZN7android8MonoPipeC1Ejjb"
+       referenced by "/system/vendor/lib/hw/audio.r_submix.default.so"
+E AudioFlinger: couldn't load audio hw module audio.r_submix (Invalid argument)
+E AudioFlinger: loadHwModule() error -22 loading module r_submix
+W APM_AudioPolicyManager: could not open HW module r_submix
+```
+
+`_ZN7android8MonoPipeC1Ejjb` 是 `android::MonoPipe::MonoPipe(unsigned int, unsigned int, bool)`
+——**KitKat 的构造函数**。我们镜像里：
+
+| 文件 | 大小 | md5 | 结论 |
+|---|---|---|---|
+| `/vendor/lib/hw/audio.r_submix.default.so` | 17708 | `cfd4caaa…` | 与原厂逐字节相同，**KitKat** |
+| `/lib/libnbaio.so` | 38488 | `f181a1e5…` | **7.1**（原厂是 25708 / `95c66023…`） |
+
+7.1 的 libnbaio 只导出 `_ZN7android8MonoPipeC1EjRKNS_12NBAIO_FormatEb`
+（`MonoPipe(size_t, const NBAIO_Format&, bool)`），成员布局也换成了 `NBAIO_Format`，
+所以不是"缺一个符号"这么简单——KitKat 的 HAL 与 7.1 的 `MonoPipe` 不是同一个类。
+
+与 §34 那次（KitKat HAL + 7.1 libtinyalsa）是同一类错误，只是那次坏在**声音主通路**，
+这次坏在**只在投屏/内录时才用得到的旁路**。libnbaio 不能换回原厂：7.1 的
+`libaudioflinger.so` 依赖 7.1 的 `MonoPipe`/`MonoPipeReader` ABI，换了 AudioFlinger 直接崩。
+要保留 r_submix 就得有一个 7.1 编的 r_submix HAL（AOSP 里它是
+`hardware/libhardware/modules/audio_remote_submix/audio_hw.cpp`，纯软件、与高通无关），
+这需要一整套 bionic/libc++ 头，收益是"录屏内录和 Wi-Fi Display 能出声"——这台机器两样都没有。
+
+fix75 的处理：**把模块声明从 `/etc/audio_policy.conf` 里删掉**，`global_configuration`
+的 `attached_input_devices` 里也去掉 `AUDIO_DEVICE_IN_REMOTE_SUBMIX`。没有声明就不会有
+加载尝试，四行报错消失。HAL 文件仍留在镜像里（`/vendor/lib/hw/audio.r_submix.default.so`），
+将来真要用，换的是那个文件，不是这行配置。
+
+### 36.2 `adsprpcd` 退 255：先给它一副眼睛，再谈原因
+
+`/system/bin/adsprpcd` 是软链，指向原厂 `/vendor/bin/adsprpcd`；服务由 7.1 ramdisk 的
+`init.qcom.rc:271` 定义。dump 里每次开机都是同一副样子：
+
+```
+6.060  init: Service adsprpcd does not have a SELinux domain defined.
+6.061  init: Starting service 'adsprpcd'...
+6.438  init: Service 'adsprpcd' (pid 550) exited with status 255
+11.07  init: Service adsprpcd does not have a SELinux domain defined.
+11.07  init: Starting service 'adsprpcd'...
+```
+
+起来、0.4 秒后退 255、5 秒后再试一次、然后彻底放弃。255 是 `exit(-1)`，也就是
+daemon 自己的 `main()` 走到了失败分支，不是被信号打死，也不是 SELinux 拒（当前是
+permissive，所有 `avc: denied` 都带 `permissive=1`）。
+
+两个候选，目前的数据分不开：
+
+* `/dev/adsprpc-smd` 不存在。内核 `CONFIG_DEVTMPFS=n`，misc 设备注册时不会自己
+  建节点，得靠 ueventd 按 `ueventd.qcom.rc:91` 的 `dev` 段补上；如果注册发生在
+  ueventd coldboot 之后、或者驱动根本没 probe，节点就是空的。
+* daemon 内部失败（比如它要的 `libadsprpc.so` 里某个 ioctl 返回错误）。
+
+所以 fix75 在报告摘要里加了一行，把这两者分开：
+
+```
+adsprpc: svc=stopped nodes=/dev/adsprpc-smd last=[Service 'adsprpcd' (pid 550) exited with status 255]
+```
+
+`nodes=` 为空 → 是节点问题，补 ueventd 规则；`nodes=` 有值但照样 255 → 是 daemon 内部，
+再往下就得给它 `strace`（`/vendor/bin/adsprpcd` 是原厂 KitKat 二进制，跑在这个 7.1 的
+`libc` 上，本身也可能是跨代问题，跟 §34/36.1 同一族）。
+
+### 36.3 `does not have a SELinux domain defined`：不是 kchalt 一个，是二十五个
+
+抓一份完整的开机日志，这条 ERROR 的服务名单是：
+
+```
+adsprpcd bootanim exec2/13(kcbt.sh) exec3(kcfuse.sh) exec4(kcboot) irsc_util
+kcadsp kcbtnled kcdiag kchalt kcshut kcssr kcstate kctail kcwifi
+mpdecision netmgrd qcamerasvr qmuxd qseecomd rfs_access rmt_storage
+time_daemon uimd
+```
+
+连 7.1 ramdisk 自带的 `bootanim`、`mpdecision`、`netmgrd`、`qmuxd` 都在里面。原因不是
+某个 rc 写漏了 `seclabel`，而是 **ramdisk 里的 `sepolicy` 是 7.1 AOSP 的，里面没有这些
+原厂服务的域**（它们来自 KitKat 的 `init.qcom.rc`）。init 在 `seclabel` 为空时打一行
+ERROR，然后用**继承来的 init 域**执行——所以这些服务其实都在跑，`bootanim` 能画、
+`qmuxd` 能起、`kchalt` 能重启，全是照常的。当前 SELinux 是 permissive，没有实际后果，
+只有日志噪音。
+
+fix75 给 10 个自己的服务补了显式域，值和当前实际行为完全一致：
+
+```
+service kcadsp /vendor/bin/kcadsp.sh
+    seclabel u:r:init:s0
+    ...
+```
+
+涉及 `kcadsp kcbtnled kcdiag kcdiag2 kchalt kcshut kcssr kcstate kctail kcwifi`。
+剩下那十几个在 ramdisk 的 rc 里，要改得重打 boot 镜像，留到改 DT（§36.4）那一轮一起做——
+它们的噪音不影响任何功能，不值得单独刷一次机。
+
+### 36.4 按键背光闪两下：GPIO 34 同时是"按键灯"和"相机对焦电源"
+
+这是本轮唯一真正的发现。原厂 DT 和我们的 DT 在这一处**根本不是同一个硬件接法**：
+
+原厂 `boot.img` 的 DTB（`/tmp/d6.dts`，5284 行）：
+
+```
+qcom,leds@a100 {
+    compatible = "qcom,leds-qpnp";
+    label = "mpp";
+    status = "okay";
+    qcom,led_mpp_2 {
+        linux,name = "button-backlight";
+        qcom,default-state = "off";
+        qcom,max-current = <0x28>;
+        qcom,current-setting = <0x05>;
+        qcom,id = <0x06>;
+        qcom,mode = "manual";
+        ...
+```
+
+也就是说：**按键背光是 PMIC 的 MPP2**，默认关。
+
+我们的 `msm8926-qrd-skug.dtsi`（78–83 行）却是：
+
+```
+gpio-leds {
+    keypad-backlight {
+        gpios = <&msmgpio 34 0>;
+        label = "button-backlight";
+        linux,default-trigger = "none";
+    };
+};
+```
+
+同时又在 `&spmi_bus` 里把原厂那个 `qcom,leds@a100` 写成了 `status = "disable"`。
+**这是从 qrd 参考设计搬过来的 gpio-leds 节点，把这台机器的按键灯改到了 GPIO 34 上。**
+
+而 GPIO 34 在 `msm8226-camera-sensor-qrd.dtsi:281` 里属于 ov12830：
+
+```
+gpios = <&msmgpio 26 0>, <&msmgpio 37 0>, <&msmgpio 36 0>,
+        <&msmgpio 22 0>, <&msmgpio 34 0>;
+qcom,gpio-reset   = <1>;
+qcom,gpio-standby = <2>;
+qcom,gpio-vdig    = <3>;
+qcom,gpio-af-pwdm = <4>;          /* ← 第 5 个，就是 GPIO 34 */
+qcom,gpio-req-tbl-label = "CAMIF_MCLK", "CAM_RESET1", "CAM_STANDBY",
+                          "CAM_VDIG", "CAM_AF_PWDM";
+```
+
+相机每次给 sensor 上电/下电，`CAM_AF_PWDM` 就把 34 拉高/拉低一次，按键灯跟着亮/灭。
+**两个 sensor，两次，就是"闪两下"**，时间点在 `qcamerasvr` 启动（6.06–6.16 s）之后、
+开机动画首帧前后——和观察完全对得上。
+
+原厂不会有这个现象：它的按键灯在 PMIC 上，GPIO 34 只归相机。
+
+根治有两条路，都要动 boot 镜像（DT 在 boot 里）：
+
+| 方案 | 改动 | 代价 |
+|---|---|---|
+| 恢复原厂接法 | 删 `gpio-leds` 节点，`qcom,leds@a100` 改回 `okay` | 要验证 MPP2 在本机确实接灯；按键灯从此走 PMIC（原厂行为） |
+| 保住 GPIO 34 | 删掉 `camera@6c` 里的 `CAM_AF_PWDM` 那一项并同步 `req-tbl` | 相机对焦永远没有电（相机本来完全不能用） |
+
+两条都要重打 boot（QCDT 1,290,240 字节，含多个 DTB，顺序和 id 不能错），所以 fix75 先不做。
+
+fix75 做的是**压制 + 取证**：新服务 `kcledguard`（`class core`，比 `qcamerasvr` 早）在
+开机前 120 秒里每 100 ms 读一次 `brightness`，不是 0 就写回 0，并把每一笔改动连同时间、
+`qcamerasvr`/`mm-qcamera-daemon` 的 pid 一起写进 `KLEDGUARD`：
+
+```
+KLEDGUARD start uptime 6.4 v=0
+KLEDGUARD caught v=1 at 6.9 cam=1234 mm=
+KLEDGUARD caught v=1 at 7.3 cam=1234 mm=
+KLEDGUARD done uptime 126.4 corrected=2 v=0
+```
+
+flash 不闪了；如果日志里出现 `caught`，36.4 这段就得到证实，下一轮直接按"方案一"改 DT；
+如果一行都没有，说明闪的不是这个节点，那就再查（比如 LK 阶段遗留电平或 `wled`）。
+代价：开机两分钟内按触摸键不会点亮按键灯，两分钟后服务退出，`kcbtnled` 照旧接管。

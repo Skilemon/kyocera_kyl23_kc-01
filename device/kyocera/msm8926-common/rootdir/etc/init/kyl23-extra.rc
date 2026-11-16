@@ -230,6 +230,7 @@ service rfs_access /vendor/bin/rfs_access
 # up working instead of leaving wifi dead for the session.
 # ---------------------------------------------------------------------------
 service kcwifi /vendor/bin/kcwifi
+    seclabel u:r:init:s0
     class core
     user root
     group root system wifi net_raw
@@ -436,6 +437,7 @@ service kcwifi /vendor/bin/kcwifi
 # ---------------------------------------------------------------------------
 
 service kcssr /vendor/bin/kcssr.sh
+    seclabel u:r:init:s0
     class core
     user root
     group root system
@@ -496,6 +498,7 @@ service kcssr /vendor/bin/kcssr.sh
 # first channel -- and if even that is out of reach, the log partition dump
 # carries the KCRPT lines.
 service kcadsp /vendor/bin/kcadsp.sh
+    seclabel u:r:init:s0
     class core
     user root
     group root system
@@ -651,9 +654,33 @@ service p2p_supplicant /system/bin/wpa_supplicant \
 # can never again be confused with "the log was written past the dump window".
 # ---------------------------------------------------------------------------
 service kcbtnled /vendor/bin/kcbtnled
+    seclabel u:r:init:s0
     class core
     user root
     group root system input
+
+# ---------------------------------------------------------------------------
+# Hold the button backlight at 0 while the camera probes.
+#
+# In this DT the button backlight and the camera's autofocus power are the same
+# line: msm8926-qrd-skug.dtsi binds gpio-leds to <&msmgpio 34 0>, and
+# msm8226-camera-sensor-qrd.dtsi lists the same 34 as CAM_AF_PWDM for the
+# ov12830.  Camera power-up and power-down therefore blink the keys -- twice,
+# one per sensor -- right around the time qcamerasvr starts at 6.2 s, which is
+# what "the keys flash just before the boot animation" is.
+#
+# The factory DT has no gpio-leds node at all: its button backlight is PMIC
+# MPP2 (qcom,led_mpp_2 in qcom,leds@a100).  Restoring that means rebuilding the
+# boot image; until then this service holds the node down and records every
+# value it had to correct, so the next dump says whether the camera was really
+# the one driving it.  See kcledguard.sh.
+# ---------------------------------------------------------------------------
+service kcledguard /vendor/bin/kcledguard.sh
+    seclabel u:r:init:s0
+    class core
+    user root
+    group root system
+    oneshot
 
 # ---------------------------------------------------------------------------
 # /dev/fuse does not exist: the kernel has FUSE built in (no uevent) and the
@@ -687,6 +714,7 @@ on post-fs-data
     chmod 0755 /vendor/bin/kcwifi /vendor/bin/kcboot /vendor/bin/kcbtnled
     chmod 0755 /vendor/bin/kcfuse.sh /vendor/bin/kcssr.sh /vendor/bin/kcadsp.sh
     chmod 0755 /vendor/bin/kctail.sh /vendor/bin/kcshut.sh /vendor/bin/kchalt.sh
+    chmod 0755 /vendor/bin/kcledguard.sh
     chmod 0755 /vendor/bin/kcstate.sh /vendor/bin/kcstate-boot.sh
     chmod 0755 /vendor/bin/kcstate-delay.sh /vendor/bin/kc_bootanim.sh
     chmod 0755 /vendor/bin/kccam.sh /system/etc/kcfix.sh
@@ -792,11 +820,13 @@ on post-fs-data
 # before a freeze always survive.  See kctail.sh.
 # ---------------------------------------------------------------------------
 service kctail /vendor/bin/kctail.sh
+    seclabel u:r:init:s0
     class late_start
     user root
     group root system log
 
 service kcshut /vendor/bin/kcshut.sh
+    seclabel u:r:init:s0
     class late_start
     user root
     group root system
@@ -822,6 +852,7 @@ service kcshut /vendor/bin/kcshut.sh
 # sys.powerctl the framework is about to write, which is exactly what kchalt
 # has to see.  As a service it runs beside init and the property goes through.
 service kchalt /vendor/bin/kchalt.sh
+    seclabel u:r:init:s0
     class late_start
     user root
     group root system
@@ -832,6 +863,7 @@ on property:sys.shutdown.requested=*
     start kchalt
 
 service kcstate /vendor/bin/kcstate-boot.sh
+    seclabel u:r:init:s0
     class late_start
     user root
     group root system
@@ -847,12 +879,14 @@ service kcstate /vendor/bin/kcstate-boot.sh
 # done, so the LED/UIO/storage state can be compared.
 # ---------------------------------------------------------------------------
 service kcdiag /vendor/bin/kcboot diag
+    seclabel u:r:init:s0
     class core
     user root
     group root system
     oneshot
 
 service kcdiag2 /vendor/bin/kcboot diag2
+    seclabel u:r:init:s0
     class late_start
     user root
     group root system
