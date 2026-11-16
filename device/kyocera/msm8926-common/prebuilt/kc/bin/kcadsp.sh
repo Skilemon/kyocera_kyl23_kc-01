@@ -2,12 +2,16 @@
 #
 # kcadsp -- the one thing that runs as root on this device without adb.
 #
-# It does three jobs, in this order, and none of them needs a terminal, a
+# It does four jobs, in this order, and none of them needs a terminal, a
 # mounted /data from a host, or USB:
 #
-#   1. bring USB up itself (the framework never manages it on this port);
+#   1. bring USB up itself (the framework never manages it on this port, and
+#      the gadget refuses to enable until iSerial is written -- see below);
 #   2. leave a small report where any file manager can read it;
-#   3. keep sampling for ten minutes so a sound played *later* is recorded.
+#   3. keep sampling once a second, so a sound played *later* is recorded at
+#      the transition, not two seconds after it;
+#   4. when playback finally starts, take one deep snapshot of AudioFlinger
+#      while the stream is live -- that is the only moment it is true.
 #
 # Where the report goes -- all three, because only one of them may be reachable:
 #
@@ -23,14 +27,28 @@
 # The KCRPT lines do not care which lines the store kept, but a *fresh* dump of
 # it only contains the session before last, so the file is the primary channel.
 #
-# USB: this kernel's android gadget has f_adb (/dev/android_adb) and f_mtp, and
-# the adbd in the ramdisk knows both /dev/android_adb and /dev/usb-ffs/adb/ep0,
-# so adb is reachable -- but only if somebody sets "functions".  init.qcom.rc
-# has stanzas for every value the framework can write, and the framework writes
-# "mtp" (persist.sys.usb.config in default.prop).  If that stanza ever fails --
-# or the value in /data is something with no stanza at all, e.g. "none" -- the
-# gadget stays disabled and the phone looks like it is charging from a wall
-# charger.  So: try mtp,adb, then adb, then mtp, and record what each one did.
+# USB, and the reason "the phone does nothing at all when plugged in":
+#
+#   The gadget is never enabled.  Not "enabled with the wrong functions" --
+#   enable stays 0, so the D+ pull-up is off and the host sees nothing, not even
+#   an unknown device.  android.c:2724 explains it:
+#
+#       if (strcmp(serial_string,"0123456789ABCDEF")) {
+#               ... android_enable(dev); dev->enabled = true;
+#       } else {
+#               android_connect_flag = 1;          <- enable_store(1) is a no-op
+#       }
+#
+#   serial_string is "0123456789ABCDEF" (android.c:3031) until somebody writes
+#   iSerial, and nothing in *our* ramdisk does.  The factory ramdisk started
+#   /vendor/bin/usb_init from init.rc:676 for exactly that; we replaced init.rc
+#   with 7.1's, which has no such service, and init.kyocera.usb.rc (which the
+#   binary needs, it is what applies the composition) went with it.
+#
+#   So: write iSerial first, then enable.  Any non-default string works; the
+#   eMMC CID gives one that is stable across flashes and unique per device.
+#   After that the three compositions below are the ones the stock rc had, and
+#   the property path (init.qcom.rc stanzas) works again too.
 
 R1=/data/media/0/kcaudio.txt
 [ -d /data/media/0 ] || R1=/data/local/tmp/kcaudio.txt
@@ -44,6 +62,7 @@ B=/sys/kernel/boot_adsp/boot
 AUST=/sys/class/android_usb/android0
 K=/dev/kmsg
 PIDF=/data/local/tmp/kcaudio.pid
+LC=/data/local/tmp/kclogcat.txt
 LOGDEV=/dev/block/bootdevice/by-name/log
 [ -e "$LOGDEV" ] || LOGDEV=/dev/block/platform/msm_sdcc.1/by-name/log
 
@@ -100,6 +119,30 @@ while [ $i -lt 30 ]; do
 done
 
 # ---- 3. USB --------------------------------------------------------------
+# The serial first.  Without it nothing below can work, and the failure is
+# completely silent: enable_store(1) returns success, the pull-up never comes
+# on, and the host has nothing to enumerate.
+kcusb_serial() {
+    s=$(getprop ro.serialno 2>/dev/null)
+    case "$s" in
+        ""|0123456789ABCDEF) ;;
+        *) echo "$s"; return ;;
+    esac
+    c=$(cat /sys/block/mmcblk0/device/cid 2>/dev/null | tr -cd '0-9a-f')
+    if [ ${#c} -ge 12 ]; then
+        echo "KC$(printf '%s' "$c" | cut -c1-14)"
+        return
+    fi
+    echo "KYL23KC00000001"
+}
+SER=$(kcusb_serial)
+echo "$SER" >"$AUST/iSerial" 2>"$U"
+SER_RB=$(cat "$AUST/iSerial" 2>/dev/null)
+echo 0482 >"$AUST/idVendor" 2>/dev/null
+echo 0a27 >"$AUST/idProduct" 2>/dev/null
+# Both properties, or the framework puts "mtp" back two seconds later.
+setprop persist.sys.usb.config mtp,adb 2>/dev/null
+
 usbtry() {
     f=$1
     echo 0 >"$AUST/enable" 2>/dev/null
@@ -118,9 +161,26 @@ usbtry() {
     return 1
 }
 
+# Last resort, and the order the kernel actually wants: enable_store(1) sets
+# android_connect_flag when the serial is still the default, and *then* a
+# serial_store() call does the android_enable() it skipped (android.c:2888).
+usbviaen() {
+    f=$1
+    echo "$f" >"$AUST/functions" 2>/dev/null
+    echo 1 >"$AUST/enable" 2>/dev/null
+    echo "$SER" >"$AUST/iSerial" 2>/dev/null
+    sleep 3
+    echo "  via iSerial($f): $(usbsnap) svc.adbd=$(getprop init.svc.adbd 2>/dev/null)"
+    case "$(cat "$AUST/state" 2>/dev/null)" in
+        CONFIGURED|CONNECTED) return 0 ;;
+    esac
+    return 1
+}
+
 {
     sec usb
     echo "initial: $USB0"
+    echo "serial:  ro.serialno='$(getprop ro.serialno 2>/dev/null)' wrote='$SER' readback='$SER_RB'"
     echo "props:   sys.usb.config=$(getprop sys.usb.config 2>/dev/null) sys.usb.state=$(getprop sys.usb.state 2>/dev/null) persist=$(getprop persist.sys.usb.config 2>/dev/null) configfs=$(getprop sys.usb.configfs 2>/dev/null)"
     echo "nodes:   $(ls /dev/android_adb* 2>/dev/null | tr '\n' ' ')"
     echo "udc:     $(ls /sys/class/udc 2>/dev/null | tr '\n' ' ')"
@@ -130,8 +190,19 @@ usbtry() {
         echo "already CONFIGURED, leaving it alone"
     else
         echo "-- bring-up --"
-        usbtry "mtp,adb" 0482 0a27 || usbtry "adb" 18d1 4ee7 || usbtry "mtp" 0482 0a28
+        setprop sys.usb.config mtp,adb 2>/dev/null
+        sleep 2
+        echo "  prop path: $(usbsnap)"
+        case "$(cat "$AUST/state" 2>/dev/null)" in
+            CONFIGURED|CONNECTED) ;;
+            *) usbtry "mtp,adb" 0482 0a27 ||
+               usbtry "adb" 18d1 4ee7 ||
+               usbtry "mtp" 0482 0a28 ||
+               usbviaen "mtp,adb" ||
+               usbviaen "mtp" ;;
+        esac
         echo "after:   $(usbsnap)"
+        echo "enable now $(cat "$AUST/enable" 2>/dev/null) (1 = pull-up on, host will see it when the cable is in)"
     fi
     if [ -e /dev/android_adb ]; then
         case "$(getprop init.svc.adbd 2>/dev/null)" in
@@ -141,7 +212,7 @@ usbtry() {
         esac
     fi
     echo "-- dmesg usb --"
-    dmesg 2>/dev/null | grep -Ei 'android_usb|msm_otg|msm_hsusb|udc|usb_bam|android_work' | tail -n 25
+    dmesg 2>/dev/null | grep -Ei 'android_usb|msm_otg|msm_hsusb|udc|usb_bam|android_work|enable_store' | tail -n 25
 } >"$UB" 2>&1
 
 # ---- 4. the report -------------------------------------------------------
@@ -186,9 +257,18 @@ A=$(adspdev)
     dmesg 2>/dev/null | grep -Ei 'msm_pcm|msm-dai|afe_|adm_|asm_|dapm' | tail -n 20
 
     sec logcat_audio
-    logcat -d -v brief -t 400 2>/dev/null |
-        grep -Ei 'audioflinger|audiopolicy|audio_hw|audiohal|tapan|adm_|asm_|afe_|usb' |
-        tail -n 40
+    # kclogcat (a service in kyl23-extra.rc) has been writing every buffer to
+    # disk since boot_completed, so this is the *live* stream, not the tail of
+    # a buffer that has already wrapped.  Fall back to logcat -d if it is not
+    # there -- that is the fix72 behaviour, and it only ever showed the boot.
+    if [ -s "$LC" ]; then
+        echo "from $LC ($(wc -l <"$LC" 2>/dev/null) lines)"
+        grep -Ei 'audioflinger|audiopolicy|audio_hw|audiohal|tapan|adm_|asm_|afe_|MediaPlayer|AudioTrack|NuPlayer|OMX' "$LC" 2>/dev/null | tail -n 80
+    else
+        logcat -d -v brief -t 400 2>/dev/null |
+            grep -Ei 'audioflinger|audiopolicy|audio_hw|audiohal|tapan|adm_|asm_|afe_|usb' |
+            tail -n 40
+    fi
 } >"$T" 2>&1
 
 writereport() {
@@ -200,6 +280,7 @@ writereport() {
         echo "adsp:    state=$(st_of "$A") dev=${A:-MISSING} asks=$asks"
         echo "usb0:    $USB0"
         echo "usb:     $(usbsnap) adbdev=$([ -e /dev/android_adb ] && echo yes || echo no) svc.adbd=$(getprop init.svc.adbd 2>/dev/null)"
+        echo "serial:  '$(cat $AUST/iSerial 2>/dev/null)' (ro.serialno='$(getprop ro.serialno 2>/dev/null)')"
         echo "card:    $(cat /proc/asound/cards 2>/dev/null | tr '\n' '|')"
         echo "audio:   start/exit = $(dmesg 2>/dev/null | grep -c "Starting service 'audioserver'") / $(dmesg 2>/dev/null | grep -c "audioserver') exited")"
         echo "logstore: magic=$(dd if="$LOGDEV" bs=1 count=7 2>/dev/null) records=${lrec:-?}"
@@ -227,43 +308,102 @@ while IFS= read -r l; do
     kmsg "KCRPT| $(printf '%s' "$l" | cut -c1-180)"
 done <"$R1"
 
-# ---- 6. sample for thirty minutes ------------------------------------------
-# Something has to be running at the moment a sound is played, or the PCM
-# status is always "closed".  Thirty minutes, because the useful test is
-# "boot it, play something, reboot" and nobody does that in two minutes.  Every change is appended to the report and sent
-# to kmsg as KCEVT, so a dump taken after a reboot still shows the shape.
+# ---- 6. sample once a second, and go deep when playback starts -------------
+# The fix72 run sampled every 2 s and recorded this for a 20-second playback:
+#
+#     136.37 | ... pcm= card0/pcm0p/sub0=OPEN
+#     139.75 | ... pcm=none
+#
+# i.e. the output was opened, sat in "open", and closed again 3.4 s later.  It
+# never reached PREPARED or RUNNING, so nothing was ever handed to the PCM ring
+# -- but a 2 s sampler can only say "we did not see it", not "it never
+# happened", and it cannot say why.  So: 1 s, and the moment a node goes busy,
+# one snapshot of AudioFlinger taken *while the stream is live*, which is the
+# only time its per-track state means anything.
+#
+# The PCM state names come straight from ALSA: open -> setup -> prepared ->
+# running -> draining -> closed.  A music track that is actually playing sits
+# in RUNNING; one that failed to start is stuck in open/prepared or goes
+# straight back to closed.
 snap() {
-    s=none
-    for d in $D/subsys*; do
-        [ -d "$d" ] || continue
-        [ "$(cat $d/name 2>/dev/null)" = adsp ] && s=$(cat "$d/state" 2>/dev/null)
-    done
-    p=
-    for f in /proc/asound/card*/pcm*p/sub*/status; do
-        [ -r "$f" ] || continue
-        x=$(sed -n 's/^state[[:space:]]*:[[:space:]]*//p' "$f" 2>/dev/null | head -1)
-        [ -n "$x" ] && [ "$x" != closed ] &&
-            p="$p $(printf '%s' "$f" | sed 's#/proc/asound/##; s#/status$##')=$x"
-    done
+    s=$(cat "$A/state" 2>/dev/null)
+    p=$(grep -s '^state' /proc/asound/card*/pcm*p/sub*/status 2>/dev/null |
+        grep -v 'closed$' |
+        sed 's#^/proc/asound/##; s#/status:state[[:space:]]*:[[:space:]]*#=#; s#^state[[:space:]]*:[[:space:]]*#?=#' |
+        tr '\n' ' ')
     echo "adsp=$s usb=$(cat "$AUST/state" 2>/dev/null) adbd=$(getprop init.svc.adbd 2>/dev/null) audio=$(pidof audioserver 2>/dev/null | cut -d' ' -f1) pcm=${p:-none}"
 }
 
-kmsg "sampling start, 30 min window, changes go out as KCEVT"
+# Deep snapshot.  Everything here is read while the stream exists, so the
+# track list, the output's sample rate and the HAL's own counters line up.
+audiosnap() {
+    {
+        sec "audio_snapshot t=$(up) why=$1"
+        echo "-- cards --"
+        cat /proc/asound/cards 2>/dev/null
+        echo "-- hw_params (busy nodes) --"
+        for f in /proc/asound/card*/pcm*p/sub*/hw_params; do
+            [ -r "$f" ] || continue
+            grep -q '^closed' "$f" 2>/dev/null && continue
+            echo "$f:"; sed 's/^/    /' "$f" 2>/dev/null
+        done
+        echo "-- foreground --"
+        dumpsys activity activities 2>/dev/null | grep -m3 -E 'mResumedActivity|mFocusedActivity'
+        echo "-- AudioFlinger --"
+        dumpsys media.audio_flinger 2>&1 | head -n 220
+        echo "-- logcat (audio, last 120) --"
+        logcat -d -v brief -t 400 2>/dev/null |
+            grep -Ei 'audioflinger|audiopolicy|audio_hw|audiohal|tapan|adm_|asm_|afe_|MediaPlayer|AudioTrack|AwesomePlayer|NuPlayer|OMX|codec' |
+            tail -n 120
+        echo "-- dmesg tail --"
+        dmesg 2>/dev/null | tail -n 60
+    } >>"$R1" 2>&1
+    chmod 0644 "$R1" 2>/dev/null
+    cp -f "$R1" "$R2" 2>/dev/null && chmod 0644 "$R2" 2>/dev/null
+    cp -f "$R1" "$R3" 2>/dev/null && chmod 0644 "$R3" 2>/dev/null
+    kmsg "KCSNAP t=$(up) pcm=$(snap | sed 's/.*pcm=//') full copy at $R1"
+}
+
+kmsg "sampling start, 1 s, 10 min fast then 2 s for 20 min"
 prev=$(snap)
+lastbusy=0
+esnaps=0
 i=0
-while [ $i -lt 900 ]; do
-    sleep 2
+while [ $i -lt 1200 ]; do
+    if [ $i -lt 600 ]; then sleep 1; else sleep 2; fi
     i=$((i+1))
     cur=$(snap)
-    [ "$cur" = "$prev" ] && continue
-    prev=$cur
-    printf '<6>KCEVT t=%s %s\n' "$(up)" "$cur" >>$K 2>/dev/null
-    printf '%s | %s\n' "$(up)" "$cur" >>"${R1}.ev" 2>/dev/null
-    echo "$(up) | $cur" >>"$R1" 2>/dev/null
+    changed=0
+    [ "$cur" != "$prev" ] && changed=1
+    busy=0
+    case "$cur" in *pcm=none*) ;; *) busy=1 ;; esac
+    if [ $changed -eq 1 ]; then
+        prev=$cur
+        printf '<6>KCEVT t=%s %s\n' "$(up)" "$cur" >>$K 2>/dev/null
+        printf '%s | %s\n' "$(up)" "$cur" >>"${R1}.ev" 2>/dev/null
+        echo "$(up) | $cur" >>"$R1" 2>/dev/null
+    elif [ $busy -eq 0 ]; then
+        continue
+    fi
+    # Two moments are worth a deep snapshot: the first second of an episode
+    # (something opened) and any later change while it is still busy (open ->
+    # prepared -> running, which is what "playing" looks like).  Four per
+    # episode, so a five-minute album does not turn the report into a dump.
+    if [ $busy -eq 1 ] && [ $lastbusy -eq 0 ]; then
+        esnaps=1
+        audiosnap "episode start"
+    elif [ $busy -eq 1 ] && [ $changed -eq 1 ] && [ $esnaps -lt 4 ]; then
+        esnaps=$((esnaps+1))
+        audiosnap "state change #$esnaps"
+    fi
+    [ $busy -eq 0 ] && esnaps=0
+    lastbusy=$busy
 done
 
 # one last snapshot, so the file ends with where things settled
 snap | sed "s/^/final@$(up) /" >>"$R1" 2>/dev/null
+cp -f "$R1" "$R2" 2>/dev/null && chmod 0644 "$R2" 2>/dev/null
+cp -f "$R1" "$R3" 2>/dev/null && chmod 0644 "$R3" 2>/dev/null
 kmsg "sampling done up=$(up), report at $R1"
 rm -f "$T" "$U" "$PIDF" 2>/dev/null
 exit 0

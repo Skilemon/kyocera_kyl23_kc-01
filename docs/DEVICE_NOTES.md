@@ -3738,7 +3738,12 @@ init 以 **root** 起它，跟 `su` 没有关系。fix70 那份 dump 里的 `kca
 
 另外 `/cache/kcaudio.txt` 留一份（recovery 里 `cat /cache/kcaudio.txt` 也行）。
 
-### 31.2 USB 缺的不是驱动，是"没人去设 functions"
+### 31.2 USB 缺的不是驱动，是"没人去设 functions"（**结论作废，见 32**）
+
+> 这一节把"属性值没有对应 stanza"当成原因，fix72 的 dump 证明不是：属性值和
+> stanza 都正常跑完了，`functions=mtp`、`vid/pid=0482:0a28` 都对，只有 `enable`
+> 一直是 0。真正的原因在 §32，是 `iSerial` 没写、`enable_store(1)` 被内核补丁
+> 静默吞掉。下面这张链路表仍然是对的，错的是最后一行的归因。
 
 把这条链路逐段核对过，**每一段都是完整的**：
 
@@ -3811,3 +3816,127 @@ on boot && property:persist.sys.usb.config=*
   root 失败；
 * 不要传 `/cache`：480 MB / 251 KB/s；
 * 不要指望 log 分区里的"当前场"：它要等这一场结束才落盘，dump 到的永远是上一场。
+
+## 32. USB 真正的原因：`iSerial` 没人写，`enable` 是个空操作
+
+fix72 的 dump 里 USB 那一段是这样的：
+
+```
+usb0:    enable=0 state=DISCONNECTED func= vid=0482 pid=0a28
+props:   sys.usb.config=mtp sys.usb.state=mtp persist=none configfs=0
+nodes:   /dev/android_adb    udc: msm_hsusb
+-- bring-up --
+  after 3s: enable=0 state=DISCONNECTED func=mtp,adb vid=0482 pid=0a27 adbdev=yes svc.adbd=stopped
+  after 3s: enable=0 state=DISCONNECTED func=adb vid=18d1 pid=4ee7 adbdev=yes svc.adbd=stopped
+  after 3s: enable=0 state=DISCONNECTED func=mtp vid=0482 pid=0a28 adbdev=yes svc.adbd=stopped
+```
+
+`functions` 写进去了，`vid/pid` 跟着变了，`sys.usb.state=mtp` 说明 init 的
+`on property:sys.usb.config=mtp` 整段跑完了 —— 而 `enable` 三次都是 0。整场 dump 里
+`enable_store` 只有四次输出，全部是 `android_usb: already disabled`，也就是**写 0 的
+那几次**；我们写 1 的那三次连一行都没有。
+
+原因在内核源码里，Kyocera 自己加的：
+
+```c
+/* drivers/usb/gadget/android.c:2724, enable_store() */
+sscanf(buff, "%d", &enabled);
+if (enabled && !dev->enabled) {
+        ...
+if (strcmp(serial_string,"0123456789ABCDEF")) {   /* 串号不是默认值才真开 */
+        err = android_enable(dev);
+        if (err < 0) { ... }
+        dev->enabled = true;
+} else {
+        android_connect_flag = 1;                 /* 否则只是举个旗子 */
+}
+```
+
+`serial_string` 在 `android_bind_config()`（3031 行）里被初始化成
+`"0123456789ABCDEF"`，之后只有**写 `iSerial` 这一个入口**能改它
+（`serial_store()`，2883 行）。写 1 而串号还是默认值时，`enable_store` 返回成功、
+不改任何硬件状态：D+ 上拉不打开，host 端连"未知设备"都不会出现 —— 这正是
+"接上电脑没有任何动静"。
+
+那么原厂是谁写 `iSerial`？原厂 ramdisk：
+
+```
+# /workspace/device_dump/fw/boot.img 的 init.rc:676
+service usb_init /system/vendor/bin/usb_init
+    class core
+    user root
+    group system
+```
+
+`/vendor/bin/usb_init` 就在我们的 system 镜像里（`strings` 里有
+`/sys/class/android_usb/android0/iSerial`、`ro.serialno`、`persist.sys.usb.config`、
+`charge_only,adb` 那一套），同目录还有 `init.kyocera.usb.rc`（0482:0a22…0a2b 全套
+composition）。**我们的 ramdisk 里两样都没有**：init.rc 换成了 7.1 的（24 个文件里
+`grep -r usb_init` 只在 `sbin/adbd` 里命中一个无关字符串），`init.kyocera.usb.rc`
+也没带过来。所以 USB 不是"属性值不对"，是从换掉 init.rc 那天起就没工作过；§31.2 的
+归因作废，§31.1/31.3/31.4 的取证办法仍然有效。
+
+**fix73 的修法**（只改 system，不用重刷 boot）：`kcadsp.sh` 在
+`boot_completed` 之后，先写 `iSerial`，再走四条路：
+
+| 顺序 | 动作 | 说明 |
+|---|---|---|
+| 0 | `iSerial = KC<eMMC CID 前 14 位>` | 清掉内核补丁的守卫；`ro.serialno` 为空，CID 唯一且跨刷机稳定 |
+| 1 | `setprop persist.sys.usb.config mtp,adb` + `setprop sys.usb.config mtp,adb` | 走 init 的 stanza，顺带把框架的覆盖挡住 |
+| 2 | 直接写 `functions`/`idVendor`/`idProduct`/`enable`，mtp,adb → adb → mtp | 每次等 3 秒看 `state` |
+| 3 | `enable 1` 之后再写一次 `iSerial` | `serial_store()` 里那段 `android_connect_flag` 分支会把刚才跳过的 `android_enable()` 补上 |
+
+判据只有两条：
+
+* `enable=1`（有没有插线都成立，插线前就该是 1）；
+* 插上线之后 `state=CONNECTED`/`CONFIGURED`，`dmesg` 里出现
+  `msm_hsusb ... CONFIGURED`，电脑上多出 0482:0a27（MTP+ADB）。
+
+报告第一段新增 `serial:` 行（写进去的值和读回来的值），USB 段的 `-- bring-up --`
+会打印 `prop path:` 这一步的结果，所以下次 dump 能一眼看出是"串号没写进去"还是
+"stanza 没跑"。
+
+## 33. 声音（五）：放了 20 秒，PCM 只开了 3.4 秒，一次都没进 RUNNING
+
+这次的操作是"开机等 2 分钟 → 打开音乐软件放 20 秒 → 暂停"，报告（写于 74.89 s，
+之后靠采样追加）里的全部证据就是两行：
+
+```
+136.37 | adsp=ONLINE usb=DISCONNECTED adbd=running audio=515 pcm= card0/pcm0p/sub0=OPEN
+139.75 | adsp=ONLINE usb=DISCONNECTED adbd=running audio=515 pcm=none
+```
+
+ALSA 的状态机是 `closed → open → setup → prepared → running → draining → closed`。
+抓到的是 `open`（子流开出来了，参数还没设、更没 start），3.4 秒后回到 `closed`。
+**中间没有 `RUNNING`**，也就是说数据从来没有进过 PCM 环形缓冲；再往前一步，
+`pcm0p` 对应的就是 `MultiMedia1`，正常放歌时它会长时间停在 `RUNNING`。
+
+同时 `logcat_audio` 段只有 8 行，全是开机那一刻的 `adev_set_parameters:
+screen_state` —— 因为 `logcat -d -t 400` 是在 74 s 拍的，放音发生在 136 s，仪器
+早就收了。
+
+所以这一轮能确定的只有："输出被打开过，然后关掉了"，**不能**确定是播放器没送数据、
+是 codec 起不来、还是 HAL 的 `start` 失败。2 秒采样 + 一次性 logcat 不足以回答，
+fix73 换三件仪器：
+
+1. **1 秒采样**（前 10 分钟），状态机每一次跃迁都进 `KCEVT`；
+2. **放音瞬间的深照**：进入 busy 的第一秒、以及 busy 期间每次状态变化，各拍一次
+   `dumpsys media.audio_flinger`（220 行）+ 忙着的 `hw_params` + 前台 Activity +
+   最近的 audio/media logcat。这一段只有流还活着的时候才有意义；
+3. **连续 logcat 落盘**：新服务 `kclogcat`
+   （`-b main,system,crash,radio -v threadtime -f /data/local/tmp/kclogcat.txt -r 4096 -n 2`），
+   从 `boot_completed` 一直写到关机，recovery 挂 /data 后 `adb pull` 即可。
+   放音时的播放器/AudioFlinger/OMX/NuPlayer 全部在里面。
+
+顺带一个关于日志分区的结论：这次 `21_log.img` 第 3 槽是 #24 那一场（780 s），
+60 s 之后有 3147 行，几乎全是 `KCLED beat/key/ino/dbwatch` 和我们自己的
+`audit_lost` 限流行 —— 内核环被 LED 调试打印打满了，音频相关的行进不去。
+所以声音这条线不要再指望 log 分区，看 `/data/local/tmp` 下的文件。
+
+下一次的操作顺序（和这次一样，只是多拿两个文件）：
+
+1. 刷 fix73 的 system（boot 不用动，`boot-fix72` 与 fix70 逐字节相同，内核 #25）；
+2. 开机等 2 分钟，**插上电脑看有没有反应**（这一步同时验证 §32）；
+3. 打开音乐软件放 20 秒，暂停；
+4. 重启进 recovery，挂 /data，`adb pull /data/local/tmp/kcaudio.txt` 和
+   `adb pull /data/local/tmp/kclogcat.txt`。

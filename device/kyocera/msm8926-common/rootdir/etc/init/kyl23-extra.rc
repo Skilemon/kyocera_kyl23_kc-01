@@ -477,12 +477,18 @@ service kcssr /vendor/bin/kcssr.sh
 #      for a kernel without patch 0003 -- subsystem_get() is refcounted, so this
 #      is safe next to the post-fs-data write;
 #   2. bring USB up itself.  The framework writes sys.usb.config and every value
-#      it can write has a stanza in init.qcom.rc, but if /data ever held a value
-#      with no stanza (e.g. "none") the gadget stays disabled forever and the
-#      phone looks like it is charging from a wall charger.  The script tries
-#      mtp,adb -> adb -> mtp directly through
-#      /sys/class/android_usb/android0 and records what each one did;
-#   3. leave a report and keep sampling for 30 minutes.
+#      it can write has a stanza in init.qcom.rc, but the stanzas were never the
+#      problem: this kernel's android.c silently ignores enable_store(1) while
+#      serial_string is still the built-in "0123456789ABCDEF" (android.c:2724),
+#      and only the factory ramdisk's `service usb_init /vendor/bin/usb_init`
+#      (init.rc:676) ever wrote iSerial.  Our ramdisk has no usb_init, so enable
+#      has been 0 since the day init.rc was replaced -- no pull-up, no device on
+#      the host at all, which is exactly what "nothing happens when I plug it
+#      in" means.  The script writes iSerial from the eMMC CID, then enables;
+#   3. leave a report and sample once a second for 30 minutes;
+#   4. the moment a PCM node goes busy, snapshot AudioFlinger while the stream
+#      is live -- fix72 opened and closed the output in 3.4 s and a 2 s sampler
+#      could only say "we did not see RUNNING".
 #
 # The report goes to /data/media/0/kcaudio.txt (0644, so a file manager, MTP or
 # recovery can read it without root), to /data/local/tmp/kcaudio.txt, and as
@@ -500,6 +506,32 @@ service kcadsp /vendor/bin/kcadsp.sh
 # file, so the second start is a no-op when the first one is still sampling.
 on property:sys.boot_completed=1
     start kcadsp
+
+# Continuous logcat, from boot_completed until the phone is switched off.
+#
+# fix72's report carried a 20-second playback window and eight logcat lines,
+# every one of them from the boot.  `logcat -d -t 400` ran once, at 74 s, and
+# 400 lines of a busy 7.1 boot do not reach 60 s forward; by the time the user
+# pressed play the instrument had already stopped recording.  The ring buffer
+# is the wrong tool for "what happened when I pressed play" anyway -- the
+# player, AudioFlinger, the codec and the HAL all log there and all of it is
+# overwritten within a minute.
+#
+# So: to a file, rotated, in /data/local/tmp, which recovery can pull with adb
+# while /data is mounted.  -b main,system,crash,radio and not "all": the kernel
+# buffer is dmesg (already dumped into the report) and the events buffer is
+# audit spam (the same dump's log partition is half audit_lost lines).
+#
+# Cost: one long-lived logcat process, 8 MB of turnover.  That is acceptable
+# for a build whose whole purpose is to be observed.
+service kclogcat /system/bin/logcat -b main,system,crash,radio -v threadtime -f /data/local/tmp/kclogcat.txt -r 4096 -n 2
+    class core
+    user root
+    group root system log
+    disabled
+
+on property:sys.boot_completed=1
+    start kclogcat
 
 # Bluetooth package state: clear the flag before PackageManager reads it.
 #
