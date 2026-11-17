@@ -71,3 +71,25 @@ readelf -sW "$OUT/libtinyalsa.so" | awk '$7=="UND"{print $8}' | sed 's/@.*//' | 
 echo "--- pcm_config size check (must be 36) ---"
 printf '#include <stdio.h>\n#include <tinyalsa/asoundlib.h>\nint main(void){printf("sizeof(struct pcm_config)=%%zu\\n",sizeof(struct pcm_config));return 0;}\n' > /tmp/kc_cfgchk.c
 ${HOSTCC:-gcc} -DIGNORE_SILENCE_SIZE -Itinyalsa/include -o /tmp/kc_cfgchk /tmp/kc_cfgchk.c && /tmp/kc_cfgchk
+
+# ---------------------------------------------------------------------------
+# kcprox -- the pocket-mode daemon (see kcprox.c for why it exists).
+#
+# Static, and deliberately not built like the two HAL libraries above: this one
+# is a program, not a library that bionic loads, so it carries its own libc and
+# the "which symbols does bionic have" problem does not apply.  What does apply
+# is the Ubuntu toolchain's default to _TIME_BITS=64: glibc then routes
+# clock_gettime() to the __clock_gettime64 syscall (403), which a 3.4 kernel
+# does not have, and every timestamp in the log would come out of an
+# uninitialised struct.  -D_TIME_BITS=32 keeps the 32-bit entry points.
+#
+# kcbtnled (fix24) was the first static ARM binary on this device, so the shape
+# is known to run: bionic's linker is not involved at all.
+OUT=${OUT:-../bin}
+$CC -static -O2 -D_TIME_BITS=32 -D_FILE_OFFSET_BITS=32 \
+    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+    -o "$OUT/kcprox" kcprox.c
+arm-linux-gnueabi-strip "$OUT/kcprox" 2>/dev/null || true
+echo "--- built ---"
+ls -l "$OUT/kcprox"
+file "$OUT/kcprox"

@@ -69,6 +69,58 @@ LOGDEV=/dev/block/bootdevice/by-name/log
 up()   { cut -d' ' -f1 /proc/uptime 2>/dev/null; }
 sec()  { echo; echo "===== $* ====="; }
 kmsg() { printf '<6>KCADSP %s\n' "$*" >>$K 2>/dev/null; }
+
+# Text helpers, in pure shell, because this ROM has no awk at all:
+#
+#   /vendor/bin/kcadsp.sh: awk: not found
+#
+# That is what fix82's sensors section and half of its display block printed --
+# nothing.  toybox here carries sed/grep/tr/cut but no awk applet, and toybox
+# sed has no "/pat/,+Np" range either (fix81 hit "bad pattern"), so the two
+# helpers below are a while-read loop each.  They take a *file*: dumps are
+# written to /data/local/tmp once and read as many times as needed, since every
+# dumpsys call costs a second or two.
+grab_from() {   # file startpat endpat maxlines
+    _f=$1; _s=$2; _e=$3; _m=$4; _p=0; _n=0
+    while IFS= read -r _l; do
+        if [ "$_p" = 0 ]; then
+            case "$_l" in *"$_s"*) _p=1 ;; *) continue ;; esac
+        fi
+        printf '%s\n' "$_l" | cut -c1-190
+        _n=$((_n+1))
+        case "$_l" in *"$_e"*) break ;; esac
+        [ "$_n" -ge "$_m" ] && break
+    done <"$_f"
+}
+grab_after() {  # file pat nlines
+    _f=$1; _s=$2; _m=$3; _p=0; _n=0
+    while IFS= read -r _l; do
+        if [ "$_p" = 0 ]; then
+            case "$_l" in *"$_s"*) _p=1 ;; *) continue ;; esac
+        fi
+        printf '%s\n' "$_l" | cut -c1-190
+        _n=$((_n+1))
+        [ "$_n" -ge "$_m" ] && break
+    done <"$_f"
+}
+# Same idea, but stops at the next sensor ring.  A ring is a header line
+# ("  NAME Sensor: last N events") followed by indented sample lines, and the
+# next ring's header is indented by the same amount -- so "indented" is not a
+# usable stop condition, "the line is another ring header" is.  Without the
+# stop, "the newest sample" is the first line of the *next* sensor.
+grab_ring() {   # file pat maxlines
+    _f=$1; _s=$2; _m=$3; _p=0; _n=0
+    while IFS= read -r _l; do
+        case "$_l" in *"$_s"*) _p=1; continue ;; esac
+        [ "$_p" = 1 ] || continue
+        case "$_l" in
+            ""|*"Sensor: last"*) break ;;
+        esac
+        printf '%s\n' "$_l" | cut -c1-190
+        _n=$((_n+1))
+        [ "$_n" -ge "$_m" ] && break
+    done <"$_f"
+}
 st_of(){ [ -n "$1" ] && cat "$1/state" 2>/dev/null; }
 adspdev() {
     for d in $D/subsys*; do
@@ -236,19 +288,50 @@ usbviaen() {
 #                     the lux the framework ended up with: enabled + owner
 #                     system + a moving mAmbientLux is the whole chain.
 #
-#   proximity on wake Same node, same cause (enable_ps_sensor).  Once the HAL
-#                     can write it, PWM's "Not waking up. Proximity sensor is
-#                     blocked." becomes possible again.
+#   proximity        Not the same story as the light sensor.  fix82's dump
+#                     proves the *sensor* works: en=1, "SFH7776 Proximity
+#                     Sensor: last 10 events", and the value the driver reports
+#                     with nothing in front of the phone is 4 (its own level 4 =
+#                     "nothing there", 0..2 = covered).  What does not work is
+#                     the framework end, and that is a code path, not a node:
+#                     PowerManagerService.runWithProximityCheck() is only ever
+#                     reached from PowerManager.wakeUpWithProximityCheck(), and
+#                     the only caller in services.jar is
+#                     PhoneWindowManager.wakeUp(..., withProximityCheck) with
+#                     `event.getKeyCode() == KEYCODE_WAKEUP`.  The power key goes
+#                     through wakeUpFromPowerKey() -> wakeUp(3 args) -> plain
+#                     wakeUp().  So on this ROM the setting cannot veto a power
+#                     key press at all; nothing is wrong with the sensor.
+#                     This report therefore stops asking for "Not waking up" and
+#                     records the raw evdev trace instead: KEY_POWER edges and
+#                     ABS_DISTANCE values, on the same clock.
 #
-# Both are sampled once a minute for three minutes, because the state that
-# matters only exists while the sensor is being covered, and the report says so
-# between samples, since that is where the user is looking.
+# The display state is sampled every 15 s for five minutes, because the state
+# that matters only exists while the sensor is being covered, and the report says
+# so between samples, since that is where the user is looking.
 A=$(adspdev)
 # The two input nodes by name, not by number: what the HAL was actually asked
 # for is the difference between "the framework never enabled it" and "the
 # driver was told to sample and stayed silent".
 LI=$(for d in /sys/class/input/input*; do [ "$(cat $d/name 2>/dev/null)" = light ] && echo "$d"; done | head -n1)
 PX=$(for d in /sys/class/input/input*; do [ "$(cat $d/name 2>/dev/null)" = proximity ] && echo "$d"; done | head -n1)
+# Event nodes by name.  getevent is used as a *second* reader: every open fd on
+# an evdev node gets its own copy of the event stream, so tracing does not take
+# anything away from the framework.  The power key is not on gpio-keys on this
+# device -- EventHub logs 'qpnp_pon' as a separate device (event1) and
+# 'gpio-keys' (event11) carries the volume keys -- so all three are traced and
+# the report says which one a press came from.
+evnode() {
+    for d in /sys/class/input/input*; do
+        [ "$(cat $d/name 2>/dev/null)" = "$1" ] || continue
+        for e in $d/event*; do
+            [ -e "$e" ] && { echo "/dev/input/$(basename $e)"; return; }
+        done
+    done
+}
+EVP=$(evnode proximity)
+EVK=$(evnode qpnp_pon)
+EVG=$(evnode gpio-keys)
 
 dispblock() {
     echo "-- t+$1 s (up=$(up)) --"
@@ -260,11 +343,12 @@ dispblock() {
     # decide the question -- mRecentLightSamples, mBrighteningLuxThreshold,
     # mDarkeningLuxThreshold, the two debounce configs -- so a frozen
     # mAmbientLux could not be attributed to the filter or to the sensor.
-    timeout 10 dumpsys display 2>/dev/null | awk '
-        /Automatic Brightness Controller/ {p=1}
-        p {print substr($0,1,190); if (/mDozing=/) p=0; next}
-        /mProximitySensor=|mProximitySensorEnabled=|mScreenBrightness=|mPowerState=|mBrightnessRampRateFast=/ {print substr($0,1,190)}
-    ' | head -n 46
+    _ds=/data/local/tmp/.kcdisp.$$
+    timeout 10 dumpsys display >"$_ds" 2>/dev/null
+    grab_from "$_ds" "Automatic Brightness Controller" "mDozing=" 46
+    grep -E 'mProximitySensor=|mProximitySensorEnabled=|mScreenBrightness=|mPowerState=|mBrightnessRampRateFast=' \
+        "$_ds" 2>/dev/null | head -n 5 | cut -c1-190
+    rm -f "$_ds"
     timeout 10 dumpsys window policy 2>/dev/null |
         grep -iE 'proxim|mAwake=|mScreenOnEarly=' | head -n 8
     timeout 10 dumpsys window 2>/dev/null |
@@ -278,9 +362,17 @@ dispblock() {
     # Owner is the whole point: the HAL writes these as uid 1000, and 0660
     # root:root is what made every write EACCES before fix81.
     echo "perm:    $(stat -c '%U:%G %a' "$LI/enable_als_sensor" 2>/dev/null) $(stat -c '%U:%G %a' "$PX/enable_ps_sensor" 2>/dev/null) $(stat -c '%U:%G %a' /dev/psals_sensor 2>/dev/null)"
-    echo "sensor:  $(timeout 6 dumpsys sensorservice 2>/dev/null |
-        grep -E 'Light Sensor: last|Proximity Sensor: last' -A1 |
-        tr -s ' \n' ' ' | cut -c1-240)"
+    # One sensor dump, three questions.  The ring is printed in full once (in
+    # the sensors section); here only the newest sample of each ring, because a
+    # timeline of "what the framework last knew" is what the samples are for.
+    # "4" is what the driver reports with nothing in front of the phone and
+    # 0..2 is covered -- that mapping is the whole near/far question.
+    _ss=/data/local/tmp/.kcss.$$
+    timeout 8 dumpsys sensorservice >"$_ss" 2>/dev/null
+    echo "kcprox:  svc=$(getprop init.svc.kcprox 2>/dev/null) last=[$(tail -n 1 /data/local/tmp/kcprox.log 2>/dev/null | cut -c1-130)]"
+    echo "prox:    newest=$(grab_ring "$_ss" 'Proximity Sensor: last' 12 | tail -n 1 | sed 's/, wall=[^)]*//; s/^[[:space:]]*//; s/[[:space:]]*$//' | tr -s ' \t' ' ')"
+    echo "lux:     newest=$(grab_ring "$_ss" 'Light Sensor: last' 8 | tail -n 1 | sed 's/, wall=[^)]*//; s/^[[:space:]]*//; s/[[:space:]]*$//' | tr -s ' \t' ' ')"
+    rm -f "$_ss"
 }
 
 {
@@ -316,21 +408,44 @@ dispblock() {
     # Handles, types and the order the HAL reports them in.  The display dump
     # only names the sensor ABC was handed, not the handle SensorService gave
     # it, and handle == the number the HAL's activate() switches on.
-    # toybox sed has no "/pat/,+Np" range -- it answered "bad pattern" and the
-    # whole section came out empty in the fix81 dump.
-    timeout 10 dumpsys sensorservice 2>/dev/null |
-        awk '/Sensor List/ {p=1; n=0} p && n<11 {print; n++}' | cut -c1-170
-    # Who holds the proximity sensor right now.  If PWM armed its check, the
+    #
+    # This whole section printed *nothing* in the fix82 dump: it was written
+    # with awk, and /system/bin has no awk applet in this ROM.  Same for the
+    # "Sensors by connection" block below and for half of the display block.
+    _ss=/data/local/tmp/.kcss2.$$
+    timeout 15 dumpsys sensorservice >"$_ss" 2>/dev/null
+    grab_after "$_ss" "Sensor List" 12 | cut -c1-170
+    # Who holds the proximity sensor right now.  If PMS armed its check, the
     # system_server connection lists the PS handle as active; if it did not, the
-    # PS only shows up while FalsingManager or a test app holds it.  This is the
-    # one place where "armed but idle" and "never armed" look different.
-    # (awk, not "grep -A": toybox' grep/sed option support is uneven -- see the
-    #  sensor-list note above.)
-    timeout 10 dumpsys sensorservice 2>/dev/null | awk '
-        /^Active sensors:/ || /^Sensors by connection:/ {p=1; n=0}
-        p && n<9 {print substr($0,1,170); n++; if (n>=9) p=0}
-    '
+    # PS only shows up while a test app holds it.  This is the one place where
+    # "armed but idle" and "never armed" look different.
+    echo "-- holders --"
+    grab_after "$_ss" "Sensors by connection" 16
+    # The full proximity ring, not one line of it.  fix82 printed only the
+    # oldest entry of "last N events" (4.00) and that single number cannot
+    # distinguish "far, as it should be" from "stuck".  The sequence 4..4,0..0,4
+    # is the proof that the driver reports both states.
+    echo "-- prox ring --"
+    grep -m1 'Proximity Sensor: last' "$_ss" 2>/dev/null | sed 's/^[[:space:]]*//'
+    grab_ring "$_ss" "Proximity Sensor: last" 14
+    echo "-- light ring --"
+    grep -m1 'Light Sensor: last' "$_ss" 2>/dev/null | sed 's/^[[:space:]]*//'
+    grab_ring "$_ss" "Light Sensor: last" 8
+    rm -f "$_ss"
+    # The evdev side of the same numbers: min/max of ABS_DISTANCE as the kernel
+    # publishes them.  The HAL takes maxRange from here, and the framework's
+    # near test is "distance < 5 AND distance < maxRange", so this bound decides
+    # whether value 4 (nothing in front) counts as far.
+    echo "caps:    $(getevent -i "$EVP" 2>/dev/null | grep -i 'ABS_DISTANCE' | tr -s ' \t' ' ')"
+    echo "nodes:   key=$EVK prox=$EVP"
+    echo "psdrv:   $(dmesg 2>/dev/null | grep 'ABS_DISTANCE' | tail -n 6 | sed 's/^.*\] //' | tr '\n' '|')"
     echo "kcsensor: $(dmesg 2>/dev/null | grep -m1 'kcsensor:')"
+    # What the pocket-mode daemon decided, and when.  This is the only record
+    # of a swallowed power key: nothing reaches logcat when a press is dropped,
+    # because the whole point is that the framework never sees it.
+    echo "-- kcprox --"
+    echo "  svc=$(getprop init.svc.kcprox 2>/dev/null) log=/data/local/tmp/kcprox.log"
+    tail -n 20 /data/local/tmp/kcprox.log 2>/dev/null | cut -c1-170
 
     sec display
     dispblock 0
@@ -383,15 +498,33 @@ done <"$R1"
 # The report above is written within a minute of boot_completed.  The test --
 # open Settings, turn adaptive brightness on, cover the sensor -- happens after
 # that, and fix80's dump was pulled only 70 s into it, so the file ended up with
-# two samples and the interesting minute was missing.  Six samples 30 s apart
-# cover the first three minutes with a before and an after of the same action;
-# the file can be pulled as soon as the seventh header appears.
+# two samples and the interesting minute was missing.  Twenty samples 15 s apart
+# cover the first five minutes; the file can be pulled once "timeline done"
+# appears.
+#
+# Alongside the samples, the raw evdev stream of the power key and of the
+# proximity sensor is recorded for the same five minutes (timeout-bounded so it
+# can never outlive the script).  That trace answers the two questions the
+# dumpsys samples cannot:
+#   * the prox value when the phone is covered -- 4 is "clear", 0..2 is covered;
+#   * whether a power key press even reaches the framework while covered.
+EVLOG=/data/local/tmp/kc_input.log
+: >"$EVLOG" 2>/dev/null
+EVPID=
+if [ -n "$EVP" ]; then
+    # set -- drops the empty ones: getevent treats a bare "" as a device name
+    # and refuses to start, which would leave the whole trace empty.
+    set -- $EVK $EVP $EVG
+    timeout 400 getevent -lt "$@" >"$EVLOG" 2>&1 &
+    EVPID=$!
+fi
 {
     sec "sensor timeline"
     echo "  每 15 秒采样一次，共 20 次（到开机后约 5 分钟）。"
     echo "  现在去 设置 -> 显示 打开「自适应亮度」，然后用手完全遮住屏幕上方"
-    echo "  听筒左边的光感，保持 20 秒以上再松开。距离传感器：盖住听筒后按电源键，"
-    echo "  屏幕应当不亮，日志里会有 'Not waking up'。每次采样都记在这里。"
+    echo "  听筒左边的光感，保持 20 秒以上再松开。"
+    echo "  距离传感器：盖住听筒（压住光感）后连按三次电源键，每次间隔 2 秒。"
+    echo "  同时在录 evdev：prox=$EVP key=$EVK gpio=$EVG -> $EVLOG"
 } >>"$R1" 2>/dev/null
 i=1
 while [ $i -le 20 ]; do
@@ -399,6 +532,17 @@ while [ $i -le 20 ]; do
     dispblock "$((i*15))" >>"$R1" 2>/dev/null
     i=$((i+1))
 done
+[ -n "$EVPID" ] && kill "$EVPID" 2>/dev/null
+{
+    sec "input trace"
+    echo "  prox=$EVP key=$EVK gpio=$EVG  lines=$(wc -l <"$EVLOG" 2>/dev/null)"
+    echo "  KEY_POWER: $(grep -c 'KEY_POWER.*DOWN' "$EVLOG" 2>/dev/null) down / $(grep -c 'KEY_POWER.*UP' "$EVLOG" 2>/dev/null) up"
+    echo "  ABS_DISTANCE: $(grep -c 'ABS_DISTANCE' "$EVLOG" 2>/dev/null) events"
+    echo "  -- ABS_DISTANCE (00000004 = clear, 00000000 = covered) --"
+    grep 'ABS_DISTANCE' "$EVLOG" 2>/dev/null | tail -n 40
+    echo "  -- KEY_POWER edges --"
+    grep 'KEY_POWER' "$EVLOG" 2>/dev/null | tail -n 30
+} >>"$R1" 2>/dev/null
 {
     sec "timeline done"
     echo "  采样结束。文件可以取了。"

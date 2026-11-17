@@ -509,6 +509,12 @@ service kcadsp /vendor/bin/kcadsp.sh
 on property:sys.boot_completed=1
     start kcadsp
 
+# Pocket mode, once the framework is up: before boot_completed the sensor node
+# may not have been chowned by kcsensor yet and there is nothing for the daemon
+# to watch anyway (no screen to switch off).
+on property:sys.boot_completed=1
+    start kcprox
+
 # Continuous logcat, from boot_completed until the phone is switched off.
 #
 # fix72's report carried a 20-second playback window and eight logcat lines,
@@ -663,6 +669,35 @@ service kcsensor /system/bin/sh /vendor/bin/kcsensor.sh
     disabled
 
 # ---------------------------------------------------------------------------
+# Pocket mode.
+#
+# The sensor works (fix82: en=1, "SFH7776 Proximity Sensor: last 10 events",
+# 4 = nothing in front, 0..2 = covered).  What does not work is the framework
+# end: on this branch PowerManagerService.runWithProximityCheck() is only
+# reached from PowerManager.wakeUpWithProximityCheck(), and services.jar calls
+# that from exactly one place --
+#
+#     PhoneWindowManager.wakeUp(..., event.getKeyCode() == KEYCODE_WAKEUP)
+#
+# -- so the CM "proximity_on_wake" setting can never veto the *power* key:
+# wakeUpFromPowerKey() passes false.  Patching that means patching the dex in
+# services.jar, and this ROM is "boot image only" (/system/framework/*.jar are
+# 299-byte stubs, every class is precompiled in boot.art/boot-*.oat), so a
+# changed dex invalidates the image with nothing to fall back to.
+#
+# So the decision is made in front of the framework instead: kcprox grabs the
+# power key's evdev node while the screen is off and drops the press when the
+# proximity sensor says the phone is covered.  See kcprox.c.  Nothing is touched
+# while the screen is on, and the grab is fd-bound, so this cannot leave the
+# power key dead -- if the daemon exits, the kernel releases it.
+# ---------------------------------------------------------------------------
+service kcprox /vendor/bin/kcprox
+    class late_start
+    user root
+    group root system input
+    disabled
+
+# ---------------------------------------------------------------------------
 # /dev/fuse does not exist: the kernel has FUSE built in (no uevent) and the
 # ramdisk ueventd.rc has no static entry for it.  Create it before vold tries
 # to bring up /storage/emulated/0, otherwise /sdcard stays empty forever.
@@ -701,6 +736,7 @@ on post-fs-data
     chmod 0755 /system/etc/kcbtinit.sh
     chmod 0755 /system/bin/btnvtool /system/bin/hci_qcomm_init
     chmod 0755 /vendor/bin/kcsensor.sh
+    chmod 0755 /vendor/bin/kcprox
 
     # Hand the sensor driver's attributes to the sensors HAL (see the header of
     # kcsensor.sh).  Stock did this from /init.rc and /init.kc.sensor.sh; our

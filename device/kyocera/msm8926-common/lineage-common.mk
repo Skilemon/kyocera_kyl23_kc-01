@@ -169,7 +169,7 @@ PRODUCT_PACKAGES += \
 KC_PREBUILT := $(LINEAGE_COMMON_PATH)/prebuilt/kc
 KC_BINS := kcboot kcfuse.sh kc_bootanim.sh kcstate.sh kcwifi \
            kccam.sh kcssr.sh kcstate-delay.sh kcstate-boot.sh kcadsp.sh \
-           kcshut.sh kctail.sh kchalt.sh kcsensor.sh
+           kcshut.sh kctail.sh kchalt.sh kcsensor.sh kcprox
 KC_LIBS := libkccabi.so libkcabi.so libkchwc.so
 
 PRODUCT_COPY_FILES += \

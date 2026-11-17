@@ -5845,3 +5845,166 @@ Connection Number: 1 | Operating Mode: NORMAL
    下一轮直接绕过它。
 4. 距离：`Sensors by connection` 里有没有 `SFH7776 Proximity Sensor`；盖住听筒按电源键后
    `proxwake` 是不是从 0 变成 1。
+
+## 46. 距离感应没生效，不是因为传感器坏，是因为电源键根本不查距离
+
+fix82 报了两件事：自动亮度**通了**，距离感应**没通**。前者是对 §45 那三个时间常数的验收通过，
+后者是本轮的全部工作量。
+
+### 46.1 先说清楚：测量工具本身有两处瞎的
+
+fix82 的 `===== sensors =====` 段是空的，`Sensors by connection` 也是空的。日志里明写着：
+
+```
+/vendor/bin/kcadsp.sh: awk: not found
+/vendor/bin/kcadsp.sh: awk: not found
+```
+
+这套 toybox **没有编 awk applet**。§45.5 把 `sed '...+N'` 换成 awk，等于从一个不存在的坑跳进另一个
+不存在的坑。于是「距离传感器现在什么状态」这个问题，在 fix82 的数据里**根本没被回答过**——
+不是回答"没生效"，是没有数据。
+
+第二处是 `dispblock()` 里抓 ABC 的那一半也是 awk 写的，所以自动亮度那次其实也没有细节，只是
+结果对上了。
+
+本轮把 kcadsp.sh 里的 awk 全部清掉，换成三个纯 shell 提取器：
+
+| 函数 | 用途 | 停止条件 |
+|---|---|---|
+| `grab_from <file> <start> <stop> <maxlines>` | 取两个标记之间的块 | 遇到 `$stop` 或行数封顶 |
+| `grab_after <file> <start> <n>` | 从标记往后 n 行 | 行数封顶 |
+| `grab_ring <file> <header>` | 取一个 sensor 的完整环形缓冲 | **下一行是空行或含 `Sensor: last`** |
+
+`grab_ring` 的停止条件第一版写的是「非缩进行」，实测把下一个 sensor 的第一条样本也吃进来了
+（`[newest lux] -> 2.00` 其实是 prox 的值，两个环挨着）。改成按「下一个环的头 / 空行」判断才对，
+因为下一个 ring 的头本身也是缩进的。
+
+### 46.2 传感器是好的，这一点 fix82 的数据已经证明了
+
+抛开空段，`input:` 那行和驱动的 debugfs 是能读到的：
+
+```
+input:  prox=/sys/class/input/input7 en=1 poll=...
+SFH7776 Proximity Sensor: last 10 events
+  ...
+  4.00
+```
+
+`en=1`（`enable_ps_sensor` 的计数器非零，IRQ 真的开了），等级 4 = `ps_lv` 的无遮挡值
+（驱动表 `{4,2,13,0}`，见 `drivers/sensors/sfh7776.c:141`）。所以硬件、驱动、HAL 三段都在线。
+
+### 46.3 真因：`proximity_on_wake` 在 14.1 上管不到电源键
+
+CM 的 `proximity_on_wake` 最终落到 `PowerManagerService.runWithProximityCheck()`。这个方法的
+唯一入口是 `PowerManager.wakeUpWithProximityCheck()`，而 `services.jar`（本机是 boot.art 里的
+预编译类）里**只有一个调用者**：
+
+```
+PhoneWindowManager.wakeUp(..., boolean withProximityCheck)
+    -> wakeUpWithProximityCheck()     当 withProximityCheck == true
+    -> wakeUp()                       否则
+```
+
+而 `withProximityCheck` 的实参是 `event.getKeyCode() == KeyEvent.KEYCODE_WAKEUP`。
+**电源键不走这条路**：
+
+```
+PhoneWindowManager.interceptPowerKeyDown()
+    -> wakeUpFromPowerKey(eventTime)
+        -> wakeUp(eventTime, /*allowWakeUpByP*/ false, "powerKey")
+```
+
+dex 反汇编逐字确认，`wakeUpFromPowerKey` 方法体里只有一条
+`invoke-direct ...->wakeUp(J Z Ljava/lang/String;)Z` —— 三参数那个重载，`withProximityCheck`
+写死 false，`runWithProximityCheck` 从头到尾没被调用过。
+
+**结论：`proximity_on_wake=1` 只对 `KEYCODE_WAKEUP` 生效——耳机线控、底座、某些蓝牙键盘上的
+专用唤醒键。物理电源键在 AOSP/CM 里从来就不查距离。** 这是既有设计，不是本 port 的 bug，
+也解释了为什么"盖住听筒按电源键屏幕照样亮"。
+
+判定阈值顺带记一下，`PowerManagerService`：
+
+```java
+PROXIMITY_NEAR_THRESHOLD = 5.0f
+// 不挡的条件：distance >= 5.0f || distance >= mProximitySensor.getMaximumRange()
+```
+
+也就是说驱动上报 0/1/2 算挡，3/4 算不挡。
+
+### 46.4 为什么不能直接改 dex：这个 ROM 是 boot image only
+
+`/system/framework/*.jar` 全是 **299 字节的桩**，真正的类预编译在 `boot.art` / `boot-*.oat` 里。
+往 `services.jar` 塞一个新 dex 进去，等于让镜像里的 `services.jar` 和 boot.art 不一致，
+ART 会拒绝加载或者静默走慢路径，而且**没有回退路径**（原 dex 不在 system 里，在 boot 里）。
+
+所以补丁只能打在框架**之前**。
+
+### 46.5 方案：在 evdev 层拦截电源键（kcprox）
+
+新增 `/vendor/bin/kcprox`，一个静态 ARM 守护进程，`late_start` 起来：
+
+```
+屏幕亮着        -> 什么都不做（不抓、不开传感器）
+屏幕灭了        -> ioctl(kfd, EVIOCGRAB, 1) 独占电源键节点，写 enable_ps_sensor=1
+   KEY_POWER 按下，prox <= 2 且距离值 <10 s 内     -> 吞掉
+   KEY_POWER 按下，其他情况                        -> uinput 注入一个 KEY_POWER，框架照常唤醒
+```
+
+几个刻意的选择：
+
+| 设计 | 原因 |
+|---|---|
+| `EVIOCGRAB` 绑在 fd 上，不写任何持久状态 | 进程一死内核自动释放，电源键**不会变砖**。这是选 evdev 而不是改 keylayout 或 IPC 的唯一理由 |
+| 只在屏幕灭时抓 | 亮屏时电源键要能正常熄屏/长按关机菜单，不能碰 |
+| 屏幕状态用 `/sys/class/leds/lcd-backlight/brightness > 0` 判 | lights HAL 真的会写 0，比 `dumpsys power` 便宜一个数量级 |
+| `KCPROX_MAX_SWALLOW 3`：连续吞 3 次后第 4 次必放行 | 万一读距离的那条路坏了、屏幕永远点不亮，用户连按四下就能出来 |
+| `seen_on` 标志：从没见过亮屏就永不 arm | init 起得太早、backlight 还没初始化时不会误抓 |
+| 注入前再读一次 `screen_is_on()` | 挡住的瞬间如果别的路径已经点亮了屏幕，不要重复注入 |
+| `inject_power()` 失败就 `ioctl(EVIOCGRAB, 0)` 放开 | uinput 建不起来时宁可放弃拦截，也不能把键扣在自己手里 |
+| uinput 完全建不起来 -> `system("/system/bin/input keyevent 26")` | 最后一道兜底 |
+
+uinput 可用性已确认：`CONFIG_INPUT_UINPUT=y` 编进内核，`/dev/uinput` 是 10,223，devtmpfs 关着
+所以代码里自己 mknod。该机电源键在 **`qpnp_pon`（event1）**，音量键在 `gpio-keys`（event11），
+看 EventHub 日志确定的，所以默认抓 `qpnp_pon`。
+
+`--dry` 的语义：仍然抓、仍然读、仍然注入，只是**不吞**，日志记 `would swallow`。
+这样能先验证"距离读得对不对"而不影响正常用机。
+
+### 46.6 顺带把距离变成可测的
+
+fix82 之所以只能靠猜，是因为报告里没有一个地方能读到"遮挡时距离到底是多少"。这一轮加了：
+
+- 每条采样多两行：`prox: newest=N (ts=...) V` 和 `lux: newest=...`，取各自 ring 的最后一条。
+- `===== sensors =====` 段重写：`Sensor List` / `-- holders --`（`Sensors by connection`）/
+  `-- prox ring --`（完整环）/ `-- light ring --` / `caps:`（`getevent -i` 里的 `ABS_DISTANCE` 值域）/
+  `nodes:` / `psdrv:`（dmesg 里 6 条 `ABS_DISTANCE`）/ `-- kcprox --`（`init.svc.kcprox` + 日志尾巴）。
+- 时间线里加 **evdev 旁路录制**：`timeout 400 getevent -lt <三个节点>`。evdev 是多读者模型，
+  每个 fd 各拿一份完整事件流，**旁路录制不会抢走框架的事件**。末尾汇总 `===== input trace =====`：
+  三个节点各自的 `KEY_POWER` down/up 计数、`ABS_DISTANCE` 计数、最近 40 条距离、最近 30 条电源键边沿。
+
+这样"遮挡时距离值多少""按键有没有到达框架""框架有没有收到第二个注入的键"全部是可直接读的事实。
+
+顺带修了个坑：`getevent $EVK $EVP $EVG` 里三个变量可能为空，toybox 的 getevent 会把空字符串
+当设备名而**拒绝启动**，整段 trace 全空。改成 `set -- $EVK $EVP $EVG` 再 `"$@"`。
+
+### 46.7 这一轮要看的
+
+刷 fix83 后（只刷 system，boot 保持 fix72 那版 #25 内核）：
+
+```sh
+adb shell getprop init.svc.kcprox      # 应该是 running
+adb shell cat /data/local/tmp/kcprox.log
+```
+
+日志应依次出现：
+
+1. `kcprox: start` / `power key node = /dev/input/event1`
+2. 熄屏后 `screen off -> armed`
+3. 遮住听筒：`prox=1 -> covered`（N ≤ 2 即算遮挡）
+4. 此时按电源键：`power: covered (prox=1) -> swallowed 1/3`，**屏幕应保持黑**
+5. 松开手再按：`power: prox=4 -> injected`，屏幕正常点亮
+
+如果第 4 步屏幕还是亮了，看 `===== input trace =====`：`qpnp_pon` 的 `KEY_POWER` 次数和
+框架侧收到的是否一致，就能区分是"没吞掉"还是"吞掉了但又注入了一份"。
+
+不想立刻改变行为的话，`kcprox --dry` 手动跑一遍，日志会出现 `would swallow` 而屏幕照常亮。
