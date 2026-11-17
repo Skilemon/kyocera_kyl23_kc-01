@@ -109,6 +109,48 @@ while [ $i -lt 10 ]; do
     i=$((i+1))
 done
 
+# ---- 1b. who blocks the boot, and on what ---------------------------------
+# PhoneWindowManager asks SensorManager for the proximity sensor inside its
+# init(), which WindowManagerService runs on the "android.ui" thread with
+# runWithScissors() -- the caller blocks until it returns.  SensorService
+# fills its sensor list on a thread of its own.  fix78's boot put 25 s
+# between the two:
+#
+#   22:51:41.386 SensorService: nuSensorService starting...
+#   22:51:41.657 ServiceManager: Waiting for service sensorservice...   <- ui
+#   ... 25 one-second lines ...
+#   22:52:06.226 SensorService: nuSensorService thread starting...
+#
+# One of them is waiting on the other; /proc says which, and the state says
+# what kind of wait it is: D is a syscall in the kernel (i2c, sysfs, mmap),
+# R is the CPU, S is a mutex or a sleep.  Twenty-five seconds is either a
+# blocking driver call or a fixed timeout, and those two have very different
+# fixes, so this runs in the background for the first 90 s of uptime and
+# writes to its own file.
+bootwatch() {
+    o=/data/local/tmp/kc_boot.log
+    : >"$o" 2>/dev/null
+    n=0
+    while [ "$n" -lt 45 ]; do
+        p=$(pidof system_server 2>/dev/null)
+        if [ -n "$p" ]; then
+            t=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
+            for s in /proc/$p/task/*; do
+                [ -r "$s/stat" ] || continue
+                c=$(cat "$s/comm" 2>/dev/null)
+                st=$(cut -d' ' -f3 "$s/stat" 2>/dev/null)
+                case "$c:$st" in
+                    *Sensor*|*sensor*|main:*|android.ui:*|*:D)
+                        echo "$t ${s##*/} $c $st $(cat "$s/wchan" 2>/dev/null)" >>"$o" 2>/dev/null
+                        ;;
+                esac
+            done
+        fi
+        sleep 2
+        n=$((n+1))
+    done
+}
+bootwatch &
 # ---- 2. wait for the framework -------------------------------------------
 # USB must not be touched before system_server has read its own property, or
 # UsbDeviceManager overwrites whatever we set two seconds later.
@@ -298,6 +340,7 @@ A=$(adspdev)
     sensprobe() {
         id=$1      # input6
         node=$2    # enable_als_sensor
+        win=${3:-3}  # seconds to watch the event device
         d=/sys/class/input/$id
         ev=
         for e in "$d"/event*; do [ -e "$e" ] && ev=/dev/input/$(basename "$e"); done
@@ -309,7 +352,7 @@ A=$(adspdev)
         echo "  $id $node: after=$(cat "$d/$node" 2>/dev/null)"
         if [ -n "$ev" ] && [ -r "$ev" ]; then
             echo "  $id events (16-byte input_event, raw):"
-            timeout 2 dd if="$ev" bs=16 count=3 2>/dev/null | od -An -tu4 -w16 | head -n 4
+            timeout "$win" dd if="$ev" bs=16 count=8 2>/dev/null | od -An -tu4 -w16 | head -n 8
         fi
         # put back whatever was there: if the framework had already enabled it
         # for the phone app, forcing 0 would quietly take proximity away.
@@ -317,10 +360,37 @@ A=$(adspdev)
     }
     echo "-- direct probe --"
     sensprobe input6 enable_als_sensor
-    sensprobe input7 enable_ps_sensor
+    # proximity is on-change: nothing is reported while the
+    # distance stays put, so the window is long enough to wave a
+    # hand over the sensor while the report is being written.
+    sensprobe input7 enable_ps_sensor 6
 
     echo "-- sensorservice --"
     timeout 8 dumpsys sensorservice 2>/dev/null | head -n 60
+
+    sec display
+    # Two yes/no answers that decide the rest of this round:
+    #
+    #   mProximitySensor=<sensor>   vs   mProximitySensor=null
+    #       DisplayPowerController is built by PowerManagerService.systemReady()
+    #       and asks SensorManager for TYPE_PROXIMITY there.  If it says null,
+    #       the controller was built before SensorService was published and no
+    #       amount of HAL work will make proximity work until a restart.
+    #   mUseSoftwareAutoBrightnessConfig=true
+    #       This is config_automatic_brightness_available, and it is what both
+    #       Settings (the missing switch) and the light-sensor loop read.
+    #
+    # mAutomaticBrightnessController only exists when the spline came out of
+    # config_autoBrightnessLevels / config_autoBrightnessLcdBacklightValues --
+    # an empty array makes createAutoBrightnessSpline() throw and the whole
+    # feature is dropped with "Error in config.xml" in the log.
+    timeout 10 dumpsys display 2>/dev/null |
+        grep -E 'mProximitySensor|mProximitySensorEnabled|mUseSoftwareAutoBrightnessConfig|mAutomaticBrightnessController|mScreenBrightness|mLightSensor|Auto-brightness|mScreenAutoBrightness|mAmbientLux|mPowerState=' |
+        head -n 20
+    echo "-- window manager policy --"
+    timeout 10 dumpsys window policy 2>/dev/null | grep -iE 'proximity|mScreenOn|mAwake' | head -n 8
+    echo "-- boot stall (system_server threads) --"
+    sed 's/^/    /' /data/local/tmp/kc_boot.log 2>/dev/null | head -n 40
 
     sec mic
     echo "capture: $(ls /proc/asound/card*/pcm*c/sub*/status 2>/dev/null | tr '\n' ' ')"

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Overlay for org.cyanogenmod.platform-res.apk (the CM SDK resource package),
+    device/kyocera/msm8926-common.
+
+    Path guess: the module that produces org.cyanogenmod.platform-res.apk is
+    frameworks/base/packages/CyanogenModPlatformRes in cm-14.1.  The shipped
+    image does not rely on it: both bools are patched straight into the
+    packaged apk's resources.arsc, four bytes each, no rebuild and no
+    renumbering (tools/image/arsc_patch.py; docs/DEVICE_NOTES.md 41).
+
+    config_proximityCheckOnWake was false, which switched off two things at
+    once:
+
+      * PhoneWindowManager never installed its proximity listener, so the
+        "do not light the screen while the phone is in a pocket" check was
+        dead code;
+      * CM's Settings saw proximity_on_wake as unavailable and hid the
+        toggle, which is the "the proximity sensor does not do anything"
+        symptom.
+
+    EnabledByDefault is turned on as well.  That is a deliberate behaviour
+    change and it is safe here only because the sensor was measured working:
+    dumpsys sensorservice in the fix78 dump shows SFH7776 proximity reporting
+    3.00/4.00 on-change events while com.android.systemui's FalsingManager had
+    it open.  If it ever has to be backed out, Settings -> Display ->
+    "Prevent accidental wake-up" is the switch, no reflash needed.
+-->
+<resources>
+    <bool name="config_proximityCheckOnWake">true</bool>
+</resources>

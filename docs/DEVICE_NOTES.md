@@ -5031,3 +5031,326 @@ bionic_compat.h）、`lights7.c`、`tests/test_pcm.c`，`build.sh` 一键重编�
    还有的话）、以及 `exit at ... reason=hold-120s-complete`。
 5. **麦克风**：录一段音；`-- record attempts --` 出现 `start_input_stream`。
 6. **传感器**：`sen:` 那些行里有没有新的 light/prox 事件。
+
+## 40. 自动亮度和距离感应：两个 bool、两条曲线，都在资源里
+
+fix78 的验收结果：**麦克风正常了，声音正常了，亮度条也能调**。§39.4 的判断成立 ——
+lights HAL 一旦导出 `HMI`，亮度、关屏、按键背光就都活了。
+
+剩下两件是新的，而且都不是驱动问题：
+
+- 设置 → 显示 里没有"自适应亮度"这一项；
+- 距离传感器"似乎没生效"。
+
+这两件是同一个性质：**功能开关在资源里是关的**。这台机器之前没有任何设备 overlay
+（`device/kyocera/msm8926-common/overlay/` 这个目录根本不存在），所以所有
+`config_*` 都停在 AOSP 默认值上，而 AOSP 默认值是"别的设备在自己的 overlay 里打开"。
+
+### 40.1 自动亮度：一个 bool 加两条曲线
+
+`config_automatic_brightness_available` 这一个 bool 同时控制两个地方：
+
+| 位置 | false 时 |
+|---|---|
+| `DisplaySettings.isAutomaticBrightnessAvailable()` | 直接把 preference `removePreference` 掉，设置里就没有这一项 |
+| `DisplayPowerController` 构造函数 | `mUseSoftwareAutoBrightnessConfig = false`，不建 `AutomaticBrightnessController`，连光感都不注册 |
+
+所以"开关不在"和"就算在也没用"是同一个原因。fix78 的 dump 里 `setting: mode=0`
+也印证了这一点（`Settings.System.SCREEN_BRIGHTNESS_MODE` 是手动）。
+
+### 40.2 但只把 bool 打开会开不了机
+
+`createAutoBrightnessSpline()` 是这样的：
+
+```java
+final int n = brightness.length;
+y[0] = normalizeAbsoluteBrightness(brightness[0]);   // 空数组 -> AIOOBE
+for (int i = 1; i < n; i++) { x[i] = lux[i - 1]; ... }
+```
+
+这台机器的 `config_autoBrightnessLevels` 和 `...LcdBacklightValues` 都是**空数组**。
+bool 一打开，`brightness[0]` 就是 `ArrayIndexOutOfBoundsException`，而这个异常在
+`DisplayPowerController` 的构造路径上 —— 打穿的是 system_server，也就是开机循环。
+**bool 和两个数组必须一起改。**
+
+数组本身还有两个坑：
+
+- `x[0]` 恒为 0（`Spline` 的第一个控制点是 0），所以 `lux[0]` 不能是 0，否则
+  `Spline.createSpline()` 因为 x 不严格递增抛 `IllegalArgumentException`，被 catch
+  成 `"Could not create auto-brightness spline"`，功能**静默失效**，看起来就像没修；
+- 背光数组必须比 lux 数组**多一个**（多出来那个是"比第一个阈值还暗"）。
+
+fix79 用的曲线（写进 `overlay/.../core/res/res/values/config.xml`，也写进了镜像）：
+
+```
+lux:      5  20  60  150  400  1000 2500 6000 10000 20000
+backlig: 12  25  45   70   95   120  150  185   220   245  255
+```
+
+### 40.3 距离感应：bool 在另一个 apk 里
+
+`config_proximityCheckOnWake` 不在 framework-res，在
+`/framework/org.cyanogenmod.platform-res.apk`（包名 `cyanogenmod.platform`，
+运行时包 id `0x3f`）。dump 里那一行就是它：
+
+```
+ConstraintsHelper: construct key=proximity_on_wake available=false
+```
+
+`available=false` 的后果是两件事：CM 的设置界面根本不生成这个开关；
+`PhoneWindowManager` 也不会注册 PS 监听（"口袋里别点亮屏幕"变成死代码）。
+
+而**传感器本身是好的**，dump 里 `dumpsys sensorservice` 写得很清楚：
+
+```
+0x00000008) SFH7776 Proximity Sensor | OSRAM | type: android.sensor.proximity(8) | wakeUp
+SFH7776 Proximity Sensor: last 3 events
+   1 (ts=62.924165000) 4.00
+   2 (ts=63.121939000) 3.00
+   3 (ts=63.222930000) 4.00
+Previous Registrations:
+   22:52:14 activated handle=0x00000008 ... package=com.android.systemui.classifier.FalsingManager
+```
+
+有事件、数值合理（3~4 cm，手不在上方）、SystemUI 的 FalsingManager 一直在用它。
+所以"距离传感器没生效"从头到尾是**功能开关**，不是硬件也不是 HAL。
+
+fix79 把 `config_proximityCheckOnWake` 和 `...EnabledByDefault` 都打开了 ——
+后者是行为改变（默认就在口袋里挡亮屏），只因为上面这段证据说明 PS 读数正常才敢开。
+想关掉：设置 → 显示 → 防止误触，不用重刷。
+
+### 40.4 改这两个 apk 的前提：platform key
+
+framework-res 和 CM 平台资源都是用 AOSP **platform key** 签的：
+
+```
+sha256 Fingerprint=C8:A2:E9:BC:CF:59:7C:2F:B6:DC:66:BE:E2:93:FC:13:
+                  F2:FC:47:EC:77:BC:6B:2B:0D:52:C1:1F:51:19:2A:B8
+```
+
+私钥在 `platform_build/android-7.1.2_r1/target/product/security/`（`platform.pk8`
++ `platform.x509.pem`）。**换成任何别的 key 都不行**：framework-res 会被
+PackageManager 拒收，或者反过来把所有 `android.uid.system` 的应用签名校验打掉 ——
+两种结果都是开不了机。AOSP 的 `testkey`（`A4:0D:A8:…`）也不行，指纹对不上。
+
+### 40.5 不能用 jarsigner
+
+`jarsigner` 会把整个 apk 的所有 entry 按 DEFLATE 重写一遍，包括
+`resources.arsc`。而**这个 entry 必须是 STORED**：AAPT 打 apk 时就是这么打的，
+`AssetManager` 用 `mmap` 直接按偏移读资源表，压缩过的它读不到 —— 结果是资源全丢，
+开机第一个 `Resources$NotFoundException` 就来自 framework。
+
+```
+19862168  Stored  19862168   0%  resources.arsc     <- 必须是这样
+```
+
+`jarsigner -verify` 仍然可以用，只是用来**验证**签名块本身对不对（`jar verified.`），
+产物不能拿它签。
+
+### 40.6 手写的 v1 签名 + 4 字节对齐
+
+树里没有 build-tools 的 `apksigner`，所以 v1 签名是脚本自己拼的
+（`tools/image/apkresign.py`）：
+
+1. `META-INF/MANIFEST.MF`：每个 entry 一段 `Name:` + `SHA-256-Digest:`，
+   72 字节折行、续行以空格开头；
+2. `META-INF/CERT.SF`：`SHA-256-Digest-Manifest` 加上每段的
+   `SHA-256-Digest`（对 MANIFEST.MF 里那一段的字节算）；
+3. `META-INF/CERT.RSA`：`openssl smime -sign -binary -noattr -md sha256`
+   出的 DER PKCS#7。
+
+打包顺序照原 apk 抄，每个 entry 的 `compress_type` 也照抄；STORED 的条目补 4 字节
+对齐，用的就是 zipalign 自己的办法 —— 往 extra field 里塞一个 id `0xd935` 的填充块：
+
+```python
+pad = (4 - ((cur + 30 + len(name)) % 4)) % 4
+zi.extra = struct.pack("<HH", 0xD935, pad - 4) + b"\0" * (pad - 4)
+```
+
+原 apk 带 APK Signature Scheme v2 块，重签后没有了（v1 only）。Android 7 上 v2 是
+可选的，PMS 会退回 v1 校验，这条路是通的 —— 代价是 apk 小了 10 KB：
+
+```
+/framework/framework-res.apk   36,713,477 -> 36,703,276
+/framework/org...platform-res.apk  579,301 -> 577,142
+```
+
+### 40.7 单值补丁：bool 就是 4 个字节
+
+一个 bool 资源在 `resources.arsc` 里是 `ResTable_entry`（8 字节头）后面跟一个
+`Res_value`：
+
+```c
+struct Res_value { uint16_t size; uint8_t res0; uint8_t dataType; uint32_t data; };
+```
+
+`dataType` 是 0x12（`TYPE_INT_BOOLEAN`），`data` 就是 0 或 0xFFFFFFFF。改它不需要
+重编，也不用动任何 id：`tools/image/arsc_patch.py` 里就是 `b[e+11] = 0x12;
+pack_into("<I", b, e+12, value)`。
+
+CM 平台那两个 bool 就是这么改的（`0x3f050001` / `0x3f050002`，4 字节 each），
+改完 `aapt dump --values resources` 的资源 id 全表 diff 是 **0 行**。
+
+### 40.8 空数组怎么塞进去：把 bag 搬到 chunk 末尾
+
+数组不是"另一个 blob"，它的 `ResTable_map` 项是**紧跟在 entry 后面**的。原来的空数组
+是 `count = 0` 的 `ResTable_map_entry`，后面紧跟着下一个 entry —— 没有地方放 10 个
+item。而且这个 entry 的 offset 表项只能指向"整条 entry（头 + 内联 items）"。
+
+做法（`arsc_patch.py: set_int_array`）：把整条 entry 复制到 type chunk 的**末尾**，
+把 item 填进去，然后把 entry offset 表里那一项指向新位置。老的那条留在原地当死空间，
+没人读。然后只需要改三个尺寸字段，全是相对值，后面的 chunk 不用动：
+
+```
+type chunk size  += 136 / 148
+package size     += 同上
+table header size += 同上
+```
+
+结果：
+
+```
+resource 0x0107002e android:array/config_autoBrightnessLevels: <bag>
+  Count=10   5 20 60 150 400 1000 2500 6000 10000 20000
+resource 0x0107002f ...LcdBacklightValues: <bag>
+  Count=11   12 25 45 70 95 120 150 185 220 245 255
+resource 0x01120025 android:bool/config_automatic_brightness_available: d=0xffffffff
+```
+
+`resources.arsc` 从 19,861,884 长到 19,862,168（+284）。9448 条资源的 spec 全表
+逐行 diff **0 行**（连 flags 都一样），`aapt` 的 stderr 是空的。
+
+### 40.9 fix79 改了什么
+
+镜像 `system-fix79.img.zip`（只刷 system，boot 仍是 fix72 那版 #25 内核）：
+
+| 路径 | 从 | 到 |
+|---|---|---|
+| `/framework/framework-res.apk` | 36,713,477 原厂 | 36,703,276：`automatic_brightness_available=true` + 两条曲线 |
+| `/framework/org.cyanogenmod.platform-res.apk` | 579,301 原厂 | 577,142：`proximityCheckOnWake`、`...EnabledByDefault` 均 true |
+| `/vendor/bin/kcadsp.sh` | fix78 | 加 `bootwatch`（开机 90 s 内每 2 s 采一次线程状态）、`sec display` 段 |
+| `/vendor/bin/kcledguard.sh` | fix78 | 加相位心跳（只写 `kc_led.log`，不写 kmsg） |
+
+另外：`kcledguard.sh` 的保持时间没动（还是 120 s 独占），但每 250 / 100 次循环记
+一行 `t=… phase1 v=…` 到 `kc_led.log`，这样"55 秒那一下闪"到底是谁写的就有时间线了。
+`kcadsp.sh` 的 `sec display` 打 `mUseSoftwareAutoBrightnessConfig` /
+`mAutomaticBrightnessController` / `mProximitySensor` / `mAmbientLux` 和
+`dumpsys window policy` 的 proximity 状态 —— 这三件是下一轮的判据。
+
+### 40.10 这一轮要看的
+
+1. **自动亮度**：设置 → 显示 里出现"自适应亮度"。打开后 `sec display` 里
+   `mUseSoftwareAutoBrightnessConfig=true`、`mAutomaticBrightnessController` 不是
+   null；手遮住光感，`mAmbientLux` 和 `lcd:` 都要跟着变。
+2. **距离感应**：`dumpsys display` 里 `mProximitySensor=` 不是 null；设置 → 显示 里
+   出现"防止误触"且默认开；手盖住听筒附近按电源键，屏幕不该亮。
+3. **开机 25 秒**：`kc_boot.log` 里 sensorservice 那个线程是 D 还是 S。
+4. **背光**：`kc_led.log` 里的心跳还在不在，55 s 那一下还有没有。
+
+## 41. 为什么不能重编 framework-res：私有属性会重新编号
+
+这一节记的是 fix79 走错又退回来的那条路，因为它是一次"看起来成功了"的失败。
+
+### 41.1 apktool 能编出来，而且能开机
+
+`apktool d` 解开 framework-res，改 `res/values/config.xml`，`apktool b` 回去，
+签名，刷机 —— 这条路是通的，资源也能读到。问题不在能不能跑，在**资源 id 变了**。
+
+```
+aapt dump --values resources framework-res.apk | grep 'spec resource'
+  原厂   9448 行
+  重编   9448 行
+  集合   完全相同
+  顺序   9246..9448 这 203 行整段不同
+```
+
+差的这 203 条是 `android:^attr-private/*`。apktool 把它们解到单独一个
+`res/values/^attr-privates.xml`，回编时按**名字排序**重新分配 id，而原厂是 aapt 按
+`public.xml` 里的声明顺序分配的。名字一个不少，id 一个不剩，全对不上。
+
+### 41.2 后果：别人的代码还拿着旧 id
+
+`^attr-private` 是 `android` 包里的私有属性，框架自己的 style/layout 用它 —— 那些
+跟着 apk 一起重编了，没问题。但镜像里还有一堆**早就编译好的** apk（SystemUI、
+Settings、CMParts、CM 设置），它们编译时拿到的是**旧 id**，二进制 XML 里存的就是
+数字，运行时不会重新查名字。
+
+于是 `0x01160001` 在它们眼里是 `textColorPrimaryActivated`（颜色），在重编后的表里
+变成了 `actionModePopupWindowStyle`（样式引用）。轻则颜色不对，重则
+`Resources$NotFoundException` 或者把颜色值当资源 id 用。这类问题**不会在开机时
+报错**，只在某个界面被打开的时候出现 —— 是最难查的那种。
+
+所以规则是：**framework-res 不重编，只做原地补丁。** 补丁补不了的东西，就不改。
+
+### 41.3 原地补丁能改什么
+
+| 想改的 | 能不能原地改 |
+|---|---|
+| bool / int / color / dimen / string 的值 | 能，`Res_value.data` 就 4 字节 |
+| 空数组 -> 非空 | 能，见 §40.8（搬 bag） |
+| 已有数组改长度 | 能，同一套办法 |
+| 加一个新资源、改一个字符串的内容（长度变了） | 不能，会牵动 string pool 和所有偏移 |
+| 改 layout / style 的结构 | 不能，等于重编 |
+
+两条曲线的长度是固定的（10 / 11），所以这一轮刚好都在"能"这一列。
+
+### 41.4 验证办法
+
+不是"刷进去看看能不能开机"，那太粗。三个机械检查，任何一个不过就不刷：
+
+```bash
+# 1. 资源 id 全表，逐行（含 flags）必须 0 行差异
+aapt dump --values resources orig.apk | grep '^\s\+spec resource' > a.txt
+aapt dump --values resources new.apk  | grep '^\s\+spec resource' > b.txt
+diff a.txt b.txt          # 必须为空
+
+# 2. aapt 自己不能有怨言
+aapt dump --values resources new.apk >/dev/null   # stderr 必须为空
+
+# 3. 签名块本身
+jarsigner -verify new.apk                          # jar verified.
+unzip -v new.apk | grep resources.arsc             # Stored
+```
+
+第 2 条是有用的：第一次做的时候 `set_int_array` 忘了把 16 字节的
+`ResTable_map_entry` 头一起搬过去，aapt 直接吐
+
+```
+ResTable_entry size 0x1 is too small
+INVALID RESOURCE 0x0107002e: NON-INTEGER ResTable_entry SIZE: 0x1
+```
+
+—— 说明 offset 指到了 map 数据上，而不是 entry 头上。没有这条检查，这个错会一路
+带到刷机。
+
+### 41.5 顺带：这些工具在树里了
+
+| 文件 | 干什么 |
+|---|---|
+| `tools/image/apkresign.py` | `sign`：重打 apktool 产物并按原 apk 的顺序/压缩方式重签；`patch`：替换 `resources.arsc`（`--arsc` 或 `--set OFFSET:HEX`）后重签 |
+| `tools/image/arsc_patch.py` | 直接改 `resources.arsc`：`--bool`、`--int-array`、`--dump`，不重编、不动 id |
+
+## 42. 镜像打 zip 会莫名胖 17 MB
+
+fix79 第一次打包出来 402,611,350 字节，fix78 是 384,964,007。内容只差几十 KB，
+体积差了 17.6 MB，压缩率从 74% 掉到 73%。
+
+原因：`debugfs` 写文件是**走日志**的。ext4 的 journal 在 1.4 GB 的镜像上是 5615 个
+块（21.9 MB），`debugfs -w` 把新数据写进去之后，这 21.9 MB 里全是"近似的元数据"，
+压缩不动。而 `zerofree` 只处理**空闲块**，日志块是 in-use，它不碰。
+
+清日志要小心，但这次是安全的：`dumpe2fs -h` 里 `Journal start: 0`、
+`sequence: 1` 说明没有待回放的事务，所以把日志体清零不会丢东西。保留头 8 KB
+（jbd2 超级块），剩下的从块 +2 开始填零：
+
+```python
+# journal inode 8 的 extent 从 debugfs -R "stat <8>" 里读
+off = phys_start * 4096 + 8192
+zero(off, (phys_end + 1) * 4096 - off)
+```
+
+之后 `e2fsck -fn` 依旧干净，`dumpe2fs -h` 依旧显示 `Journal start: 0`，zip 回到
+384,057,801。
+
+所以现在的打包顺序固定是：`debugfs` 注入 -> `e2fsck -fn` -> `zerofree` ->
+清日志 -> `e2fsck -fn` -> `zip -6`。

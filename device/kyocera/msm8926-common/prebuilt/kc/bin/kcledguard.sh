@@ -43,6 +43,14 @@ say() {
 
 now() { cut -d' ' -f1 /proc/uptime 2>/dev/null; }
 
+# Heartbeat, file only so /dev/kmsg stays readable: fix78's log ended at the
+# first "caught" with no phase-1 completion and no exit line, i.e. the script
+# stopped existing and nothing said why.  A line every five seconds turns
+# "the log just stops" into a timestamp.
+beat() {
+    for f in $L1 $L2; do echo "beat $*" >> $f 2>/dev/null; done
+}
+
 # Whatever happens, say why we stopped.  A silent exit is what made fix77's
 # log useless: two lines, then nothing, with no way to tell whether the loop
 # ended, the script was killed, or the writes started failing.
@@ -84,6 +92,7 @@ while [ "$i" -lt 3000 ]; do
         prev=0
     fi
     i=$((i + 1))
+    [ $((i % 250)) -eq 0 ] && beat "t=$(now) phase1 v=$(cat "$B" 2>/dev/null) n=$n"
     sleep 0.02
 done
 say "t=$(now) fast phase done, corrected=$n"
@@ -91,6 +100,7 @@ say "t=$(now) fast phase done, corrected=$n"
 # Phase 2: 50 ms until HOLD seconds of uptime.  Nothing should write here; if
 # something does, it is the framework (the lights HAL) rather than kcbtnled,
 # and pidof button tells us which.
+j=0
 while :; do
     u=$(now | cut -d. -f1)
     [ -z "$u" ] && break
@@ -101,6 +111,8 @@ while :; do
         [ "$n" -le 30 ] && say "caught v=$v t=$(now) (slow phase) btn=$(pidof kcbtnled 2>/dev/null)"
         echo 0 >"$B" 2>/dev/null
     fi
+    j=$((j + 1))
+    [ $((j % 100)) -eq 0 ] && beat "t=$(now) phase2 v=$(cat "$B" 2>/dev/null) n=$n"
     sleep 0.05
 done
 

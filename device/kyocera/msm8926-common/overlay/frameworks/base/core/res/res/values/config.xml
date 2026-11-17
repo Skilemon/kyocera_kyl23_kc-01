@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Device overlay for framework-res.apk, device/kyocera/msm8926-common.
+
+    This directory was missing entirely until fix79, and every value below was
+    therefore sitting at the AOSP default.  That is not cosmetic: an empty
+    config_autoBrightnessLevels is not "no curve configured", it is a landmine
+    -- see the note under config_automatic_brightness_available.
+
+    Path convention: overlay/frameworks/base/core/res/res/values/config.xml is
+    merged into framework-res.apk at build time by the overlay mechanism in
+    build/core/package.mk (the module path of framework-res is
+    frameworks/base/core/res).
+
+    The shipped image does not wait for such a rebuild: framework-res.apk is
+    patched in place, because these are single values and recompiling the
+    whole resource table would renumber the private attributes (docs/
+    DEVICE_NOTES.md section 41).  This file is the value of record, and the
+    two have to be kept in step by hand.
+-->
+<resources>
+
+    <!--
+        Kept off by AOSP for every device; each one turns it on in its own
+        overlay.  This one had no overlay at all, so:
+
+          * Settings -> Display removes the "Adaptive brightness" switch
+            (DisplaySettings.isAutomaticBrightnessAvailable() reads exactly
+            this bool and removes the preference when it is false);
+          * DisplayPowerController sets mUseSoftwareAutoBrightnessConfig =
+            false and never registers a light sensor listener, so even if the
+            switch existed it would do nothing.
+
+        Turning it on without the two arrays below is a boot loop: with the
+        bool true, DisplayPowerController creates the brightness spline from
+        them, createAutoBrightnessSpline() indexes brightness[0] on an empty
+        array, and the ArrayIndexOutOfBoundsException takes system_server
+        down.  The two go together.
+    -->
+    <bool name="config_automatic_brightness_available">true</bool>
+
+    <!--
+        Lux thresholds.  Must be strictly increasing and start above zero:
+        createAutoBrightnessSpline() prepends 0 as the first control point
+        and Spline.createSpline() rejects a duplicate x, so a first entry of 0
+        silently disables the whole feature with "Could not create
+        auto-brightness spline".
+    -->
+    <integer-array name="config_autoBrightnessLevels">
+        <item>5</item>
+        <item>20</item>
+        <item>60</item>
+        <item>150</item>
+        <item>400</item>
+        <item>1000</item>
+        <item>2500</item>
+        <item>6000</item>
+        <item>10000</item>
+        <item>20000</item>
+    </integer-array>
+
+    <!--
+        Backlight for each threshold, plus one for "darker than the first".
+        Exactly one more entry than config_autoBrightnessLevels.  The panel is
+        a 540x960 IPS with 0..255 backlight; this is a conservative curve --
+        dim but readable indoors, full only in daylight.
+    -->
+    <integer-array name="config_autoBrightnessLcdBacklightValues">
+        <item>12</item>
+        <item>25</item>
+        <item>45</item>
+        <item>70</item>
+        <item>95</item>
+        <item>120</item>
+        <item>150</item>
+        <item>185</item>
+        <item>220</item>
+        <item>245</item>
+        <item>255</item>
+    </integer-array>
+
+</resources>
