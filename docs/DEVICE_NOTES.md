@@ -5354,3 +5354,209 @@ zero(off, (phys_end + 1) * 4096 - off)
 
 所以现在的打包顺序固定是：`debugfs` 注入 -> `e2fsck -fn` -> `zerofree` ->
 清日志 -> `e2fsck -fn` -> `zip -6`。
+
+## 43. 拆掉按键灯的调试，和两个还没结案的传感器
+
+fix79 的结果是"一半":设置里那个开关出来了,但按下去看不到反应;距离感应还是没动静。
+这一轮把能确定的部分做掉(按键灯整套调试),把不能确定的部分改成**一次能问清楚的测量**。
+
+### 43.1 自动亮度:框架这一侧已经对了
+
+`dumpsys display` 在 fix79 里第一次给出了完整的那一段:
+
+```
+mUseSoftwareAutoBrightnessConfig=true
+mScreenAutoBrightnessSpline=MonotoneCubicSpline{[(0.0, 0.047: ..), (5.0, 0.098: ..),
+    ... (20000.0, 1.0: ..)]}                       <- 11 个控制点都在
+mLightSensor={Sensor name="SFH7776 Light Sensor", ...}
+mScreenBrightness=30
+-- Automatic Brightness Controller State --
+mLightSensorEnabled=false
+mLightSensorEnableTime=0 (94487 ms ago)            <- 从来没开过
+mAmbientLux=0.0
+mScreenAutoBrightness=-1
+```
+
+也就是说:`config_automatic_brightness_available` 和两条曲线都读进去了(fix78 的判断
+成立),但 `AutomaticBrightnessController` **一次都没有把光感打开**。它的入口只有一个:
+
+```java
+// DisplayPowerController.updatePowerState()
+autoBrightnessEnabled = mPowerRequest.useAutoBrightness
+        && (state == STATE_ON || doze) && brightness < 0;
+mAutomaticBrightnessController.configure(autoBrightnessEnabled, ...);
+// AutomaticBrightnessController.configure()
+boolean changed = setLightSensorEnabled(enable && !dozing);
+```
+
+而 `mPowerRequest.useAutoBrightness` 只来自 PowerManagerService 里那一行:
+
+```java
+// PMS.updateDisplayPowerStateLocked()
+boolean autoBrightness = (mScreenBrightnessModeSetting ==
+        Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC);
+```
+
+`mScreenBrightnessModeSetting` 在 `updateSettingsLocked()` 里重新读,任何一次设置变更
+都会走到那里。所以只剩两种解释:要么那个读的时刻 `mode` 还是 0,要么 PMS 的观察者没
+把它读进来。
+
+### 43.2 报告的时间点比测试早
+
+`kcadsp.sh` 在 `boot_completed` 之后立刻写报告,而用户是拿到机器才去 设置 -> 显示 打开
+开关的。fix79 的 dump 里两个时间点能对上这件事:
+
+- `sec display`(t≈84)说自动亮度没启用;
+- `sec led` 里 `setting: ... mode=1`(t≈90)说已经开了。
+
+6 秒之差,报告写的是"打开之前"。更要紧的是后面:
+
+```
+158.47 | sen: SFH7776 Light Sensor: last 1 events  ... Proximity Sensor: last 1 events
+196.83 | sen: SFH7776 Light Sensor: last 1 events  ... Proximity Sensor: last 1 events
+```
+
+到 t=196 光感仍然只有**一个**事件。如果 `mode=1` 真的让 ABC 打开了光感、采样率 250 ms,
+这里应该是几十个。所以不是"报告写得早"这么简单 —— 关了灯之后也没有事件。
+
+### 43.3 确定的另一半:那 3 秒里 ALS 一个事件都没发
+
+fix79 的直读探针和 fix78 用的是同一段脚本、同一个窗口:
+
+| | fix78 | fix79 |
+|---|---|---|
+| `enable_als_sensor` 写入 1 | `before=0 after=1` | `before=0 after=1` |
+| `/dev/input/event6` 3 秒内 | 4 个事件(100 / 98 / 100 / 82 lux) | **0 个** |
+
+驱动里 `sfh7776_als_work_handler()` 是**无条件**上报的,每 `als_poll_delay`(250 ms)
+一次,不管值有没有变:
+
+```c
+luxValue = sfh7776_als_lux_conversion(...);
+input_report_abs(data->input_dev_als, ABS_MISC, (int)luxValue);
+input_sync(data->input_dev_als);
+schedule_delayed_work(&data->als_dwork, msecs_to_jiffies(data->als_poll_delay));
+```
+
+所以"没有事件"只有一种含义:**这个 work 没跑**。`enable_als_sensor` 写入是计数器的,
+写 1 之后如果 `<=1` 就 `sfh7776_select_control()` + 重新排 work;`before=0` 说明计数器
+本来是 0,那一次写入应该正好触发它。
+
+sensorservice 那边记到的那一个事件是 `0.00` —— 那是驱动在 enable 时补发的
+`input_report_abs(ABS_VOLUME, serial)`,被 HAL 当成了 lux 值。
+
+结论:光感这条链上有一环是死的,但**从框架状态看不出是哪一环**。三个数就能定:
+
+| 数 | 谁写的 | 含义 |
+|---|---|---|
+| `mLightSensorEnabled` | 框架(ABC) | false = 框架根本没开 |
+| `/sys/class/input/input6/enable_als_sensor` | HAL | 0 = HAL 没往驱动写 |
+| `mAmbientLux` / `mLastObservedLux` | 框架(ABC) | 一直是 0 = 驱动没给数据 |
+
+组合起来:框架 true + 驱动 0 → HAL 断了;框架 true + 驱动 1 + lux 0 → 驱动/芯片;
+框架 false → 回去查 §43.1 那两行。
+
+### 43.4 距离感应:功能确实在,但判据在 PWM 自己身上
+
+先把"这个 ROM 里到底有没有那个功能"这件事钉死。`services.jar` 的 dex 里有:
+
+```
+proximity_on_wake              mProximityWakeEnabled       mProximityWakeSupported
+wakeUpWithProximityCheck       runWithProximityCheck       checkProximity
+"Not waking up. Proximity sensor is blocked."
+"Proximity sensor took too long, wake event already triggered!"
+```
+
+最后那条是安全网:传感器不回事件时,电源键最多等一个超时,不会变成砖。`proximity_on_wake`
+是 `Settings.System` 的键,PWM 在 init 里按 `config_proximityCheckOnWake` 决定要不要
+`getDefaultSensor(TYPE_PROXIMITY)`。
+
+fix79 已经把 `config_proximityCheckOnWake` 和 `...EnabledByDefault` 都设成 true,所以
+剩下的可能只有两个:那个 bool 没被读到(PWM 在 SensorService 起来之前就问了一遍),
+或者 `Settings.System` 里 `proximity_on_wake` 这一行早就存在且是 0(资源默认值只在
+**那一行不存在**时生效)。
+
+`dumpsys window policy` 里 `mProximityWakeSupported` / `mProximityWakeEnabled` 加
+`settings get system proximity_on_wake`,这一组就能分开。
+
+顺带一个事实:`dumpsys display` 里 `mProximitySensorEnabled=false` 是**正常**的 ——
+那个 handle 是 `LIGHT_ID_PROXIMITY` 的屏幕锁(通话中贴脸关屏)用的,要
+`PROXIMITY_SCREEN_OFF_WAKE_LOCK` 才会开。整机空闲时它就是 false。
+
+### 43.5 按键灯:整套拆掉
+
+fix76 到 fix79 围绕"开机时背光闪两下"堆了三样东西:
+
+| 文件 | 干什么 |
+|---|---|
+| `/vendor/bin/kcbtnled` | 632 KB 静态 ARM,自己解析 CMSettings 的 SQLite 读"按键背光亮度/超时",按键时点灯 |
+| `/vendor/bin/kcledguard.sh` | 前两分钟把节点按在 0,记录别人写的每个值 |
+| `/vendor/bin/kcbtnlednet.sh` | 200 秒兜底,怕 guard 死在半路导致键永远不亮 |
+
+现在全删了。理由是 fix76 那一条自己就写明了写者是谁:
+
+```
+caught v=5 t=7.89 cam= btn=494      <- 7.89 s,值 5,pidof kcbtnled = 494
+```
+
+而 fix79 的 `kc_led.log` 把它补完了:
+
+```
+start t=6.89 v=0 hold=120s
+beat ... phase1 v=0 ...
+caught v=5 t=59.60 cam= btn=        <- 抓到,然后没有下文
+```
+
+guard 抓到 v=5 之后自己就没了(它该继续 beat 到 120 s),`kcbtnled` 一直没被放行,
+直到 `kcbtnlednet` 的 200 秒兜底把它拉起来(`kclog.txt` 里 `[207] kcbtnled fix24 start`)。
+而 t≈90 的报告里 `button: 5 of 255` —— 那个 5 是**框架的 lights HAL** 写的,不是这个守护。
+
+所以:闪的那两下 = kcbtnled 启动时点 255、5 秒后淡出、guard 中间把 0 写回去,一前一后
+就是两次。没有守护就没有写者。`button-backlight` 现在归框架,而框架这一侧是 fix78 修好的
+(`HMI` 符号),这也是为什么它现在能写 5 了 —— 以前根本写不了,才有"7.1 从不点亮按键灯"
+那个判断。
+
+### 43.6 报告瘦身
+
+`kcadsp.sh` 从 28 175 字节降到 17 544,行数 604 -> 380。
+
+| 去掉 | 为什么 |
+|---|---|
+| `bootwatch`(开机 90 s 每 2 s 采线程状态) | 那 25 秒是 ADSP 起不来拖住 audioserver,已经好了 |
+| `-- boot stall --` 段 | 同上 |
+| `-- direct probe --`(直读 /dev/input/event6) | 被 HAL 抓着的节点读不到东西,换成了 HAL 侧的 `enable_als_sensor` |
+| `sec pcm`(21 个 PCM 节点的 status) | 声音好了,只需要一行"有没有忙的节点" |
+| `-- audio policy (full, first 110 lines) --` | 麦克风好了 |
+| `audiosnap()` / 1200 次 1 秒采样 / `.ev` 文件 | 那是 fix72-fix78 诊断声音用的,每轮往 kmsg 写 40 KB |
+| `-- kcledguard --` 段 | guard 没了 |
+| `sen:` 每 30 秒一行 | 换成下面那个时间线 |
+
+| 新增 | 为什么 |
+|---|---|
+| `dispblock`:power + display + window policy + settings + 输入节点,一次 20 行 | 三个判据在同一时刻取,能互相验证 |
+| 开机后 5 分钟时间线,每 60 秒一次 `dispblock` | 报告写的时候用户还没走到设置,只有时间线能给出"同一个动作"的前后 |
+| 提示语(遮光感 2 秒、盖听筒 3 秒) | 采样是自动的,动作要在窗口里做 |
+
+### 43.7 fix80 改了什么
+
+镜像 `system-fix80.img.zip`(只刷 system,boot 仍是 fix72 那版 #25 内核):
+
+| 路径 | 从 | 到 |
+|---|---|---|
+| `/vendor/bin/kcbtnled` | 632 016,fix24 自建 | **删除** |
+| `/vendor/bin/kcledguard.sh` | fix78 | **删除** |
+| `/vendor/bin/kcbtnlednet.sh` | fix78 | **删除** |
+| `/etc/init/kyl23-extra.rc` | 三个 service + `sys.kcbtnled.late` 触发器 | 全删,原位留一段说明 |
+| `/vendor/bin/kcadsp.sh` | 28 175,604 行 | 17 544,380 行 |
+| `/framework/framework-res.apk` | fix79 | 不变(00b8b940) |
+| `/framework/org.cyanogenmod.platform-res.apk` | fix79 | 不变(3009dd66) |
+
+### 43.8 这一轮要看的
+
+1. **开机后别再闪**:按键灯只在框架要它亮的时候亮。`kc_led.log` 不会再出现。
+2. **时间线**:`/data/local/tmp/kcaudio.txt` 末尾会有 `===== sensor timeline =====`,
+   五次 `-- t+60 s --` … 每次 20 行。打开自适应亮度、遮光感、盖听筒都在这五分钟里做。
+3. **三个数**:看最后一次采样里 `mLightSensorEnabled`、`input: light=... en=?`、
+   `mAmbientLux` —— 见 §43.3 的表。
+4. **距离**:`dumpsys window policy` 的 `mProximityWakeSupported` / `mProximityWakeEnabled`
+   和 `setting: ... prox=?`。

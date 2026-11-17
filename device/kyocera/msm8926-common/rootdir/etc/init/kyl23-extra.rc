@@ -535,14 +535,7 @@ service kclogcat /system/bin/logcat -b main,system,crash,radio -v threadtime -f 
 on property:sys.boot_completed=1
     start kclogcat
 
-# fix78: kcbtnled does not start on boot_completed any more either.  Boot
-# completing is not the end of the flash window -- the user sees the two
-# blinks *after* the animation, which is precisely when kcbtnled comes up and
-# its key handler first fires (input code 330, "set 255 (key)").  It now waits
-# for kcledguard to say the two minutes are over.
-on property:sys.kcbtnled.late=1
-    start kcbtnled
-
+# kcbtnled is gone (fix80); see the note where its service used to be.
 # Bluetooth package state: clear the flag before PackageManager reads it.
 #
 # fix32's wpa hook ran `pm disable com.android.bluetooth` to stop the 4.4 crash
@@ -634,86 +627,28 @@ service p2p_supplicant /system/bin/wpa_supplicant \
     oneshot
 
 # ---------------------------------------------------------------------------
-# Capacitive key backlight.  7.1 does not time LIGHT_ID_BUTTONS out by itself
-# and the framework never even asks for it at a key press, so a tiny daemon
-# owns the LED:
-#   * lights it on any EV_KEY down (logging what the kernel read back),
-#   * kills it after the timeout, or immediately when the panel blanks,
-#   * follows Settings -> Buttons -> Backlight, i.e. CMSettings.Secure
-#     "button_brightness" (0 = illumination off) and "button_backlight_timeout"
-#     (milliseconds).
+# Capacitive key backlight: nothing custom owns it any more.
 #
-# The two values are read by the daemon itself, straight out of the provider's
-# SQLite file: it walks the b-tree read-only, with no sqlite3 binary, no locks
-# and no child process.  Every earlier attempt used a shell loop with sqlite3,
-# and each one failed at a different layer -- wrong key name (fix13), missing
-# /xbin/sqlite3 (fix15), and finally a script that logged "started" and then
-# never logged anything again (fix16/fix17), which left the daemon on its
-# compiled-in 255/5000 defaults no matter what the page said.  Parsing the file
-# in-process removes that whole class of failure.
+# What used to be here was a 630 KB daemon (kcbtnled) that parsed the CMSettings
+# provider's SQLite file in-process to follow "button_brightness" /
+# "button_backlight_timeout", plus a guard script (kcledguard) that held the
+# node at 0 for the first two minutes of uptime and undid whatever else wrote
+# to it, plus a deadline script (kcbtnlednet) in case the guard died.
 #
-# State changes go to /cache/kclog.txt (mirrored to /data/misc and the card) and
-# every decision is also written to the kernel log as KCLED -- that second path
-# is the important one: the cache partition is 458 MB and a dump only ever
-# returns its first 20 MB, while the kernel log lands on the 20 MB "log"
-# partition, which dumps in well under a minute.  The daemon also prints the
-# physical offset of each of its log files with FIEMAP, so "the log is missing"
-# can never again be confused with "the log was written past the dump window".
+# That whole contraption existed because of one symptom: the keys blinked twice
+# around the boot animation.  It never removed the blinking -- it moved it, and
+# the dumps kept showing one transition the guard could not attribute
+# (fix79: "caught v=5 t=59.60 cam= btn=", no daemon running at that second,
+# guard dead right after printing it).
+#
+# The blinking was the debug itself.  The daemon lights the keys to 255 on its
+# own start-up and fades them out on its 5 s timeout; the guard forced 0 back
+# and the two writes in a row are the two blinks.  With no daemon there is no
+# writer, and the node belongs to the framework's lights HAL again -- the same
+# HAL whose HMI symbol was fixed in fix78, which is why LightsService now gets
+# a device and sets button-backlight itself (fix79 dump: "button: 5 of 255"
+# with kcbtnled not yet running).
 # ---------------------------------------------------------------------------
-# The fix76 dump settled the flash question.  kcledguard caught exactly one
-# transition in the boot window:
-#
-#     caught v=5 t=7.89 cam= btn=494
-#
-# i.e. 7.89 s, brightness 5, and pidof kcbtnled returned 494 -- the writer was
-# this daemon's own start-up light (it fades 0 -> 255 and holds for its 5 s
-# timeout), not the camera, not a DT line, and not the framework (its lights
-# HAL is dead, see below).  Started from class core it therefore lit the keys
-# in the middle of the boot animation, which is the "flashes twice".
-#
-# fix77 moved it to boot_completed and the flash simply moved with it: the user
-# now sees "two blinks just after the boot animation ends".  fix78 gives the
-# node to kcledguard for the first two minutes and starts this only when the
-# guard sets sys.kcbtnled.late.  kcbtnlednet.sh is the fallback if the guard
-# dies before it gets there.
-service kcbtnled /vendor/bin/kcbtnled
-    seclabel u:r:init:s0
-    class core
-    user root
-    group root system input
-    disabled
-
-# ---------------------------------------------------------------------------
-# Hold the button backlight at 0 across the boot animation, and record what
-# somebody else writes to it.
-#
-# Section 36.4 blamed this on a DT collision (gpio-leds on GPIO 34 vs the
-# camera's CAM_AF_PWDM).  That was wrong, and the dump that disproved it is
-# simply the boot image's own DTB: it has no gpio-leds node at all --
-# qcom,leds@a100 is "okay" and the button backlight is PMIC MPP2 with
-# default-state off, exactly as the factory built it.  So the flashing is
-# software writing brightness, and the writers are kcbtnled and the framework's
-# lights HAL.
-#
-# Started from post-fs-data rather than class core, because class core runs at
-# ~7 s and the flash is over by then.  See kcledguard.sh for what it records.
-# ---------------------------------------------------------------------------
-service kcledguard /vendor/bin/kcledguard.sh
-    seclabel u:r:init:s0
-    user root
-    group root system
-    oneshot
-
-# The safety net for kcledguard: if that script dies before its last line,
-# kcbtnled would never start and the keys would never light again.  This holds
-# the node's owner to a fixed deadline instead of depending on the guard.
-service kcbtnlednet /vendor/bin/kcbtnlednet.sh
-    seclabel u:r:init:s0
-    class core
-    user root
-    group root system
-    oneshot
-
 # ---------------------------------------------------------------------------
 # /dev/fuse does not exist: the kernel has FUSE built in (no uevent) and the
 # ramdisk ueventd.rc has no static entry for it.  Create it before vold tries
@@ -743,10 +678,9 @@ on post-fs-data
     # (the images shipped during bring-up were built by hand and already had
     # it).  Set it here, before any of them is exec'd or started below.  On a
     # hand-built image this is a no-op.
-    chmod 0755 /vendor/bin/kcwifi /vendor/bin/kcboot /vendor/bin/kcbtnled
+    chmod 0755 /vendor/bin/kcwifi /vendor/bin/kcboot
     chmod 0755 /vendor/bin/kcfuse.sh /vendor/bin/kcssr.sh /vendor/bin/kcadsp.sh
     chmod 0755 /vendor/bin/kctail.sh /vendor/bin/kcshut.sh /vendor/bin/kchalt.sh
-    chmod 0755 /vendor/bin/kcledguard.sh
     chmod 0755 /vendor/bin/kcstate.sh /vendor/bin/kcstate-boot.sh
     chmod 0755 /vendor/bin/kcstate-delay.sh /vendor/bin/kc_bootanim.sh
     chmod 0755 /vendor/bin/kccam.sh /system/etc/kcfix.sh
@@ -828,11 +762,6 @@ on post-fs-data
     start kcssr
     start kcadsp
 
-    # Before class core starts kcbtnled.  The keys flash in the window that
-    # opens here (~4.3 s), not after the boot animation, so the guard has to
-    # own the node first; it then holds it at 0 for four minutes and writes a
-    # timestamped line for every value it had to undo.
-    start kcledguard
 
     # /cache is where every one of these scripts leaves its transcript, and
     # the bluetooth process (uid 1002) needs to be able to write next to it.

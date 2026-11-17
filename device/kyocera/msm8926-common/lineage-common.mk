@@ -167,7 +167,7 @@ PRODUCT_PACKAGES += \
 # the first exec.  (The images used during bring-up were assembled by hand and
 # already carried 0755, which is why this only matters for a ROM built here.)
 KC_PREBUILT := $(LINEAGE_COMMON_PATH)/prebuilt/kc
-KC_BINS := kcboot kcfuse.sh kcbtnled kc_bootanim.sh kcstate.sh kcwifi \
+KC_BINS := kcboot kcfuse.sh kc_bootanim.sh kcstate.sh kcwifi \
            kccam.sh kcssr.sh kcstate-delay.sh kcstate-boot.sh kcadsp.sh \
            kcshut.sh kctail.sh kchalt.sh
 KC_LIBS := libkccabi.so libkcabi.so libkchwc.so

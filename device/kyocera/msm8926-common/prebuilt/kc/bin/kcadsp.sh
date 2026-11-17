@@ -2,16 +2,15 @@
 #
 # kcadsp -- the one thing that runs as root on this device without adb.
 #
-# It does four jobs, in this order, and none of them needs a terminal, a
+# It does three jobs, in this order, and none of them needs a terminal, a
 # mounted /data from a host, or USB:
 #
 #   1. bring USB up itself (the framework never manages it on this port, and
 #      the gadget refuses to enable until iSerial is written -- see below);
 #   2. leave a small report where any file manager can read it;
-#   3. keep sampling once a second, so a sound played *later* is recorded at
-#      the transition, not two seconds after it;
-#   4. when playback finally starts, take one deep snapshot of AudioFlinger
-#      while the stream is live -- that is the only moment it is true.
+#   3. stop.  It used to also sample once a second for twenty minutes and take
+#      AudioFlinger snapshots when playback started; that was for the sound
+#      work and it is gone as of fix80 (see the note at the end of the file).
 #
 # Where the report goes -- one file, and only one:
 #
@@ -109,48 +108,6 @@ while [ $i -lt 10 ]; do
     i=$((i+1))
 done
 
-# ---- 1b. who blocks the boot, and on what ---------------------------------
-# PhoneWindowManager asks SensorManager for the proximity sensor inside its
-# init(), which WindowManagerService runs on the "android.ui" thread with
-# runWithScissors() -- the caller blocks until it returns.  SensorService
-# fills its sensor list on a thread of its own.  fix78's boot put 25 s
-# between the two:
-#
-#   22:51:41.386 SensorService: nuSensorService starting...
-#   22:51:41.657 ServiceManager: Waiting for service sensorservice...   <- ui
-#   ... 25 one-second lines ...
-#   22:52:06.226 SensorService: nuSensorService thread starting...
-#
-# One of them is waiting on the other; /proc says which, and the state says
-# what kind of wait it is: D is a syscall in the kernel (i2c, sysfs, mmap),
-# R is the CPU, S is a mutex or a sleep.  Twenty-five seconds is either a
-# blocking driver call or a fixed timeout, and those two have very different
-# fixes, so this runs in the background for the first 90 s of uptime and
-# writes to its own file.
-bootwatch() {
-    o=/data/local/tmp/kc_boot.log
-    : >"$o" 2>/dev/null
-    n=0
-    while [ "$n" -lt 45 ]; do
-        p=$(pidof system_server 2>/dev/null)
-        if [ -n "$p" ]; then
-            t=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
-            for s in /proc/$p/task/*; do
-                [ -r "$s/stat" ] || continue
-                c=$(cat "$s/comm" 2>/dev/null)
-                st=$(cut -d' ' -f3 "$s/stat" 2>/dev/null)
-                case "$c:$st" in
-                    *Sensor*|*sensor*|main:*|android.ui:*|*:D)
-                        echo "$t ${s##*/} $c $st $(cat "$s/wchan" 2>/dev/null)" >>"$o" 2>/dev/null
-                        ;;
-                esac
-            done
-        fi
-        sleep 2
-        n=$((n+1))
-    done
-}
-bootwatch &
 # ---- 2. wait for the framework -------------------------------------------
 # USB must not be touched before system_server has read its own property, or
 # UsbDeviceManager overwrites whatever we set two seconds later.
@@ -259,7 +216,55 @@ usbviaen() {
 } >"$UB" 2>&1
 
 # ---- 4. the report -------------------------------------------------------
+# Short on purpose.  fix80 removed everything that only existed while the audio
+# and key-backlight questions were open: the boot-stall sampler (the 25 s was
+# the ADSP boot blocking audioserver, and that is fixed), the 21-line PCM status
+# table, the 110-line audio policy dump, the whole AudioFlinger deep snapshot
+# machinery and the sensor probe that read /dev/input/event6 by hand.
+#
+# What is left answers two questions that are still open:
+#
+#   auto-brightness   Does the framework ever enable the light sensor?  The
+#                     curve is loaded (mScreenAutoBrightnessSpline), the bool is
+#                     on (mUseSoftwareAutoBrightnessConfig=true), so the only
+#                     piece that can still be missing is the *enable* side:
+#                     PowerManagerService's mScreenBrightnessModeSetting must be
+#                     1, and DisplayPowerController's AutomaticBrightnessController
+#                     must have called setLightSensorEnabled(true).
+#
+#   proximity on wake Is PhoneWindowManager's check armed at all?  It has its
+#                     own sensor handle, separate from the one DisplayPower
+#                     Controller uses for "screen off in a call".
+#
+# Both are sampled three times, eight seconds apart, because the state that
+# matters only exists while the sensors are being covered -- and the report says
+# so between samples, since that is where the user is looking.
 A=$(adspdev)
+# The two input nodes by name, not by number: what the HAL was actually asked
+# for is the difference between "the framework never enabled it" and "the
+# driver was told to sample and stayed silent".
+LI=$(for d in /sys/class/input/input*; do [ "$(cat $d/name 2>/dev/null)" = light ] && echo "$d"; done | head -n1)
+PX=$(for d in /sys/class/input/input*; do [ "$(cat $d/name 2>/dev/null)" = proximity ] && echo "$d"; done | head -n1)
+
+dispblock() {
+    echo "-- t+$1 s (up=$(up)) --"
+    timeout 10 dumpsys power 2>/dev/null |
+        grep -E 'mWakefulness=|mScreenBrightnessSetting=|mScreenBrightnessModeSetting=|mScreenBrightnessOverrideFromWindowManager=|mTemporaryScreenBrightnessSettingOverride=' |
+        head -n 6
+    timeout 10 dumpsys display 2>/dev/null |
+        grep -E 'mUseSoftwareAutoBrightnessConfig=|mProximitySensor=|mProximitySensorEnabled=|mScreenBrightness=|mScreenAutoBrightnessSpline=|mLightSensor=|mLightSensorEnabled=|mLightSensorEnableTime=|mAmbientLux=|mScreenAutoBrightness=|mLastObservedLux=|mDozing=|mAmbientLightRingBuffer=' |
+        cut -c1-240 | head -n 14
+    timeout 10 dumpsys window policy 2>/dev/null |
+        grep -iE 'mProximityWake|mProximitySensor|mProximityTimeOut|mAwake=|mScreenOnEarly=' |
+        head -n 8
+    echo "setting: mode=$(settings get system screen_brightness_mode 2>/dev/null) prox=$(settings get system proximity_on_wake 2>/dev/null) bright=$(settings get system screen_brightness 2>/dev/null)"
+    echo "leds:    lcd=$(cat /sys/class/leds/lcd-backlight/brightness 2>/dev/null) button=$(cat /sys/class/leds/button-backlight/brightness 2>/dev/null)"
+    echo "input:   light=$LI en=$(cat "$LI/enable_als_sensor" 2>/dev/null) poll=$(cat "$LI/als_poll_delay" 2>/dev/null) | prox=$PX en=$(cat "$PX/enable_ps_sensor" 2>/dev/null)"
+    echo "sensor:  $(timeout 6 dumpsys sensorservice 2>/dev/null |
+        grep -E 'Light Sensor: last|Proximity Sensor: last' -A1 |
+        tr -s ' \n' ' ' | cut -c1-240)"
+}
+
 {
     sec subsys
     for d in $D/subsys*; do
@@ -269,180 +274,34 @@ A=$(adspdev)
 
     sec boot
     echo "dev=${A:-MISSING} sysfs_boot=$([ -e $B ] && echo yes || echo no)"
-    echo "fw adsp files: $(ls /firmware/image 2>/dev/null | grep -ic '^adsp')"
     echo "final: state=$(st_of "$A") asks=$asks up=$(up)"
 
     cat "$UB"
     rm -f "$UB"
 
-    sec kernel
-    dmesg 2>/dev/null | grep -E 'adsp-loader:' | tail -n 20
-    echo "-- pil --"
-    dmesg 2>/dev/null | grep -E 'pil-q6v5-lpass|pil_pronto|subsystem_restart' | tail -n 12
-    echo "-- apr --"
-    dmesg 2>/dev/null | grep -E 'apr_tal|APR:|Q6 Is Up|adsp not up' | tail -n 15
-    echo "-- audio --"
-    dmesg 2>/dev/null | grep -Ei 'audioserver|tapan|asoc|slimbus|sound\.' | tail -n 20
-
     sec audio
-    echo "cards: $(cat /proc/asound/cards 2>/dev/null | tr '\n' '|')"
-    echo "pcm:   $(cat /proc/asound/pcm 2>/dev/null | head -n 10 | tr '\n' '|')"
-    echo "slim:  $(ls /sys/bus/slimbus/devices 2>/dev/null | tr '\n' ',')"
-    echo "audioserver start/exit: $(dmesg 2>/dev/null | grep -c "Starting service 'audioserver'") / $(dmesg 2>/dev/null | grep -c "audioserver') exited")"
-    # The audio HAL in /vendor/lib/hw is the KitKat prebuilt (byte-identical to
-    # the stock one) and it passes a 36-byte struct pcm_config.  Since fix78
-    # libtinyalsa is upstream 7.1 tinyalsa built with -DIGNORE_SILENCE_SIZE,
-    # which is exactly that 36-byte layout: avail_min at offset 32 and no
-    # silence_size, so snd_pcm_sw_params() sees 240 against 0 and accepts it.
+    echo "cards:   $(cat /proc/asound/cards 2>/dev/null | tr '\n' '|')"
+    echo "audio:   start/exit = $(dmesg 2>/dev/null | grep -c "Starting service 'audioserver'") / $(dmesg 2>/dev/null | grep -c "audioserver') exited")"
+    # One line, not a table: this is only here to notice a *regression*.
+    busy=$(grep -s '^state' /proc/asound/card*/pcm*p/sub*/status 2>/dev/null |
+        grep -v 'closed$' |
+        sed 's#^/proc/asound/##; s#/status:state[[:space:]]*:[[:space:]]*#=#' |
+        tr '\n' ' ')
+    echo "busy:    ${busy:-none}"
     tlfile=
     for f in /system/lib/libtinyalsa.so /lib/libtinyalsa.so; do
         [ -r "$f" ] && tlfile=$f && break
     done
-    echo "tinyalsa: ${tlfile:-missing} $(wc -c <"$tlfile" 2>/dev/null) bytes"
-    echo "          $(grep -m1 -ao 'kc-tinyalsa7[^\"]*' "$tlfile" 2>/dev/null || echo 'no kc-tinyalsa7 tag -- still the stock 7.1 or KitKat build')"
-    echo "-- pcm errors logged by the library --"
-    # Every failure inside libtinyalsa also goes to /dev/kmsg as KCTL, because
-    # this HAL ignores the return value of pcm_mmap_write.  A broken PCM layer
-    # is otherwise completely silent -- which is exactly what fix77 shipped.
-    dmesg 2>/dev/null | grep -E 'KCTL' | tail -n 10
-
-    sec sensors
-    # fix76's dump retired the 36-vs-68-byte sensor_t theory: SensorService
-    # printed all eight sensors with the right names, vendors and handles, so
-    # the HAL's array is stepped correctly.  What it also printed was
-    #
-    #     Recent Sensor events:            <- nothing, ever
-    #     Active sensors: SFH7776 Proximity Sensor (connections=1)
-    #
-    # and the sysfs enable nodes were still 0.  So the framework asked for the
-    # proximity sensor and the HAL either never wrote enable, or wrote it and
-    # got nothing back.  This section now settles that by hand: write the node
-    # itself, read the event device, write it back.
-    echo "hal:    $(wc -c </vendor/lib/hw/sensors.default.so 2>/dev/null) bytes"
-    for d in /sys/class/input/input*; do
-        [ -r "$d/name" ] || continue
-        n=$(cat "$d/name" 2>/dev/null)
-        case "$n" in
-            light|proximity)
-                echo "$d name=$n"
-                for a in enable_als_sensor als_poll_delay als_ratio enable_ps_sensor ps_crosstalk drvstr; do
-                    [ -r "$d/$a" ] && echo "    $a=$(cat "$d/$a" 2>/dev/null)"
-                done
-                ;;
-            *) echo "$d name=$n" ;;
-        esac
-    done
-
-    # Direct proof, one sensor at a time: does the driver emit an event when
-    # the enable node is written by hand?  If yes the kernel and the part are
-    # fine and the fault is above (HAL or SensorService); if no, it is below
-    # and no amount of HAL surgery will help.
-    sensprobe() {
-        id=$1      # input6
-        node=$2    # enable_als_sensor
-        win=${3:-3}  # seconds to watch the event device
-        d=/sys/class/input/$id
-        ev=
-        for e in "$d"/event*; do [ -e "$e" ] && ev=/dev/input/$(basename "$e"); done
-        [ -e "$d/$node" ] || { echo "  $id: no $node"; return; }
-        was=$(cat "$d/$node" 2>/dev/null)
-        echo "  $id $node: before=$was event=${ev:-none}"
-        echo 1 >"$d/$node" 2>/dev/null
-        sleep 1
-        echo "  $id $node: after=$(cat "$d/$node" 2>/dev/null)"
-        if [ -n "$ev" ] && [ -r "$ev" ]; then
-            echo "  $id events (16-byte input_event, raw):"
-            timeout "$win" dd if="$ev" bs=16 count=8 2>/dev/null | od -An -tu4 -w16 | head -n 8
-        fi
-        # put back whatever was there: if the framework had already enabled it
-        # for the phone app, forcing 0 would quietly take proximity away.
-        echo "${was:-0}" >"$d/$node" 2>/dev/null
-    }
-    echo "-- direct probe --"
-    sensprobe input6 enable_als_sensor
-    # proximity is on-change: nothing is reported while the
-    # distance stays put, so the window is long enough to wave a
-    # hand over the sensor while the report is being written.
-    sensprobe input7 enable_ps_sensor 6
-
-    echo "-- sensorservice --"
-    timeout 8 dumpsys sensorservice 2>/dev/null | head -n 60
-
-    sec display
-    # Two yes/no answers that decide the rest of this round:
-    #
-    #   mProximitySensor=<sensor>   vs   mProximitySensor=null
-    #       DisplayPowerController is built by PowerManagerService.systemReady()
-    #       and asks SensorManager for TYPE_PROXIMITY there.  If it says null,
-    #       the controller was built before SensorService was published and no
-    #       amount of HAL work will make proximity work until a restart.
-    #   mUseSoftwareAutoBrightnessConfig=true
-    #       This is config_automatic_brightness_available, and it is what both
-    #       Settings (the missing switch) and the light-sensor loop read.
-    #
-    # mAutomaticBrightnessController only exists when the spline came out of
-    # config_autoBrightnessLevels / config_autoBrightnessLcdBacklightValues --
-    # an empty array makes createAutoBrightnessSpline() throw and the whole
-    # feature is dropped with "Error in config.xml" in the log.
-    timeout 10 dumpsys display 2>/dev/null |
-        grep -E 'mProximitySensor|mProximitySensorEnabled|mUseSoftwareAutoBrightnessConfig|mAutomaticBrightnessController|mScreenBrightness|mLightSensor|Auto-brightness|mScreenAutoBrightness|mAmbientLux|mPowerState=' |
-        head -n 20
-    echo "-- window manager policy --"
-    timeout 10 dumpsys window policy 2>/dev/null | grep -iE 'proximity|mScreenOn|mAwake' | head -n 8
-    echo "-- boot stall (system_server threads) --"
-    sed 's/^/    /' /data/local/tmp/kc_boot.log 2>/dev/null | head -n 40
+    echo "tinyalsa: $(wc -c <"$tlfile" 2>/dev/null) bytes $(grep -a -m1 -o 'kc-tinyalsa7[^,;]\{0,60\}' "$tlfile" 2>/dev/null)"
 
     sec mic
-    echo "capture: $(ls /proc/asound/card*/pcm*c/sub*/status 2>/dev/null | tr '\n' ' ')"
-    echo "-- audio policy (full, first 110 lines) --"
-    # fix76 grepped this for "input" and got three lines, because 7.1 dumps the
-    # whole AudioPolicyConfig as XML and the interesting part -- which input
-    # profile was parsed, with which masks -- is not on a line containing the
-    # word "input".  Dump it whole; it is the only place the parsed profile is
-    # visible without a debugger.
-    timeout 10 dumpsys media.audio_policy 2>/dev/null | head -n 110
-    echo "-- input devices as APM sees them --"
-    timeout 5 dumpsys media.audio_policy 2>/dev/null | grep -Ei 'unreachable|input|Input' | head -n 30
-    echo "-- record attempts --"
-    grep -Ei 'AudioRecord|open_input|start_input|getInputForAttr|cannot open input|AUDIO_DEVICE_IN' "$LC" 2>/dev/null | tail -n 12
+    echo "-- record attempts (logcat) --"
+    grep -Ei 'AudioRecord|open_input|start_input_stream|getInputForAttr|cannot open input' "$LC" 2>/dev/null | tail -n 6
 
-    sec led
-    echo "leds:    $(ls /sys/class/leds 2>/dev/null | tr '\n' ' ')"
-    echo "button:  $(cat /sys/class/leds/button-backlight/brightness 2>/dev/null) of $(cat /sys/class/leds/button-backlight/max_brightness 2>/dev/null)"
-    echo "lcd:     $(cat /sys/class/leds/lcd-backlight/brightness 2>/dev/null) of $(cat /sys/class/leds/lcd-backlight/max_brightness 2>/dev/null)"
-    echo "hal:     $(wc -c </vendor/lib/hw/lights.default.so 2>/dev/null) bytes"
-    # Whether LightsService got a device at all.  fix77's HAL loaded and was
-    # then thrown away -- "load: couldn't find symbol HMI" -- because the
-    # module struct was spelled HAL_MODULE_INFO_SYM instead of letting the
-    # macro expand to HMI.  This count has to be 0 and "lcd:" has to move when
-    # the brightness slider is dragged; together they are the whole test.
+    sec display
+    dispblock 0
+    echo
     echo "load:    $(grep -c 'find symbol HMI' "$LC" 2>/dev/null) x 'couldn't find symbol HMI' (must be 0)"
-    echo "setting: screen_brightness=$(settings get system screen_brightness 2>/dev/null) mode=$(settings get system screen_brightness_mode 2>/dev/null) button=$(settings get system button_brightness 2>/dev/null)"
-    echo "-- kcledguard --"
-    sed 's/^/    /' /data/local/tmp/kc_led.log 2>/dev/null | head -n 20
-
-    sec pcm
-    for p in /proc/asound/card*/pcm*p/sub*/status; do
-        [ -r "$p" ] || continue
-        echo "$p"
-        sed 's/^/    /' "$p" 2>/dev/null | head -n 8
-    done
-    echo "-- datapath --"
-    dmesg 2>/dev/null | grep -Ei 'msm_pcm|msm-dai|afe_|adm_|asm_|dapm' | tail -n 20
-
-    sec logcat_audio
-    # kclogcat (a service in kyl23-extra.rc) has been writing every buffer to
-    # disk since boot_completed, so this is the *live* stream, not the tail of
-    # a buffer that has already wrapped.  Fall back to logcat -d if it is not
-    # there -- that is the fix72 behaviour, and it only ever showed the boot.
-    if [ -s "$LC" ]; then
-        echo "from $LC ($(wc -l <"$LC" 2>/dev/null) lines)"
-        grep -Ei 'audioflinger|audiopolicy|audio_hw|audiohal|tapan|adm_|asm_|afe_|MediaPlayer|AudioTrack|NuPlayer|OMX' "$LC" 2>/dev/null | tail -n 80
-    else
-        logcat -d -v brief -t 400 2>/dev/null |
-            grep -Ei 'audioflinger|audiopolicy|audio_hw|audiohal|tapan|adm_|asm_|afe_|usb' |
-            tail -n 40
-    fi
 } >"$T" 2>&1
 
 writereport() {
@@ -486,119 +345,33 @@ while IFS= read -r l; do
     kmsg "KCRPT| $(printf '%s' "$l" | cut -c1-180)"
 done <"$R1"
 
-# ---- 6. sample once a second, and go deep when playback starts -------------
-# The fix72 run sampled every 2 s and recorded this for a 20-second playback:
-#
-#     136.37 | ... pcm= card0/pcm0p/sub0=OPEN
-#     139.75 | ... pcm=none
-#
-# i.e. the output was opened, sat in "open", and closed again 3.4 s later.  It
-# never reached PREPARED or RUNNING, so nothing was ever handed to the PCM ring
-# -- but a 2 s sampler can only say "we did not see it", not "it never
-# happened", and it cannot say why.  So: 1 s, and the moment a node goes busy,
-# one snapshot of AudioFlinger taken *while the stream is live*, which is the
-# only time its per-track state means anything.
-#
-# The PCM state names come straight from ALSA: open -> setup -> prepared ->
-# running -> draining -> closed.  A music track that is actually playing sits
-# in RUNNING; one that failed to start is stuck in open/prepared or goes
-# straight back to closed.
-snap() {
-    s=$(cat "$A/state" 2>/dev/null)
-    p=$(grep -s '^state' /proc/asound/card*/pcm*p/sub*/status 2>/dev/null |
-        grep -v 'closed$' |
-        sed 's#^/proc/asound/##; s#/status:state[[:space:]]*:[[:space:]]*#=#; s#^state[[:space:]]*:[[:space:]]*#?=#' |
-        tr '\n' ' ')
-    echo "adsp=$s usb=$(cat "$AUST/state" 2>/dev/null) adbd=$(getprop init.svc.adbd 2>/dev/null) audio=$(pidof audioserver 2>/dev/null | cut -d' ' -f1) pcm=${p:-none}"
-}
-
-# Deep snapshot.  Everything here is read while the stream exists, so the
-# track list, the output's sample rate and the HAL's own counters line up.
-audiosnap() {
-    {
-        sec "audio_snapshot t=$(up) why=$1"
-        echo "-- cards --"
-        cat /proc/asound/cards 2>/dev/null
-        echo "-- hw_params (busy nodes) --"
-        for f in /proc/asound/card*/pcm*p/sub*/hw_params; do
-            [ -r "$f" ] || continue
-            grep -q '^closed' "$f" 2>/dev/null && continue
-            echo "$f:"; sed 's/^/    /' "$f" 2>/dev/null
-        done
-        echo "-- foreground --"
-        dumpsys activity activities 2>/dev/null | grep -m3 -E 'mResumedActivity|mFocusedActivity'
-        echo "-- stream volume / mode --"
-        # A silent phone with a healthy PCM path is usually this: STREAM_MUSIC
-        # at 0, or a headset/jack state that routed the mix elsewhere.
-        dumpsys audio 2>&1 | grep -E 'STREAM_MUSIC|Muted|Current|Mode:|Ringing|Devices' | head -n 24
-        echo "-- jack --"
-        echo "h2w=$(cat /sys/class/switch/h2w/state 2>/dev/null) name=$(cat /sys/class/switch/h2w/name 2>/dev/null)"
-        echo "-- AudioFlinger --"
-        dumpsys media.audio_flinger 2>&1 | head -n 220
-        echo "-- logcat (audio, last 120) --"
-        logcat -d -v brief -t 400 2>/dev/null |
-            grep -Ei 'audioflinger|audiopolicy|audio_hw|audiohal|tapan|adm_|asm_|afe_|MediaPlayer|AudioTrack|AwesomePlayer|NuPlayer|OMX|codec' |
-            tail -n 120
-        echo "-- dmesg tail --"
-        dmesg 2>/dev/null | tail -n 60
-    } >>"$R1" 2>&1
-    chmod 0644 "$R1" 2>/dev/null
-    kmsg "KCSNAP t=$(up) pcm=$(snap | sed 's/.*pcm=//') full copy at $R1"
-}
-
-# One compact line about what the sensor framework is handing out.  The direct
-# probe in "sec sensors" writes enable_als_sensor by hand and reads the event
-# device, which settles whether the driver emits anything at all; this settles
-# whether SensorService and the HAL still deliver to clients afterwards.  The
-# two together are the difference between "the sensor is broken" and "nothing
-# asked for it".
-sensline() {
-    timeout 6 dumpsys sensorservice 2>/dev/null |
-        grep -E 'Sensor: last|^ +[0-9]+ \(ts=|^Active sensors|^[0-9]+ active' |
-        head -n 8 | tr '\n' ' ' | cut -c1-300
-}
-
-kmsg "sampling start, 1 s, 10 min fast then 2 s for 20 min"
-prev=$(snap)lastbusy=0
-esnaps=0
-i=0
-while [ $i -lt 1200 ]; do
-    if [ $i -lt 600 ]; then sleep 1; else sleep 2; fi
+# ---- 6. the sensor timeline ----------------------------------------------
+# The report above is written within a minute of boot_completed -- before
+# anybody can get to Settings and turn the switch on.  So the file would only
+# ever contain the state *before* the test.  Five more samples, one a minute,
+# give it a before and an after of the same action, which is the whole point.
+{
+    sec "sensor timeline"
+    echo "  每 60 秒采样一次，共 5 次。"
+    echo "  现在去 设置 -> 显示 打开「自适应亮度」，然后遮住屏幕上方听筒左边的"
+    echo "  光感约 2 秒，再用手盖住听筒约 3 秒。每次采样都会记在这里。"
+} >>"$R1" 2>/dev/null
+i=1
+while [ $i -le 5 ]; do
+    sleep 60
+    dispblock "$((i*60))" >>"$R1" 2>/dev/null
     i=$((i+1))
-    # every 30 s: did any sensor event reach the framework meanwhile?
-    if [ $((i % 30)) -eq 0 ]; then
-        echo "$(up) | sen: $(sensline)" >>"$R1" 2>/dev/null
-    fi
-    cur=$(snap)
-    changed=0
-    [ "$cur" != "$prev" ] && changed=1
-    busy=0
-    case "$cur" in *pcm=none*) ;; *) busy=1 ;; esac
-    if [ $changed -eq 1 ]; then
-        prev=$cur
-        printf '<6>KCEVT t=%s %s\n' "$(up)" "$cur" >>$K 2>/dev/null
-        printf '%s | %s\n' "$(up)" "$cur" >>"${R1}.ev" 2>/dev/null
-        echo "$(up) | $cur" >>"$R1" 2>/dev/null
-    elif [ $busy -eq 0 ]; then
-        continue
-    fi
-    # Two moments are worth a deep snapshot: the first second of an episode
-    # (something opened) and any later change while it is still busy (open ->
-    # prepared -> running, which is what "playing" looks like).  Four per
-    # episode, so a five-minute album does not turn the report into a dump.
-    if [ $busy -eq 1 ] && [ $lastbusy -eq 0 ]; then
-        esnaps=1
-        audiosnap "episode start"
-    elif [ $busy -eq 1 ] && [ $changed -eq 1 ] && [ $esnaps -lt 4 ]; then
-        esnaps=$((esnaps+1))
-        audiosnap "state change #$esnaps"
-    fi
-    [ $busy -eq 0 ] && esnaps=0
-    lastbusy=$busy
 done
+chmod 0644 "$R1" 2>/dev/null
 
-# one last snapshot, so the file ends with where things settled
-snap | sed "s/^/final@$(up) /" >>"$R1" 2>/dev/null
-kmsg "sampling done up=$(up), report at $R1"
+# ---- 7. done -------------------------------------------------------------
+# What used to be here was a 1200-iteration sampler (1 s, then 2 s) that watched
+# the PCM nodes and took an AudioFlinger snapshot the moment one went busy.
+# That is how fix74 -> fix78 were diagnosed, and it is also how the report would
+# be flooded now: every state change went to /dev/kmsg and to the .ev file,
+# 40 KB of it per boot with nothing to look at.  Sound works, so it is gone; the
+# version to restore, if it is ever needed again, is in the fix79 commit.
+
+kmsg "report done up=$(up), file $R1"
 rm -f "$T" "$U" "$PIDF" 2>/dev/null
 exit 0
