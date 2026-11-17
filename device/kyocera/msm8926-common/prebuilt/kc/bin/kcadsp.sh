@@ -255,12 +255,23 @@ dispblock() {
     timeout 10 dumpsys power 2>/dev/null |
         grep -E 'mWakefulness=|mScreenBrightnessSetting=|mScreenBrightnessModeSetting=|mScreenBrightnessOverrideFromWindowManager=|mTemporaryScreenBrightnessSettingOverride=' |
         head -n 6
-    timeout 10 dumpsys display 2>/dev/null |
-        grep -E 'mUseSoftwareAutoBrightnessConfig=|mProximitySensor=|mProximitySensorEnabled=|mScreenBrightness=|mScreenAutoBrightnessSpline=|mLightSensor=|mLightSensorEnabled=|mLightSensorEnableTime=|mAmbientLux=|mScreenAutoBrightness=|mLastObservedLux=|mDozing=|mAmbientLightRingBuffer=' |
-        cut -c1-240 | head -n 14
+    # The whole Automatic Brightness Controller block, not a hand-picked subset.
+    # fix81's report asked for a dozen fields and left out exactly the ones that
+    # decide the question -- mRecentLightSamples, mBrighteningLuxThreshold,
+    # mDarkeningLuxThreshold, the two debounce configs -- so a frozen
+    # mAmbientLux could not be attributed to the filter or to the sensor.
+    timeout 10 dumpsys display 2>/dev/null | awk '
+        /Automatic Brightness Controller/ {p=1}
+        p {print substr($0,1,190); if (/mDozing=/) p=0; next}
+        /mProximitySensor=|mProximitySensorEnabled=|mScreenBrightness=|mPowerState=|mBrightnessRampRateFast=/ {print substr($0,1,190)}
+    ' | head -n 46
     timeout 10 dumpsys window policy 2>/dev/null |
-        grep -iE 'mProximityWake|mProximitySensor|mProximityTimeOut|mAwake=|mScreenOnEarly=' |
-        head -n 8
+        grep -iE 'proxim|mAwake=|mScreenOnEarly=' | head -n 8
+    timeout 10 dumpsys window 2>/dev/null |
+        grep -iE 'proxim' | head -n 6
+    # PWM's "Not waking up" is the only direct proof that a power key press was
+    # vetoed by the sensor; it goes to logcat, not to kmsg.
+    echo "proxwake: $(grep -c 'Not waking up' "$LC" 2>/dev/null) x 'Not waking up' in logcat"
     echo "setting: mode=$(settings get system screen_brightness_mode 2>/dev/null) prox=$(settings get system proximity_on_wake 2>/dev/null) bright=$(settings get system screen_brightness 2>/dev/null)"
     echo "leds:    lcd=$(cat /sys/class/leds/lcd-backlight/brightness 2>/dev/null) button=$(cat /sys/class/leds/button-backlight/brightness 2>/dev/null)"
     echo "input:   light=$LI en=$(cat "$LI/enable_als_sensor" 2>/dev/null) poll=$(cat "$LI/als_poll_delay" 2>/dev/null) | prox=$PX en=$(cat "$PX/enable_ps_sensor" 2>/dev/null)"
@@ -305,7 +316,20 @@ dispblock() {
     # Handles, types and the order the HAL reports them in.  The display dump
     # only names the sensor ABC was handed, not the handle SensorService gave
     # it, and handle == the number the HAL's activate() switches on.
-    timeout 10 dumpsys sensorservice 2>/dev/null | sed -n '/Sensor List/,+10p' | cut -c1-170
+    # toybox sed has no "/pat/,+Np" range -- it answered "bad pattern" and the
+    # whole section came out empty in the fix81 dump.
+    timeout 10 dumpsys sensorservice 2>/dev/null |
+        awk '/Sensor List/ {p=1; n=0} p && n<11 {print; n++}' | cut -c1-170
+    # Who holds the proximity sensor right now.  If PWM armed its check, the
+    # system_server connection lists the PS handle as active; if it did not, the
+    # PS only shows up while FalsingManager or a test app holds it.  This is the
+    # one place where "armed but idle" and "never armed" look different.
+    # (awk, not "grep -A": toybox' grep/sed option support is uneven -- see the
+    #  sensor-list note above.)
+    timeout 10 dumpsys sensorservice 2>/dev/null | awk '
+        /^Active sensors:/ || /^Sensors by connection:/ {p=1; n=0}
+        p && n<9 {print substr($0,1,170); n++; if (n>=9) p=0}
+    '
     echo "kcsensor: $(dmesg 2>/dev/null | grep -m1 'kcsensor:')"
 
     sec display
@@ -364,16 +388,21 @@ done <"$R1"
 # the file can be pulled as soon as the seventh header appears.
 {
     sec "sensor timeline"
-    echo "  每 30 秒采样一次，共 6 次（到开机后约 3 分钟）。"
-    echo "  现在去 设置 -> 显示 打开「自适应亮度」，然后遮住屏幕上方听筒左边的"
-    echo "  光感约 2 秒，再用手盖住听筒约 3 秒。每次采样都会记在这里。"
+    echo "  每 15 秒采样一次，共 20 次（到开机后约 5 分钟）。"
+    echo "  现在去 设置 -> 显示 打开「自适应亮度」，然后用手完全遮住屏幕上方"
+    echo "  听筒左边的光感，保持 20 秒以上再松开。距离传感器：盖住听筒后按电源键，"
+    echo "  屏幕应当不亮，日志里会有 'Not waking up'。每次采样都记在这里。"
 } >>"$R1" 2>/dev/null
 i=1
-while [ $i -le 6 ]; do
-    sleep 30
-    dispblock "$((i*30))" >>"$R1" 2>/dev/null
+while [ $i -le 20 ]; do
+    sleep 15
+    dispblock "$((i*15))" >>"$R1" 2>/dev/null
     i=$((i+1))
 done
+{
+    sec "timeline done"
+    echo "  采样结束。文件可以取了。"
+} >>"$R1" 2>/dev/null
 chmod 0644 "$R1" 2>/dev/null
 
 # ---- 7. done -------------------------------------------------------------

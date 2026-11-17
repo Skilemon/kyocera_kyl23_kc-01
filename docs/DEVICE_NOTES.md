@@ -5707,3 +5707,141 @@ PMS 传下去的是 `BRIGHTNESS_DEFAULT`(-1)，`mScreenAutoBrightness=-1` 时 DP
 5. 距离：盖住听筒按电源键，`kclogcat.txt` 里应出现 `Not waking up. Proximity sensor is blocked.`；
    不想用可以在 设置→显示 里关掉（那是 CM 的 `proximity_on_wake`）。
 6. 开机：`nuSensorService starting` 到 `thread starting` 应该从 24.5 s 掉到几秒。
+
+## 45. 光感通了，但自动亮度还是不动：把时间常数改短
+
+fix81 的 dump 说明了链条的前半段已经修好，也把后半段的问题放在了明面上。
+
+### 45.1 这一轮确定成立的
+
+```
+perm:    system:input 660 system:input 660 system:system 600
+input:   light=/sys/class/input/input6 en=1 poll=250000 | prox=.../input7 en=0
+mLightSensorEnabled=true   mLightSensorEnableTime=53800
+leds:    lcd=85
+```
+
+`enable_als_sensor` 终于是 1，`als_poll_delay` 是 HAL 写进去的 250 ms（不再是驱动默认值），
+lux 也真的在动：`102 → 98 → 56 → 32 → 10 → 2 → 0 → 100 → 102`。§44 那个 chown 是对的，
+`/dev/psals_sensor` 现在也是 `system:system 600`。
+
+### 45.2 但屏幕亮度一次都没跟着动
+
+三次采样（t+0 / t+30 / t+60）里，`mScreenBrightness` 和 `mScreenAutoBrightness` 一直是 **85**，
+`leds: lcd=` 也是 85。85 本身说明 ABC 算过一次 —— `mScreenAutoBrightnessSpline` 在 lux=102
+处就是 0.33 左右，`0.33 × 255 ≈ 85`；而 `mScreenBrightnessSetting=30`，如果自动亮度没生效，
+面板应该是 30。所以"引擎"是转过的，只是**再没转过第二次**：
+
+```
+mAmbientLux=102.0            <- 冻在初始化那一次
+mLastObservedLux=98.0        <- 但原始采样一直在更新
+mAmbientLightRingBuffer=[102.0/490ms, 100.0/750ms, 96.0/260ms, 56.0/250ms,
+                         32.0/250ms, 10.0/250ms, 2.0/750ms, ... 0.0/999ms, ...]
+```
+
+`mAmbientLux` 只在 `updateAmbientLux()` 里那个门被推开时才更新：
+
+```java
+if (ambientLux >= mBrighteningLuxThreshold && nextBrightenTransition <= time
+        || ambientLux <= mDarkeningLuxThreshold && nextDarkenTransition <= time) {
+    setAmbientLux(ambientLux);
+    updateAutoBrightness(true);
+}
+```
+
+门要同时满足两件事：加权后的 lux 落到 `mDarkeningLuxThreshold`（=102×0.8=**81.6**）以下，
+**并且**窗口里连续低于阈值的样本已经存在 `mDarkeningLightDebounceConfig` 那么久。
+两者的默认值（AOSP，这台机器上没设备 overlay，所以全是默认值）：
+
+| 资源 | AOSP 默认 | 含义 |
+|---|---|---|
+| `config_autoBrightnessBrighteningLightDebounce` | 4000 ms | 变亮前要稳定多久 |
+| `config_autoBrightnessDarkeningLightDebounce` | 8000 ms | 变暗前要稳定多久 |
+| `config_autoBrightnessAmbientLightHorizon` | 10000 ms | 加权平均的时间窗 |
+| `config_autoBrightnessLightSensorRate` | 250 ms | 期望的采样周期 |
+
+这套常数是按"光感每 250 ms 无条件上报"设计的。而 sfh7776 的 HAL 只把**变化**上报给框架
+（fix81 的 ring buffer 在 3.6 秒里只有两个点，`dumpsys sensorservice` 的 `last 10 events` 也只有一个），
+于是"遮盖"这个动作只产生一个低值样本，加权平均要很久才压到 81.6 以下；再叠加 8 秒的
+debounce，而窗口本身只有 10 秒 —— 门槛和窗口一样长，落到窗口边上就永远差一点点。
+
+fix81 的 dump 恰好是在"刚遮上 5 秒"时取的（`mAmbientLightRingBuffer` 里那一串
+`0→2→6→2→4→2→10→32→56→96→100→102` 是松手后回升的过程），所以那份日志没法区分
+"只是慢" 和 "卡死"。两种情况用同一把刀都能切开：**把时间常数改短**。
+
+### 45.3 fix82 改的三个整数
+
+| 资源 | 原值 | 新值 |
+|---|---|---|
+| `config_autoBrightnessBrighteningLightDebounce` | 4000 | **1000** |
+| `config_autoBrightnessDarkeningLightDebounce` | 8000 | **2000** |
+| `config_autoBrightnessAmbientLightHorizon` | 10000 | **4000** |
+
+改完以后：遮盖 2 秒左右开始压暗，松手 1 秒左右开始回亮，`lcd:` 从 85 落到 12（lux=0 落在
+曲线第一个控制点上）。窗口 4 秒 / 采样 250 ms = 16 个样本，容量比例和 AOSP 原值一致，
+不会碰到 `AmbientLightRingBuffer` 的容量边界。
+
+依然是**原地改 `resources.arsc`**，不重编资源：这三个是 `<integer>`，和 bool 一样只是
+`Res_value` 的 4 字节 `data`。`tools/image/arsc_patch.py` 为此加了 `--int`。
+
+验证（和 fix79 同一套）：`aapt dump --values resources` 全表 9448 条 spec 逐行 diff 原厂
+= **0 行**，stderr 空；三个整数回读 1000/2000/4000，bool 回读 0xffffffff，数组回读 10/11 项；
+`jar verified.`；5563 个 STORED 条目全部 4 字节对齐，`resources.arsc` 仍是 Stored。
+
+### 45.4 距离传感器：Settings 这一侧已经通了，PWM 这一侧要间接看
+
+fix81 的 logcat 里有一行是这轮的收获：
+
+```
+D ConstraintsHelper: construct key=proximity_on_wake available=true
+```
+
+fix78 的时候是 `available=false`（那正是"设置里看不到这个开关"），现在是 true，说明
+fix79 对 `org.cyanogenmod.platform-res.apk` 里那两个 bool 的补丁被 Settings 读到了。
+
+PWM 在 `services.jar` 里，读的是同一个资源 id。全 dex 里 `0x3f050001` 只出现一次：
+
+```
+$ python3 -c "...find b'\x01\x00\x05\x3f'..."
+0x3f050001 出现次数 1
+0x3882a4 前4字节 d5401401 后4字节 ...
+                    ^^ const v1, 0x3f050001
+```
+
+也就是说 PWM 用 `cyanogenmod.platform.R.bool.config_proximityCheckOnWake`（0x3f050001），
+和我们补的是同一个值。补丁已经让它是 true，`...EnabledByDefault` 也是 true，所以
+`proximity_on_wake` 这一行不存在时默认就是开。
+
+但 PWM 自己不开 dump，`dumpsys window policy` 里没有 `mProximityWake*` 这几个字段
+（fix81 的报告只打出了 `mAwake` / `mScreenOnEarly`）。所以这一轮换一个更硬的判据：
+**SensorService 的连接表**。PWM 只要 armed，system_server（pid 1741 / uid 1000）就会一直
+持有 proximity 这个 handle：
+
+```
+Sensors by connection:
+Connection Number: 1 | Operating Mode: NORMAL
+  Package: android | pid: 1741 | uid: 1000
+  Active sensor list:
+    0x00000000) SFH7776 Proximity Sensor     <- 有这一行 = PWM 挂上了
+```
+
+再加一个计数器：`proxwake: N x 'Not waking up'`。PWM 一旦因为传感器被挡而否决电源键，
+就会在 logcat 打 `Not waking up. Proximity sensor is blocked.`，那是唯一的直接证据。
+
+### 45.5 顺带修掉报告里的两个坑
+
+| 问题 | 后果 | 现在 |
+|---|---|---|
+| `sed -n '/Sensor List/,+10p'` | toybox 的 sed 不认 `,+N` 区间，直接 `bad pattern`，fix81 的 `===== sensors =====` 整段是空的 | 换成 `awk '/Sensor List/{p=1;n=0} p&&n<11'` |
+| `dispblock` 只挑十几个字段 | 恰好漏掉 `mRecentLightSamples`、两个阈值、两个 debounce —— 也就是唯一能回答"是滤镜还是传感器"的那几个 | 打印完整的 `Automatic Brightness Controller Configuration/State` 两段（46 行封顶，每行截 190 字符） |
+| 时间线 6×30 s、总长 3 分钟 | fix81 的 dump 在 140 秒被取走，遮盖过程刚好落在采样之外 | 20×15 s、总长 5 分钟，末尾写 `===== timeline done =====` |
+
+### 45.6 这一轮要看的
+
+1. `Automatic Brightness Controller Configuration` 里那三个数是不是 1000 / 2000 / 4000。
+2. 遮住光感 20 秒，中间任意一次采样：`mAmbientLux` 应该掉到个位数，`mDarkeningLuxThreshold`
+   跟着一起掉，`mScreenAutoBrightness` 和 `leds: lcd=` 应该跟着变。
+3. 如果 `mRecentLightSamples` 在涨、`mAmbientLux` 仍然不动 —— 那就是滤镜本身坏了，
+   下一轮直接绕过它。
+4. 距离：`Sensors by connection` 里有没有 `SFH7776 Proximity Sensor`；盖住听筒按电源键后
+   `proxwake` 是不是从 0 变成 1。

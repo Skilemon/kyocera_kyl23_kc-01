@@ -221,6 +221,8 @@ def main():
     ap.add_argument("--dump", action="append", default=[])
     ap.add_argument("--bool", action="append", default=[],
                     help="TYPE:ENTRY=true|false")
+    ap.add_argument("--int", action="append", default=[],
+                    help="TYPE:ENTRY=value, a scalar android:integer")
     ap.add_argument("--int-array", action="append", default=[],
                     help="TYPE:ENTRY=v1,v2,...")
     a = ap.parse_args()
@@ -240,6 +242,16 @@ def main():
         arsc.set_scalar(tid, idx, TYPE_INT_BOOLEAN, 0xFFFFFFFF if on else 0)
         print("  bool %s %s: %d -> %d" % (before["id"], before["name"],
                                           before["value"], 1 if on else 0))
+        arsc = Arsc(bytes(arsc.b))
+
+    for s in a.int:
+        where, val = s.split("=", 1)
+        tid, idx = loc(where)
+        value = int(val, 0)
+        before = arsc.describe(tid, idx)
+        arsc.set_scalar(tid, idx, TYPE_INT_DEC, value)
+        print("  int  %s %s: %d -> %d"
+              % (before["id"], before["name"], before["value"], value))
         arsc = Arsc(bytes(arsc.b))
 
     for s in a.int_array:
