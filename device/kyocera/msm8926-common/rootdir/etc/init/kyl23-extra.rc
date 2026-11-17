@@ -650,6 +650,19 @@ service p2p_supplicant /system/bin/wpa_supplicant \
 # with kcbtnled not yet running).
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# The nodes kcsensor.sh chowns belong to the sensor driver, which probes long
+# before init runs, so the work itself is instant; it is the *ordering* that
+# matters -- the sensors HAL is constructed by system_server a few seconds
+# later, and reads ps_crosstalk in its constructor.
+# ---------------------------------------------------------------------------
+service kcsensor /system/bin/sh /vendor/bin/kcsensor.sh
+    class core
+    user root
+    group root input
+    oneshot
+    disabled
+
+# ---------------------------------------------------------------------------
 # /dev/fuse does not exist: the kernel has FUSE built in (no uevent) and the
 # ramdisk ueventd.rc has no static entry for it.  Create it before vold tries
 # to bring up /storage/emulated/0, otherwise /sdcard stays empty forever.
@@ -687,6 +700,16 @@ on post-fs-data
     chmod 0755 /system/etc/kcbt.sh
     chmod 0755 /system/etc/kcbtinit.sh
     chmod 0755 /system/bin/btnvtool /system/bin/hci_qcomm_init
+    chmod 0755 /vendor/bin/kcsensor.sh
+
+    # Hand the sensor driver's attributes to the sensors HAL (see the header of
+    # kcsensor.sh).  Stock did this from /init.rc and /init.kc.sensor.sh; our
+    # ramdisk is CM's and has neither, and that one missing chown is why the
+    # light and proximity sensors have never worked: the HAL runs inside
+    # system_server as uid 1000, sfh7776.c publishes the attributes as 0660
+    # root:root, so activate() got EACCES, the driver was never told to sample,
+    # and the HAL constructor's failing reads cost 24 s of every boot.
+    start kcsensor
 
     # This phone's Bluetooth core lives inside the WCNSS and is reached over two
     # shared-memory channels, not over a UART.  The stack picks its HCI back end

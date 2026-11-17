@@ -211,8 +211,9 @@ usbviaen() {
                echo "adbd start -> $(getprop init.svc.adbd 2>/dev/null)" ;;
         esac
     fi
-    echo "-- dmesg usb --"
-    dmesg 2>/dev/null | grep -Ei 'android_usb|msm_otg|msm_hsusb|udc|usb_bam|android_work|enable_store' | tail -n 25
+    # The 25-line dmesg tail that used to be here was for the bring-up that
+    # established the enabled/pid/UDC dance above; it has said the same thing
+    # every boot since fix30, and the five lines above are the summary of it.
 } >"$UB" 2>&1
 
 # ---- 4. the report -------------------------------------------------------
@@ -224,21 +225,24 @@ usbviaen() {
 #
 # What is left answers two questions that are still open:
 #
-#   auto-brightness   Does the framework ever enable the light sensor?  The
-#                     curve is loaded (mScreenAutoBrightnessSpline), the bool is
-#                     on (mUseSoftwareAutoBrightnessConfig=true), so the only
-#                     piece that can still be missing is the *enable* side:
-#                     PowerManagerService's mScreenBrightnessModeSetting must be
-#                     1, and DisplayPowerController's AutomaticBrightnessController
-#                     must have called setLightSensorEnabled(true).
+#   auto-brightness   The framework side is settled: fix80's dump has
+#                     mUseSoftwareAutoBrightnessConfig=true, the 11-point
+#                     spline, mLightSensorEnabled=true and
+#                     mLightSensorEnableTime != 0 -- AutomaticBrightnessController
+#                     really did ask.  What was still 0 is the driver's
+#                     enable_als_sensor, i.e. the HAL never wrote it (it runs as
+#                     uid 1000 and the node was 0660 root:root).  So this report
+#                     prints the owner of that node, the driver's counter, and
+#                     the lux the framework ended up with: enabled + owner
+#                     system + a moving mAmbientLux is the whole chain.
 #
-#   proximity on wake Is PhoneWindowManager's check armed at all?  It has its
-#                     own sensor handle, separate from the one DisplayPower
-#                     Controller uses for "screen off in a call".
+#   proximity on wake Same node, same cause (enable_ps_sensor).  Once the HAL
+#                     can write it, PWM's "Not waking up. Proximity sensor is
+#                     blocked." becomes possible again.
 #
-# Both are sampled three times, eight seconds apart, because the state that
-# matters only exists while the sensors are being covered -- and the report says
-# so between samples, since that is where the user is looking.
+# Both are sampled once a minute for three minutes, because the state that
+# matters only exists while the sensor is being covered, and the report says so
+# between samples, since that is where the user is looking.
 A=$(adspdev)
 # The two input nodes by name, not by number: what the HAL was actually asked
 # for is the difference between "the framework never enabled it" and "the
@@ -260,6 +264,9 @@ dispblock() {
     echo "setting: mode=$(settings get system screen_brightness_mode 2>/dev/null) prox=$(settings get system proximity_on_wake 2>/dev/null) bright=$(settings get system screen_brightness 2>/dev/null)"
     echo "leds:    lcd=$(cat /sys/class/leds/lcd-backlight/brightness 2>/dev/null) button=$(cat /sys/class/leds/button-backlight/brightness 2>/dev/null)"
     echo "input:   light=$LI en=$(cat "$LI/enable_als_sensor" 2>/dev/null) poll=$(cat "$LI/als_poll_delay" 2>/dev/null) | prox=$PX en=$(cat "$PX/enable_ps_sensor" 2>/dev/null)"
+    # Owner is the whole point: the HAL writes these as uid 1000, and 0660
+    # root:root is what made every write EACCES before fix81.
+    echo "perm:    $(stat -c '%U:%G %a' "$LI/enable_als_sensor" 2>/dev/null) $(stat -c '%U:%G %a' "$PX/enable_ps_sensor" 2>/dev/null) $(stat -c '%U:%G %a' /dev/psals_sensor 2>/dev/null)"
     echo "sensor:  $(timeout 6 dumpsys sensorservice 2>/dev/null |
         grep -E 'Light Sensor: last|Proximity Sensor: last' -A1 |
         tr -s ' \n' ' ' | cut -c1-240)"
@@ -294,9 +301,12 @@ dispblock() {
     done
     echo "tinyalsa: $(wc -c <"$tlfile" 2>/dev/null) bytes $(grep -a -m1 -o 'kc-tinyalsa7[^,;]\{0,60\}' "$tlfile" 2>/dev/null)"
 
-    sec mic
-    echo "-- record attempts (logcat) --"
-    grep -Ei 'AudioRecord|open_input|start_input_stream|getInputForAttr|cannot open input' "$LC" 2>/dev/null | tail -n 6
+    sec sensors
+    # Handles, types and the order the HAL reports them in.  The display dump
+    # only names the sensor ABC was handed, not the handle SensorService gave
+    # it, and handle == the number the HAL's activate() switches on.
+    timeout 10 dumpsys sensorservice 2>/dev/null | sed -n '/Sensor List/,+10p' | cut -c1-170
+    echo "kcsensor: $(dmesg 2>/dev/null | grep -m1 'kcsensor:')"
 
     sec display
     dispblock 0
@@ -346,20 +356,22 @@ while IFS= read -r l; do
 done <"$R1"
 
 # ---- 6. the sensor timeline ----------------------------------------------
-# The report above is written within a minute of boot_completed -- before
-# anybody can get to Settings and turn the switch on.  So the file would only
-# ever contain the state *before* the test.  Five more samples, one a minute,
-# give it a before and an after of the same action, which is the whole point.
+# The report above is written within a minute of boot_completed.  The test --
+# open Settings, turn adaptive brightness on, cover the sensor -- happens after
+# that, and fix80's dump was pulled only 70 s into it, so the file ended up with
+# two samples and the interesting minute was missing.  Six samples 30 s apart
+# cover the first three minutes with a before and an after of the same action;
+# the file can be pulled as soon as the seventh header appears.
 {
     sec "sensor timeline"
-    echo "  每 60 秒采样一次，共 5 次。"
+    echo "  每 30 秒采样一次，共 6 次（到开机后约 3 分钟）。"
     echo "  现在去 设置 -> 显示 打开「自适应亮度」，然后遮住屏幕上方听筒左边的"
     echo "  光感约 2 秒，再用手盖住听筒约 3 秒。每次采样都会记在这里。"
 } >>"$R1" 2>/dev/null
 i=1
-while [ $i -le 5 ]; do
-    sleep 60
-    dispblock "$((i*60))" >>"$R1" 2>/dev/null
+while [ $i -le 6 ]; do
+    sleep 30
+    dispblock "$((i*30))" >>"$R1" 2>/dev/null
     i=$((i+1))
 done
 chmod 0644 "$R1" 2>/dev/null

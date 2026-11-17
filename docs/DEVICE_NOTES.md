@@ -5560,3 +5560,150 @@ guard 抓到 v=5 之后自己就没了(它该继续 beat 到 120 s),`kcbtnled` �
    `mAmbientLux` —— 见 §43.3 的表。
 4. **距离**:`dumpsys window policy` 的 `mProximityWakeSupported` / `mProximityWakeEnabled`
    和 `setting: ... prox=?`。
+
+## 44. 两个传感器的真正原因：一个 chown
+
+fix80 的 dump 把这件事问清楚了，而且答案比前几轮猜的都简单。
+
+### 44.1 框架这一侧已经无可挑剔
+
+```
+mUseSoftwareAutoBrightnessConfig=true
+mScreenAutoBrightnessSpline=MonotoneCubicSpline{[(0.0, ...), (5.0, ...), ...]}
+mLightSensor={Sensor name="SFH7776 Light Sensor", ...}
+mLightSensorEnabled=true
+mLightSensorEnableTime=56191 (6544 ms ago)        <- 真的开了，不是从来没开
+mAmbientLux=0.0
+mLastObservedLux=0.0
+mAmbientLightRingBuffer=[]                        <- 一个事件都没收到
+mScreenAutoBrightness=-1
+```
+
+`AutomaticBrightnessController` 这次确实调了 `setLightSensorEnabled(true)`，`mScreenBrightnessModeSetting`
+也是 1（那行 `setting: mode=1`）。框架要的做了，事件没来。
+
+### 44.2 剩下的三个数指向同一处
+
+fix80 的报告新增了一行直读驱动的状态：
+
+```
+input:   light=/sys/class/input/input6 en=0 poll=250000 | prox=/sys/class/input/input7 en=0
+```
+
+`enable_als_sensor` 是 0，`enable_ps_sensor` 也是 0。而且 `als_poll_delay` 是 250000，
+正是驱动里 `data->als_poll_delay = 250` 的默认值（show 里 `*1000`）：
+
+```c
+static ssize_t sfh7776_show_als_poll_delay(...) { return sprintf(buf, "%d\n", data->als_poll_delay*1000); }
+```
+
+也就是说：**HAL 一次都没写成功过这两个节点，连采样率都没写进去**。框架说开、驱动说没开，
+中间那一环是 HAL。
+
+### 44.3 为什么写不进去：uid，不是 SELinux
+
+先排掉 SELinux：整机是 permissive（`permissive=1` 出现在每一条 avc 里），所以拒绝写不会
+是它。再看驱动：
+
+```c
+static DEVICE_ATTR(enable_als_sensor, S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP, ...);   /* 0660 */
+static DEVICE_ATTR(enable_ps_sensor,  S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP, ...);   /* 0660 */
+static DEVICE_ATTR(ps_crosstalk,      S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP, ...);   /* 0660 */
+static struct miscdevice sfh7776_device = { .name = "psals_sensor", ... };     /* 0600 */
+```
+
+sysfs 属性默认属主 root:root，`misc_register()` 不给 mode 时也是 0600 root:root。而
+`/vendor/lib/hw/sensors.default.so` **不是**一个独立进程：7.1 的 SensorService 在
+system_server 里，HAL 是 dlopen 进来的，于是它写文件用的身份是 **uid 1000 (system)**。
+0660 root:root 对 uid 1000 来说不可写 —— 每一次 `activate()` 都拿到 EACCES，`enable()`
+返回 -1，SensorService 静默放弃，驱动什么都没收到。
+
+HAL 反汇编对得上（`sensors.default.so` 是流媒体预编译，符号还在）：
+
+```
+LightSensor::enable(int handle, int en)        @0x5928 (Thumb)
+    cmp  r1, #5                 ; handle == LIGHT
+    ldr  r3, [r5, #0x14]        ; 缓存
+    cmp  r3, r2 / beq  ret 0    ; 没变化就不写
+    bl   sysfs_set_input_attr_by_int(path, "enable_als_sensor", en)
+    cmp  r0, #0 / blt  ret -1   ; 写失败就直接返回 -1，缓存也不更新
+    str  r4, [r5, #0x14]
+    bl   sysfs_set_input_attr_by_int(path, "wake", 1)
+```
+
+### 44.4 那 24 秒也是同一件事
+
+`nuSensorService starting...`(03.893) → `nuSensorService thread starting...`(28.428)，24.5 s。
+构造函数里要做三件事：两个 `readInitialValue()`、一个 `setCrossTalkVal()`（读
+`ps_crosstalk`）。这三个都因为同一个 EACCES 失败，而它们带重试。fix80 的 dump 里
+`SensorService` 一条错误都没有 —— 不是没失败，是失败被吞在 HAL 里、重试到超时才返回。
+
+顺带：`mProximitySensorEnabled=false` 依旧是正常的（那是通话贴脸关屏的屏幕锁），
+`mProximitySensor=` 这次也不是 null，所以距离感应的硬件、句柄、PMS 通路都是好的，
+坏的只是"让驱动开始采样"这一步。
+
+### 44.5 原厂是怎么做的
+
+`stock/boot.img` 的 ramdisk 里有 `init.kc.sensor.sh`，`init.rc` 里也有一整段：
+
+```
+    chown system input /sys/class/input/input6/enable_als_sensor
+    chown system input /sys/class/input/input6/delay
+    chown system input /sys/class/input/input6/wake
+    chown system input /sys/class/input/input7/enable_ps_sensor
+    chown system input /sys/class/input/input7/ps_crosstalk
+    ...
+on boot
+    chown system system /dev/psals_sensor
+    start sensor-sh
+```
+
+我们的 ramdisk 是 CM 的 msm8926 那套（`init.rc` / `init.qcom.rc` / `init.cm.rc`），
+`init.kc.sensor.sh` 和这些 chown 一行都没有 —— 这就是从 fix72 到 fix80 两个传感器一直
+"没生效"的全部原因。不是驱动、不是 HAL 版本、不是 SELinux、不是资源里那两个 bool。
+
+### 44.6 fix81 改了什么
+
+新增 `/vendor/bin/kcsensor.sh`，在 `on post-fs-data` 里由 `start kcsensor` 拉起来
+（`class core` / `oneshot` / `disabled`）。它按 `/sys/class/input/input*/name` 匹配，
+把节点交给 uid 1000 / gid 1004：
+
+| 节点 | 用途 |
+|---|---|
+| `light/enable_als_sensor`, `light/als_poll_delay` | 光感采样开关与周期 |
+| `proximity/enable_ps_sensor`, `proximity/ps_crosstalk` | 距离采样开关与串扰校准 |
+| `accelerometer/{enable,delay,wake,mtp_recovery}` | 加速度计 |
+| `geomagnetic`/`orientation`/`rotation_vector`/`linear_acceleration`/`gravity` 的 `{enable,delay,wake}` | 其余（含虚拟传感器） |
+| `/dev/psals_sensor` | HAL 的 ioctl 通道（crosstalk） |
+
+用数字 `1000:1004` 而不是 `system:input`：这个 ROM 里没有 `/etc/passwd` 和 `/etc/group`
+（`debugfs` 查过，`/system/etc/` 下两个文件都不存在），toybox 的 `chown` 解析名字要查它们。
+原厂那两个脚本用名字是因为它自己的 rootfs 里有这两份文件。
+
+启动时机是刻意的：`post-fs-data` 在 zygote 之前，而五个 input 设备在内核 probe 阶段就
+存在了，所以 HAL 构造时第一次读 `ps_crosstalk` 就已经是 system 的。
+
+### 44.7 报告也跟着改了
+
+| 改 | 为什么 |
+|---|---|
+| `input:` 后面加 `perm:`（`stat -c '%U:%G %a'`） | 这次的核心判据就是属主，一行看完 |
+| 新增 `===== sensors =====`，`dumpsys sensorservice` 的 Sensor List 前 10 行 | display 只告诉你 ABC 拿到了哪个 sensor，不告诉你 handle；而 HAL 的 `activate()` 就是按 handle 分派的 |
+| `===== mic =====` 删掉 | 麦克风好了 |
+| `-- dmesg usb --`（25 行）删掉 | USB 那套 enable/pid/UDC 的舞蹈早就稳定了，上面五行就是它的结论 |
+| 时间线 5×60 s → 6×30 s | fix80 的 dump 是开机后 134 秒抓的，只拿到两个采样点；改成 30 秒一次后，三分钟内就有 7 个点，随时可以抓 |
+
+顺带说明自动亮度那一档为什么是 102：`mScreenBrightnessSetting=30`，但 auto 模式下
+PMS 传下去的是 `BRIGHTNESS_DEFAULT`(-1)，`mScreenAutoBrightness=-1` 时 DPC 兜底用
+`config_screenBrightnessSettingDefault`，也就是 102。lux 一来这个数就会自己变。
+
+### 44.8 这一轮要看的
+
+1. `perm:` 一行是不是 `system:input 660`（两个节点 + `/dev/psals_sensor`）。
+2. `kcsensor:` 一行是不是 `nodes=11 als=yes ps=yes psals=yes`。
+3. `===== sensors =====` 里 Light/Proximity 的 handle 是不是 5 / 8。
+4. 时间线里 `mLightSensorEnabled=true` 且 `mAmbientLux` 从 0 变成非 0、`mScreenAutoBrightness`
+   不再是 -1；遮住光感时 `leds: lcd=` 跟着变。
+5. 距离：盖住听筒按电源键，`kclogcat.txt` 里应出现 `Not waking up. Proximity sensor is blocked.`；
+   不想用可以在 设置→显示 里关掉（那是 CM 的 `proximity_on_wake`）。
+6. 开机：`nuSensorService starting` 到 `thread starting` 应该从 24.5 s 掉到几秒。
