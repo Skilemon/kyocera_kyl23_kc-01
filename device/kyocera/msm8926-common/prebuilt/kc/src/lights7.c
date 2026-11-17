@@ -263,10 +263,27 @@ static struct hw_module_methods_t g_methods = {
     .open = open_light,
 };
 
-struct hw_module_t HAL_MODULE_INFO_SYM = {
+/*
+ * The symbol has to be named HMI, not HAL_MODULE_INFO_SYM.
+ *
+ * hardware.h does `#define HAL_MODULE_INFO_SYM HMI`, so a real HAL writes
+ * `struct hw_module_t HAL_MODULE_INFO_SYM` and the compiler emits a symbol
+ * literally called HMI.  lights7.c spelled the macro name out instead, so the
+ * .so exported "HAL_MODULE_INFO_SYM" while hw_get_module() dlsym()ed "HMI":
+ *
+ *     E HAL: load: couldn't find symbol HMI
+ *
+ * That is why the fix77 build still had no brightness control -- the library
+ * loaded, and then the loader threw it away because it could not find its
+ * entry point.  The version fields also now match what a real 7.1 lights HAL
+ * declares (HARDWARE_MODULE_API_VERSION(1,0) == 0x0100).
+ */
+#define KC_MODULE_INFO_SYM HMI
+
+struct hw_module_t KC_MODULE_INFO_SYM = {
     .tag = HARDWARE_MODULE_TAG,
-    .module_api_version = 1,
-    .hal_api_version = 0,
+    .module_api_version = 0x0100,
+    .hal_api_version = 0x0100,
     .id = "lights",
     .name = "Kyocera KC01 lights module",
     .author = "kc01 port",

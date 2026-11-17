@@ -1,34 +1,40 @@
 #!/system/bin/sh
 #
-# kcledguard.sh -- hold the button backlight at 0 across the boot animation,
-# and write down every value that somebody else tried to set.
+# kcledguard.sh -- keep the button backlight dark for the whole boot window,
+# then hand the node to kcbtnled.
 #
-# Why: with fix74/75 the keys flash twice in the second or two before the boot
-# animation.  The first guess (section 36.4) was a DT collision -- a gpio-leds
-# node on GPIO 34 fighting the camera's CAM_AF_PWDM -- and that guess is wrong.
-# The boot image's own DTB has no gpio-leds node at all: qcom,leds@a100 is
-# "okay" and the button backlight is PMIC MPP2 (qcom,led_mpp_2,
-# linux,name="button-backlight", default-state off), exactly like the factory
-# build.  So the flashing comes from software writing brightness, not from the
-# camera driving a shared line, and there are only three writers in this ROM:
-# kcbtnled (our daemon, level 255 for 5 s at start), the framework's lights HAL
-# (dead: lights.default.so fails to load, see section 37), and the kernel's
-# default-state.
+# History, because this file has been wrong twice:
 #
-# This cannot say *who* wrote, so it records when: a timestamped line per
-# transition, at 20 ms resolution through the boot window, in three places
-# (/data/local/tmp survives to the next boot; /cache is dumped; kmsg is the
-# one that survives a crash).  The next dump then says whether the flash is
-# kcbtnled's 5 s light, two short writes from somewhere else, or the panel
-# backlight rather than the keys.
+#   fix75  blamed a DT collision (gpio-leds on GPIO 34 vs the camera's
+#          CAM_AF_PWDM).  Wrong: the boot image's own DTB has no gpio-leds node
+#          at all -- qcom,leds@a100 is "okay" and the button backlight is PMIC
+#          MPP2 (qcom,led_mpp_2, default-state off), same as the factory build.
 #
-# It also holds the node at 0 the whole time, so the flash is not visible in
-# the meantime.  Cost: for the first four minutes touching the keys does not
-# light them; after that this exits and kcbtnled owns the node again.
+#   fix76  the dump caught "v=5 t=7.89 cam= btn=494": pidof kcbtnled was 494,
+#          so kcbtnled was the writer, and it was starting in class core --
+#          i.e. right on top of the boot animation.
+#
+#   fix77  moved kcbtnled to boot_completed, which only moved the flash: the
+#          user now sees it "two blinks just after the boot animation ends".
+#          The guard also released six seconds after boot_completed, and its
+#          log stopped after the first catch, so kcbtnled had the node to
+#          itself from about 60 s -- exactly when the flash shows up.
+#
+# fix78 stops trying to out-run it.  The guard owns the node for the first two
+# minutes of uptime and nothing else may touch it.  Only then does it set
+# sys.kcbtnled.late, which is what starts kcbtnled (see kyl23-extra.rc).  So
+# there is no window in which two writers alternate, and no window in which
+# kcbtnled is started but this is not holding the node.
+#
+# kcbtnled's own log says its start does not light anything -- the light comes
+# from its key handler, "set 255 (key)" on input code 330 -- so starting it
+# after the guard lets go is invisible.  kcbtnlednet.sh is the safety net: if
+# this script dies, kcbtnled still gets started, just later.
 #
 B=/sys/class/leds/button-backlight/brightness
 L1=/data/local/tmp/kc_led.log
 L2=/cache/kc_led.log
+HOLD=120
 
 say() {
     for f in $L1 $L2; do echo "$*" >> $f 2>/dev/null; done
@@ -37,72 +43,65 @@ say() {
 
 now() { cut -d' ' -f1 /proc/uptime 2>/dev/null; }
 
+# Whatever happens, say why we stopped.  A silent exit is what made fix77's
+# log useless: two lines, then nothing, with no way to tell whether the loop
+# ended, the script was killed, or the writes started failing.
+finish() {
+    say "exit at t=$(now) reason=$1 corrected=$n"
+    setprop sys.kcbtnled.late 1
+    exit 0
+}
+
+n=0
+prev=""
+
 # /system is mounted by now but the LED class device appears when qpnp probes,
-# which is ~1 s into the kernel boot -- long before init gets here.  Still, wait
-# rather than give up: "no node at this instant" is not "no node".
+# ~1 s into the kernel boot.  Wait rather than give up: "no node yet" is not
+# "no node".
 i=0
 while [ ! -e "$B" ] && [ "$i" -lt 600 ]; do
     sleep 0.05
     i=$((i + 1))
 done
-[ -e "$B" ] || { say "no $B after 30 s"; exit 0; }
+[ -e "$B" ] || { say "no $B after 30 s"; setprop sys.kcbtnled.late 1; exit 0; }
+
+trap 'finish signal' INT TERM HUP
 
 echo 0 >"$B" 2>/dev/null
 prev=$(cat "$B" 2>/dev/null)
-say "start t=$(now) v=$prev"
+say "start t=$(now) v=$prev hold=${HOLD}s"
 
-# 45 s at 20 ms (the boot animation window), then 200 ms until four minutes.
-# Two loops rather than one with a variable sleep: this shell has no
-# sub-second arithmetic worth trusting.
-#
-# fix77: kcbtnled no longer starts in class core (that was the flash -- the
-# fix76 dump caught v=5 at 7.89 s with pidof kcbtnled = 494), so this no longer
-# has to fight it for the whole boot.  Instead it yields the moment the
-# framework is up: after boot_completed the keys belong to kcbtnled, and
-# holding the node at 0 past that would just look like broken key backlight.
-n=0
+# Phase 1: 20 ms for the first 60 s -- that is the boot animation window and
+# the few seconds after it, where the two blinks were seen.
 i=0
-while [ "$i" -lt 2250 ]; do
+while [ "$i" -lt 3000 ]; do
     v=$(cat "$B" 2>/dev/null)
     if [ -n "$v" ] && [ "$v" != "0" ]; then
         n=$((n + 1))
-        [ "$n" -le 20 ] && [ "$v" != "$prev" ] && say "caught v=$v t=$(now) cam=$(pidof qcamerasvr 2>/dev/null) btn=$(pidof kcbtnled 2>/dev/null)"
+        [ "$n" -le 30 ] && [ "$v" != "$prev" ] && \
+            say "caught v=$v t=$(now) cam=$(pidof qcamerasvr 2>/dev/null) btn=$(pidof kcbtnled 2>/dev/null)"
         echo 0 >"$B" 2>/dev/null
         prev=0
     fi
     i=$((i + 1))
-    if [ $((i % 50)) -eq 0 ] && [ "$(getprop sys.boot_completed 2>/dev/null)" = 1 ]; then
-        # kcbtnled starts on this same property and fades the keys up for its
-        # 5 s timeout as part of its own start-up.  Hold six more seconds so
-        # that light is not visible either, then hand the node over.
-        say "boot_completed t=$(now), holding 6 s for kcbtnled start"
-        j=0
-        while [ "$j" -lt 300 ]; do
-            v=$(cat "$B" 2>/dev/null)
-            if [ -n "$v" ] && [ "$v" != "0" ]; then
-                n=$((n + 1))
-                [ "$n" -le 20 ] && say "caught v=$v t=$(now) (post-boot)"
-                echo 0 >"$B" 2>/dev/null
-            fi
-            j=$((j + 1))
-            sleep 0.02
-        done
-        say "releasing t=$(now) corrected=$n"
-        exit 0
-    fi
     sleep 0.02
 done
+say "t=$(now) fast phase done, corrected=$n"
 
-i=0
-while [ "$i" -lt 585 ]; do
+# Phase 2: 50 ms until HOLD seconds of uptime.  Nothing should write here; if
+# something does, it is the framework (the lights HAL) rather than kcbtnled,
+# and pidof button tells us which.
+while :; do
+    u=$(now | cut -d. -f1)
+    [ -z "$u" ] && break
+    [ "$u" -ge "$HOLD" ] && break
     v=$(cat "$B" 2>/dev/null)
     if [ -n "$v" ] && [ "$v" != "0" ]; then
         n=$((n + 1))
-        [ "$n" -le 20 ] && say "caught v=$v t=$(now) (slow phase)"
+        [ "$n" -le 30 ] && say "caught v=$v t=$(now) (slow phase) btn=$(pidof kcbtnled 2>/dev/null)"
         echo 0 >"$B" 2>/dev/null
     fi
-    i=$((i + 1))
-    sleep 0.2
+    sleep 0.05
 done
 
-say "done t=$(now) corrected=$n v=$(cat "$B" 2>/dev/null)"
+finish hold-${HOLD}s-complete

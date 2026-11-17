@@ -4739,3 +4739,295 @@ compress offload），那是另一个量级的工程，而且是拿"已经出声
    解析成了什么样，以及开机后还有没有 `unreachable`；
 4. `tinyalsa:` 那行是不是 `kc-tinyalsa7/fix77`，以及播放时 `pcm=` 能不能进
    `RUNNING`（声音不能因为换库退回去，这是这一轮最大的风险）。
+
+## 39. fix77 全崩，以及四个各不相同的真因
+
+fix77 的四项改动四条全错：没声音、亮度条无效、动画后仍闪两下、麦克风还是不行。
+这一轮把每一条都追到根，其中三条是"我写的东西错了"，一条是"根本没问题"。
+
+### 39.1 没声音：自研 libtinyalsa 的两处硬伤
+
+fix76 有声音、fix77 没声音，中间只换了 `libtinyalsa`，所以是我写的那份 1412 行
+实现的问题。dump 里 HAL 的行为把范围收得很窄：
+
+```
+V audio_hw_primary: start_output_stream: Opening PCM device card_id(0) device_id(0)
+V audio_hw_primary: start_output_stream: exit          <- 10 ms 后正常退出，没有报错
+```
+
+`pcm_open` 成功（否则 HAL 会打 `E audio_hw_primary`，整个 dump 里一行 E 都没有），
+AudioTrack 放了 8 秒，`out_standby` 正常收尾，就是没声。也就是"写进去的数据没人要"。
+两处原因，都在我那份实现里：
+
+**(1) avail 公式在环空的时候返回 0。** 我写的是
+
+```c
+avail = (pcm->buffer_size + hw - app) % pcm->buffer_size;   /* 错 */
+```
+
+第一次写时 `hw == app == 0`，于是 `3840 % 3840 == 0`。`pcm_mmap_transfer` 拿到
+`chunk == 0`，状态又不是 RUNNING，直接 `set_error("no frames available")` 返回 -1。
+上游的写法是 `buffer_size - (app - hw)`，环空时返回满环 3840。差别就是"第一个字节
+能不能写进去"，而第一个字节进不去，后面全都进不去。
+
+**(2) 没有 PREPARE。** fix74 那版我判断"7.1 把 prepare 交给 HAL"，就把
+`pcm_write` 里的隐式 prepare 删了。但把这个 HAL 导入的符号列出来看：
+
+```
+pcm_open pcm_is_ready pcm_get_error pcm_close pcm_write pcm_read
+pcm_start pcm_stop pcm_mmap_write pcm_mmap_read pcm_ioctl pcm_get_htimestamp
+```
+
+**没有 `pcm_prepare`** —— 它从来不会自己准备。而内核 `snd_pcm_lib_write1()`
+（`sound/core/pcm_lib.c`）在 SETUP 状态下直接 `-EBADFD`。反汇编原厂那份
+13580 字节的库，prepared 检查就在 `pcm_write` 和 `pcm_start` 里：
+
+```
+<pcm_write>::  movw r1, #16704   @ 0x4140  (SNDRV_PCM_IOCTL_PREPARE)
+<pcm_start>::  movw r1, #16704   @ 0x4140  (PREPARE)
+<pcm_start>::  movw r1, #16706   @ 0x4142  (START)
+```
+
+它是有意这么做的，我却按"7.1 的风格"把它去掉了。两条叠加：即使 avail 算对，
+写入也会因为 SETUP 状态失败。
+
+### 39.2 正解：上游 7.1 源码 + `-DIGNORE_SILENCE_SIZE`
+
+不再手写。`pcm.c` / `mixer.c` 用 CyanogenMod `android_external_tinyalsa` 的
+cm-14.1 原文（就是 7.1 那一代的原版），只加两样东西：
+
+1. `-DIGNORE_SILENCE_SIZE` —— 这是**上游自带的开关**，作用是删掉
+   `struct pcm_config` 的 `silence_size` 字段：
+
+   ```c
+   unsigned int start_threshold, stop_threshold, silence_threshold;
+   #ifndef IGNORE_SILENCE_SIZE
+       unsigned int silence_size;
+   #endif
+       unsigned int avail_min;
+   ```
+
+   编译出来 `sizeof(struct pcm_config) == 36`，与本机厂商 HAL 那份 KitKat 结构
+   逐字节相同，`avail_min` 落在 offset 32。§34 那个 36/40 的对撞，上游早就留了
+   这个开关，我却在手搓实现里去"猜"字段。
+
+   传 40 字节结构的调用者（7.1 的 usb HAL）offset 32 是 `silence_size`（0），
+   上游自己会退化成 `period_size`（mmap）或 1（rw），不会 EINVAL。**一份库同时
+   满足两种布局，不需要判断、不需要猜测。**
+
+2. 一个 `bionic_compat.h`，只解决三件宿主 gcc 与 bionic 的差异：
+   `errno` 要映射到 `__errno()`（glibc 的 `__errno_location` 在 bionic 上不存在）、
+   `stderr`/`fprintf` 变空操作（bionic 没有可链接的 `stderr` 对象，而且错误文本
+   本来就写进 `pcm->error`）。另外 Ubuntu 的 gcc-arm-linux-gnueabi 默认
+   `_TIME_BITS=64`/`_FILE_OFFSET_BITS=64`，会把 `open`/`mmap`/`ioctl` 变成
+   `open64`/`mmap64`/`__ioctl_time64`，所以 build.sh 里显式
+   `-D_TIME_BITS=32 -D_FILE_OFFSET_BITS=32 -D_FORTIFY_SOURCE=0`。
+
+结果：26272 字节（原厂 7.1 是 26420），`NEEDED` 只有 `libc.so`，未定义符号全部
+是 bionic 有的名字：
+
+```
+__aeabi_idiv __aeabi_uidiv __aeabi_uidivmod calloc close __errno fcntl free ioctl
+memcpy memset mmap munmap open poll snprintf strcmp strdup strerror strlen sysconf
+vsnprintf write
+```
+
+导出 57 个 `pcm_*`/`mixer_*`，与原厂 7.1 的 62 个相比只少 5 个 `__aeabi_*`
+（libgcc 的除零辅助，bionic 自带，我们也不再静态链它们）。
+
+另外给 `oops()` 加了一行：**任何内部失败同时写 `/dev/kmsg` 的 `KCTL` 行**。
+理由就是这个 HAL 不看 `pcm_mmap_write` 的返回值 —— 库坏掉时全系统一声不响，
+fix77 就是这么过去的。报告里新增 `-- pcm errors logged by the library --` 段。
+
+### 39.3 用一个假的 3.4 内核把它测了
+
+不能只靠"读代码觉得对"。`prebuilt/kc/src/tests/test_pcm.c` 把 `pcm.c` 编进来，
+把 `open/ioctl/mmap/poll/fcntl` 换成假的，假内核按 `sound/core/pcm_native.c` 的
+真实规则办事：SETUP 状态下写返回 `-EBADFD`；`silence_size >= boundary` 或
+`silence_size > silence_threshold` 或 `avail_min == 0` 一律 `-EINVAL`。
+
+```
+sizeof(struct pcm_config) = 36 (must be 36)
+-- playback, 36-byte config, non-mmap --
+  ok  sw_params accepted            0      ok  avail_min seen by kernel      240
+  ok  silence_size forced to 0      0      ok  start_threshold               240
+  ok  rate 48000   channels 2   period_size 960   periods 4   buffer_size 3840
+  ok  first pcm_write               0      ok  PREPARE was issued            1
+  ok  stream is RUNNING             3      ok  prepared only once            1
+-- playback, 40-byte config (7.1 caller) --
+  ok  avail_min fell back (rw path -> 1)   ok  start_threshold defaulted to p*c/2 1920
+  ok  still PREPARED below start_threshold ok  RUNNING once threshold is reached 3
+-- the config that used to fail: silence_size 240 --
+  ok  kernel rejects silence_size 240 > threshold 0  (EINVAL)
+all checks passed (0 failures)
+```
+
+最后那条是反向对照：拿 §34 里那份"把 avail_min 当 silence_size"的参数喂给假内核，
+它必须报 EINVAL —— 说明这个假内核确实会拒绝当初那个 bug，前面那些 ok 才有意义。
+
+### 39.4 亮度：`HMI`，不是 `HAL_MODULE_INFO_SYM`
+
+fix77 的 `lights.default.so`（6372 字节，`NEEDED libc.so`，符号齐全）仍然没工作，
+logcat 里只有一行：
+
+```
+E HAL: load: couldn't find symbol HMI
+```
+
+`hardware.h` 里是 `#define HAL_MODULE_INFO_SYM HMI`，真 HAL 写
+`struct hw_module_t HAL_MODULE_INFO_SYM`，编译器产出的符号名就是 `HMI`。
+我在 `lights7.c` 里把宏名当成符号名写了出来，于是 `.so` 导出的是
+`HAL_MODULE_INFO_SYM`，而 `hw_get_module()` 找的是 `HMI`：库加载成功，然后被
+**丢掉**，LightsService 拿不到设备，亮度条自然一动不动。
+
+顺手把版本字段改成真 HAL 的样子（`HARDWARE_MODULE_API_VERSION(1,0) == 0x0100`）。
+现在 `readelf --dyn-syms` 里是 `9: 00002018 128 OBJECT GLOBAL DEFAULT 12 HMI`。
+
+报告里加了三行判据，一条 dump 就能定论：
+
+```
+lcd:     <brightness> of <max>          <- 拖亮度条这个数必须变
+load:    0 x 'couldn't find symbol HMI' <- 必须是 0
+setting: screen_brightness=... mode=... button=...
+```
+
+`mode=1` 才是自动亮度；如果它是 0，"光线传感器没用"其实是"自动亮度没开"。
+
+### 39.5 按键背光：三次都错在时间点上
+
+- fix75 说是 DT 冲突 → 撤回（DT 是原厂的，按键背光是 PMIC MPP2）。
+- fix76 抓到 `caught v=5 t=7.89 cam= btn=494` → 是 kcbtnled，于是 fix77 把它从
+  `class core` 挪到 `boot_completed`。
+- fix77 的 dump：`caught v=5 t=53.35 cam= btn=4222`，`boot_completed` 在 52 s，
+  也就是**动画结束之后**。用户看到的"闪两下"正好在这个位置。同一份 dump 里
+  kcbtnled 自己的日志（`kclog.txt`）写得很清楚：
+
+  ```
+  [52] kcbtnled fix24 start: level=255 timeout=5000 enabled=1
+  [62] key: dev=0 code=330 led=0 en=1
+  [62] set 255 (key): 0 -> 255
+  ```
+
+  它的**启动本身不点灯**（52 秒没有任何 `set`），点灯来自 62 秒那次 input
+  `code=330`（触摸屏 BTN_TOOL_FINGER）—— 开机动画一结束，触摸屏上报一次，
+  kcbtnled 就按设计把按键点亮 5 秒。两次，就是这类事件来了两次。
+
+  而 fix77 的守卫在 53.35 抓到一次之后就没再记录了，`boot_completed` 那段的
+  让步逻辑没留下任何行 —— 它在那之后就不再守着节点，62 秒那次自然看得见。
+
+fix78 不再抢时间差：**守卫独占节点 120 秒**（0-60 s 每 20 ms，60-120 s 每 50 ms），
+期间任何人写非 0 都压回 0 并记一行；到点后 `setprop sys.kcbtnled.late 1` 才启动
+kcbtnled。因为它的启动不点灯，交接是不可见的。另外：
+
+- 守卫加了 `trap` 和 `finish`，**任何退出路径都会留一行原因**（fix77 那种
+  "两行之后没了"不能再发生）；
+- 新增 `kcbtnlednet.sh`：class core 起，`sleep 200` 后无条件
+  `setprop sys.kcbtnled.late 1`。守卫万一死了，按键背光只是晚两分钟，不会永久失效。
+
+`sh` 干跑（`/tmp/g78`，假 sysfs、HOLD=4 s，中途写 5 和 255）：
+
+```
+start t=... v=0 hold=4s
+caught v=5   t=... cam= btn=
+caught v=255 t=... cam= btn=
+t=... fast phase done, corrected=2
+exit at t=... reason=hold-4s-complete corrected=2
+final value: 0
+```
+
+### 39.6 麦克风：APM 那一层已经通了
+
+fix77 把 input profile 收窄到 PCM16/MONO|STEREO 之后，7.1 的 APM 开机不再把输入
+设备判死。fix77 的 dump：
+
+```
+V audio_hw_primary: adev_open_input_stream: enter
+V audio_hw_primary: adev_open_input_stream: exit      <- fix76 里永远等不到这一行
+- Available input devices:
+  Device 1: AUDIO_DEVICE_IN_BUILTIN_MIC  PCM_16_BIT  8000..48000  0x000c,0x0010
+  Device 2: AUDIO_DEVICE_IN_BACK_MIC     ...
+  Device 3: AUDIO_DEVICE_IN_TELEPHONY_RX ...
+```
+
+三个都在、profile 正确、`unreachable` 一条都没有。剩下的断点就是采集流的
+`pcm_open` —— 和放音同一个库、同一类错误（§39.1 的 avail 公式和 PREPARE 一样
+会把 `pcm_read` 打死）。换库之后这条应该一起好，但需要实测：
+
+- 用录音机 App 录一段，能听到自己的声音；
+- 播完 `kcaudio.txt` 里 `-- record attempts --` 应该出现 `start_input_stream`，
+  `-- pcm errors --` 里不应有 `KCTL`。
+
+### 39.7 传感器：其实一直是好的，坏的是亮度
+
+fix77 的 `-- direct probe --` 是这一轮最干净的一条证据：
+
+```
+input6 enable_als_sensor: before=0 event=/dev/input/event6
+input6 enable_als_sensor: after=1
+input6 events (16-byte input_event, raw):
+   61  950969  2621443  96          <- EV_ABS ABS_MISC = 96 lux
+   61  950975        0      0       <- EV_SYN
+input7 enable_ps_sensor: after=1  (无事件，见下)
+```
+
+`od -tu4` 那两行拆开是 `type=3(EV_ABS) code=0x28(ABS_MISC) value=96`，也就是**手动
+写 enable 之后驱动和器件立刻给数据**。再看 `dumpsys sensorservice`：
+
+```
+Recent Sensor events:
+SFH7776 Light Sensor: last 2 events
+	 1 (ts=59.200837) 98.00       <- 就是上面那次 probe
+	 2 (ts=61.950975) 96.00
+SFH7776 Proximity Sensor: last 1 events
+	 1 (ts=62.221997) 4.00
+```
+
+这些事件**已经穿过了 HAL 和 SensorService**，说明 `sensors.default.so`（原厂
+38192 字节）→ HAL → 框架整条链路是通的。八个传感器名字/厂商/handle 全对，
+`Active sensors: 0` 只是当时没有客户端在要（我们自己写完又写回了）。
+
+所以"光线传感器不能用"最可能的真相是：**自动亮度靠 LightsService 调屏幕亮度，
+而 lights HAL 是死的（§39.4）**，传感器有数据、屏幕不动。距离传感器同理 ——
+它只在通话时关屏，而关屏/亮屏也要走 lights。修好 `HMI` 之后两者应该同时恢复。
+
+距离那次没有事件，是因为 PS 是 on-change：手不在上方时它只在状态变化时上报，
+而 probe 只等了 1 秒。不是故障。
+
+为了不再靠猜，报告里加了两样：
+
+- `-- direct probe --` 保留（写 enable → 读 1 秒 event → **写回原值**，不是无条件写 0，
+  否则会把电话 App 正在用的 PS 关掉）；
+- 采样循环每 30 秒打一行 `sen:`（`dumpsys sensorservice` 里 light/prox 的
+  last events 和 active 数），这样**用户在测试 App 里看传感器的同时**，报告里就有
+  一条时间线，能直接看出"事件有没有到框架"。
+
+### 39.8 fix78 改了什么
+
+镜像 `system-fix78.img.zip`（只刷 system，boot 仍是 fix72 那版 #25 内核）：
+
+| 路径 | 从 | 到 |
+|---|---|---|
+| `/lib/libtinyalsa.so` | 21032，自研（avail 公式错、无 PREPARE） | 26272，上游 7.1 + `IGNORE_SILENCE_SIZE` |
+| `/vendor/lib/hw/lights.default.so` | 6372，导出 `HAL_MODULE_INFO_SYM` | 6372，导出 `HMI` |
+| `/vendor/bin/kcledguard.sh` | fix77，45 s + 6 s 让步 | 独占 120 s，退出必留原因 |
+| `/vendor/bin/kcbtnlednet.sh` | 无 | 新增，200 s 后无条件放行 kcbtnled |
+| `/etc/init/kyl23-extra.rc` | fix77 | kcbtnled 改由 `sys.kcbtnled.late` 启动 |
+| `/vendor/bin/kcadsp.sh` | fix77 | `KCTL` 段、`sen:` 周期采样、亮度/HMI/设置三项判据 |
+
+源码：`prebuilt/kc/src/tinyalsa/`（pcm.c、mixer.c、include/tinyalsa/asoundlib.h、
+bionic_compat.h）、`lights7.c`、`tests/test_pcm.c`，`build.sh` 一键重编。
+手写的 `tinyalsa7.c` 已删除 —— 一份"看起来对"的实现输给了一份被几亿台设备跑过的
+实现，这轮就认这一点。
+
+### 39.9 这一轮要看的
+
+1. **声音**：放音时 `pcm=` 能进 `RUNNING`；`tinyalsa:` 行显示
+   `kc-tinyalsa7/fix78: upstream 7.1 pcm.c+mixer.c, IGNORE_SILENCE_SIZE`；
+   `-- pcm errors --` 里应为空。
+2. **亮度**：拖亮度条，`lcd:` 那个数要变；`load: 0 x 'couldn't find symbol HMI'`。
+3. **自动亮度**：`setting:` 行里 `mode=` 是不是 1。
+4. **按键背光**：开机动画前后都不该闪；`kc_led.log` 里应有
+   `start ... hold=120s`、若干 `caught` 带 `btn=<pidof kcbtnled>`（如果 120 s 内
+   还有的话）、以及 `exit at ... reason=hold-120s-complete`。
+5. **麦克风**：录一段音；`-- record attempts --` 出现 `start_input_stream`。
+6. **传感器**：`sen:` 那些行里有没有新的 light/prox 事件。

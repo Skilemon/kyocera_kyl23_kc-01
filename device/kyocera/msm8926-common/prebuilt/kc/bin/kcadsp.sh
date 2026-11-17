@@ -248,17 +248,21 @@ A=$(adspdev)
     echo "slim:  $(ls /sys/bus/slimbus/devices 2>/dev/null | tr '\n' ',')"
     echo "audioserver start/exit: $(dmesg 2>/dev/null | grep -c "Starting service 'audioserver'") / $(dmesg 2>/dev/null | grep -c "audioserver') exited")"
     # The audio HAL in /vendor/lib/hw is the KitKat prebuilt (byte-identical to
-    # the stock one), and it passes a 36-byte struct pcm_config.  libtinyalsa
-    # 13580 bytes is the KitKat build that expects those 36 bytes; 26420 bytes
-    # is the 7.1 build, which reads avail_min at offset 36 and silence_size at
-    # 32 -- i.e. past the end of the caller's struct -- and every pcm_open()
-    # then dies in SNDRV_PCM_IOCTL_SW_PARAMS with EINVAL.
+    # the stock one) and it passes a 36-byte struct pcm_config.  Since fix78
+    # libtinyalsa is upstream 7.1 tinyalsa built with -DIGNORE_SILENCE_SIZE,
+    # which is exactly that 36-byte layout: avail_min at offset 32 and no
+    # silence_size, so snd_pcm_sw_params() sees 240 against 0 and accepts it.
     tlfile=
     for f in /system/lib/libtinyalsa.so /lib/libtinyalsa.so; do
         [ -r "$f" ] && tlfile=$f && break
     done
     echo "tinyalsa: ${tlfile:-missing} $(wc -c <"$tlfile" 2>/dev/null) bytes"
     echo "          $(grep -m1 -ao 'kc-tinyalsa7[^\"]*' "$tlfile" 2>/dev/null || echo 'no kc-tinyalsa7 tag -- still the stock 7.1 or KitKat build')"
+    echo "-- pcm errors logged by the library --"
+    # Every failure inside libtinyalsa also goes to /dev/kmsg as KCTL, because
+    # this HAL ignores the return value of pcm_mmap_write.  A broken PCM layer
+    # is otherwise completely silent -- which is exactly what fix77 shipped.
+    dmesg 2>/dev/null | grep -E 'KCTL' | tail -n 10
 
     sec sensors
     # fix76's dump retired the 36-vs-68-byte sensor_t theory: SensorService
@@ -333,9 +337,17 @@ A=$(adspdev)
     grep -Ei 'AudioRecord|open_input|start_input|getInputForAttr|cannot open input|AUDIO_DEVICE_IN' "$LC" 2>/dev/null | tail -n 12
 
     sec led
-    echo "leds:   $(ls /sys/class/leds 2>/dev/null | tr '\n' ' ')"
-    echo "button: $(cat /sys/class/leds/button-backlight/brightness 2>/dev/null) of $(cat /sys/class/leds/button-backlight/max_brightness 2>/dev/null)"
-    echo "lcd:    $(cat /sys/class/leds/lcd-backlight/brightness 2>/dev/null)"
+    echo "leds:    $(ls /sys/class/leds 2>/dev/null | tr '\n' ' ')"
+    echo "button:  $(cat /sys/class/leds/button-backlight/brightness 2>/dev/null) of $(cat /sys/class/leds/button-backlight/max_brightness 2>/dev/null)"
+    echo "lcd:     $(cat /sys/class/leds/lcd-backlight/brightness 2>/dev/null) of $(cat /sys/class/leds/lcd-backlight/max_brightness 2>/dev/null)"
+    echo "hal:     $(wc -c </vendor/lib/hw/lights.default.so 2>/dev/null) bytes"
+    # Whether LightsService got a device at all.  fix77's HAL loaded and was
+    # then thrown away -- "load: couldn't find symbol HMI" -- because the
+    # module struct was spelled HAL_MODULE_INFO_SYM instead of letting the
+    # macro expand to HMI.  This count has to be 0 and "lcd:" has to move when
+    # the brightness slider is dragged; together they are the whole test.
+    echo "load:    $(grep -c 'find symbol HMI' "$LC" 2>/dev/null) x 'couldn't find symbol HMI' (must be 0)"
+    echo "setting: screen_brightness=$(settings get system screen_brightness 2>/dev/null) mode=$(settings get system screen_brightness_mode 2>/dev/null) button=$(settings get system button_brightness 2>/dev/null)"
     echo "-- kcledguard --"
     sed 's/^/    /' /data/local/tmp/kc_led.log 2>/dev/null | head -n 20
 
@@ -464,14 +476,29 @@ audiosnap() {
     kmsg "KCSNAP t=$(up) pcm=$(snap | sed 's/.*pcm=//') full copy at $R1"
 }
 
+# One compact line about what the sensor framework is handing out.  The direct
+# probe in "sec sensors" writes enable_als_sensor by hand and reads the event
+# device, which settles whether the driver emits anything at all; this settles
+# whether SensorService and the HAL still deliver to clients afterwards.  The
+# two together are the difference between "the sensor is broken" and "nothing
+# asked for it".
+sensline() {
+    timeout 6 dumpsys sensorservice 2>/dev/null |
+        grep -E 'Sensor: last|^ +[0-9]+ \(ts=|^Active sensors|^[0-9]+ active' |
+        head -n 8 | tr '\n' ' ' | cut -c1-300
+}
+
 kmsg "sampling start, 1 s, 10 min fast then 2 s for 20 min"
-prev=$(snap)
-lastbusy=0
+prev=$(snap)lastbusy=0
 esnaps=0
 i=0
 while [ $i -lt 1200 ]; do
     if [ $i -lt 600 ]; then sleep 1; else sleep 2; fi
     i=$((i+1))
+    # every 30 s: did any sensor event reach the framework meanwhile?
+    if [ $((i % 30)) -eq 0 ]; then
+        echo "$(up) | sen: $(sensline)" >>"$R1" 2>/dev/null
+    fi
     cur=$(snap)
     changed=0
     [ "$cur" != "$prev" ] && changed=1

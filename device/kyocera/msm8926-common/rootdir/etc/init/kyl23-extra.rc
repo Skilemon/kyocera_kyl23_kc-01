@@ -534,8 +534,13 @@ service kclogcat /system/bin/logcat -b main,system,crash,radio -v threadtime -f 
 
 on property:sys.boot_completed=1
     start kclogcat
-    # fix77: the key backlight daemon used to start in class core and light the
-    # keys at ~7.9 s, i.e. during the boot animation.  See the note above it.
+
+# fix78: kcbtnled does not start on boot_completed any more either.  Boot
+# completing is not the end of the flash window -- the user sees the two
+# blinks *after* the animation, which is precisely when kcbtnled comes up and
+# its key handler first fires (input code 330, "set 255 (key)").  It now waits
+# for kcledguard to say the two minutes are over.
+on property:sys.kcbtnled.late=1
     start kcbtnled
 
 # Bluetooth package state: clear the flag before PackageManager reads it.
@@ -666,8 +671,11 @@ service p2p_supplicant /system/bin/wpa_supplicant \
 # HAL is dead, see below).  Started from class core it therefore lit the keys
 # in the middle of the boot animation, which is the "flashes twice".
 #
-# fix77 starts it once the framework is up instead.  Nothing needs the keys lit
-# before that, and kcledguard keeps the node at 0 until boot_completed anyway.
+# fix77 moved it to boot_completed and the flash simply moved with it: the user
+# now sees "two blinks just after the boot animation ends".  fix78 gives the
+# node to kcledguard for the first two minutes and starts this only when the
+# guard sets sys.kcbtnled.late.  kcbtnlednet.sh is the fallback if the guard
+# dies before it gets there.
 service kcbtnled /vendor/bin/kcbtnled
     seclabel u:r:init:s0
     class core
@@ -692,6 +700,16 @@ service kcbtnled /vendor/bin/kcbtnled
 # ---------------------------------------------------------------------------
 service kcledguard /vendor/bin/kcledguard.sh
     seclabel u:r:init:s0
+    user root
+    group root system
+    oneshot
+
+# The safety net for kcledguard: if that script dies before its last line,
+# kcbtnled would never start and the keys would never light again.  This holds
+# the node's owner to a fixed deadline instead of depending on the guard.
+service kcbtnlednet /vendor/bin/kcbtnlednet.sh
+    seclabel u:r:init:s0
+    class core
     user root
     group root system
     oneshot
