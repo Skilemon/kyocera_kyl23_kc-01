@@ -24,6 +24,27 @@ TARGET_BOARD_PLATFORM_GPU := qcom-adreno305
 TARGET_BOOTLOADER_BOARD_NAME := MSM8226
 BOARD_VENDOR := kyocera-qcom
 
+# ------------------------------------------------------------------ screen
+#
+# 540x960 qHD, 240 dpi (ro.sf.lcd_density lives in lineage-common.mk).
+#
+# These two are not cosmetic.  vendor/cm/bootanimation/Android.mk installs a
+# generated bootanimation.zip whenever TARGET_BOOTANIMATION is empty, and
+# generate-bootanimation.sh takes TARGET_SCREEN_WIDTH/HEIGHT as $2/$3 and
+# feeds them straight into `[ "$HEIGHT" -lt "$WIDTH" ]`.  With both unset that
+# test prints
+#
+#   generate-bootanimation.sh: line 10: [: : integer expression expected
+#
+# and then writes its desc.txt as `echo "$IMAGEWIDTH $IMAGEHEIGHT" 60`, which
+# with empty values produces a first line of ` 60` -- no width, no height.
+# bootanimation parses that line with sscanf("%d %d %d"), gets 1 instead of 3,
+# leaves fps at 0, and movie() divides by it.  That is exactly the SIGFPE in
+# DEVICE_NOTES 23, and it was never a shipped placeholder: this build was
+# generating the broken file itself, at 92% of every bacon run.
+TARGET_SCREEN_HEIGHT := 960
+TARGET_SCREEN_WIDTH := 540
+
 # ------------------------------------------------------------ architecture
 TARGET_ARCH := arm
 TARGET_ARCH_VARIANT := armv7-a-neon

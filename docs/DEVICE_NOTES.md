@@ -6008,3 +6008,125 @@ adb shell cat /data/local/tmp/kcprox.log
 框架侧收到的是否一致，就能区分是"没吞掉"还是"吞掉了但又注入了一份"。
 
 不想立刻改变行为的话，`kcprox --dry` 手动跑一遍，日志会出现 `would swallow` 而屏幕照常亮。
+
+## 47. CI 每次都在最后一步红：这个构建一直在生成一个坏掉的开机动画
+
+fix83 推上去之后 `Build LineageOS 14.1` 又红了。翻 run 记录才发现不是这一轮的事：
+
+| commit | 结论 | 失败步骤 |
+|---|---|---|
+| 24d7efe4 (fix83) | failure | Verify the package |
+| a0acf365 (fix82) | cancelled | — |
+| ffa472e0 (fix81) | failure | Verify the package |
+| 35544987 (fix80) | cancelled | — |
+| 9d204d71 (fix79) | failure | Verify the package |
+| 939c5cac | failure | Verify the package |
+| ae6dd409 | failure | Verify the package |
+
+**从 fix76 引入这个步骤起，一次都没通过过。** 而且每次都停在同一条上。
+
+### 47.1 失败的那一条
+
+日志尾部（`set -x`）：
+
+```
++ unzip -p system/media/bootanimation.zip desc.txt
++ head -n 1
++ tr -d '\r'
++ grep -Eq '^[0-9]+ [0-9]+ [0-9]+$'
+##[error]Process completed with exit code 1.
+```
+
+`unzip` 一句错都没报。这不是"文件不存在"——文件不存在时 Info-ZIP 会打
+`cannot find or open`，而这版 unzip 在 `-p` 遇到不存在的成员时干脆什么都不输出，
+所以两种情形在日志里长得一模一样。真正的原因要在构建日志里往前翻：
+
+```
+[ 92% 26585/28792] Building bootanimation
+vendor/cm/bootanimation/generate-bootanimation.sh: line 10: [: : integer expression expected
+[ 92% 26586/28792] build .../ETC/bootanimation.zip_intermediates/bootanimation.zip
+[ 95% 27509/28792] Install: .../system/media/bootanimation.zip
+```
+
+文件确实装进去了。装进去的是**生成出来的**那个。
+
+### 47.2 生成器的两行
+
+`vendor/cm/bootanimation/Android.mk`：
+
+```make
+define build-bootanimation
+    $(shell) vendor/cm/bootanimation/generate-bootanimation.sh \
+    $(PRODUCT_OUT) $(TARGET_SCREEN_WIDTH) $(TARGET_SCREEN_HEIGHT) \
+    $(TARGET_BOOTANIMATION_HALF_RES)
+endef
+
+ifeq ($(TARGET_BOOTANIMATION),)
+    TARGET_BOOTANIMATION := $(TARGET_GENERATED_BOOTANIMATION)
+endif
+
+LOCAL_MODULE := bootanimation.zip
+LOCAL_MODULE_PATH := $(TARGET_OUT)/media
+$(LOCAL_BUILT_MODULE): $(TARGET_BOOTANIMATION)
+	@cp $(TARGET_BOOTANIMATION) $@
+```
+
+而 `generate-bootanimation.sh`：
+
+```sh
+if [ "$HEIGHT" -lt "$WIDTH" ]; then      # line 10
+...
+echo "$IMAGESCALEWIDTH $IMAGESCALEHEIGHT" 60 > "$OUT/bootanimation/desc.txt"
+```
+
+这台设备的 mk 里 **`TARGET_SCREEN_WIDTH` / `TARGET_SCREEN_HEIGHT` / `TARGET_BOOTANIMATION`
+一个都没有**。于是：
+
+1. `[ "$HEIGHT" -lt "$WIDTH" ]` 两边都是空串 → `[: : integer expression expected`；
+2. `IMAGESCALEWIDTH` 空 → desc.txt 第一行是 `"  60"`（两个空格加 60），不是三个数字；
+3. bootanimation 的 `sscanf("%d %d %d")` 得到 1 个字段，`Animation::fps` 留 0，
+   `movie()` 拿它做除数 → `eglInitialize` 之后约 90 ms `SIGFPE`。
+
+**这就是 DEVICE_NOTES 23 里那个崩溃。** 当时把它记成"vendor 附带了一个占位动画"，
+这个说法是错的：没有谁附带它，**每次构建都在 92% 的位置自己生成它**。
+
+### 47.3 为什么 verify 一直红而设备一直能用
+
+因为交付的 system.img 里那份 `bootanimation.zip` 是我们手工塞进去的（23,894 B，
+540x960 的正确版本），不是 CI 产物的那份。CI 的包一直带着坏的动画，只是从没有人
+去刷它——它连 artifact 都没上传过，因为 verify 先红了。
+
+所以这一步**抓的是真 bug**，红了五次是对的。要修的是构建，不是判据。
+
+### 47.4 步骤 10 那三行 cp 是死的
+
+原来的 "Install the boot animation"：
+
+```sh
+src=device/kyocera/msm8926-common/prebuilt/media/bootanimation.zip
+dst=vendor/lineage/prebuilt/bootanimation/bootanimation.zip
+cp "$src" "$dst"
+unzip -p "$dst" desc.txt | ... grep -Eq '^[0-9]+ [0-9]+ [0-9]+$'
+```
+
+**没有任何规则读 `$dst`。** `bootanimation.zip` 这个模块没有 `LOCAL_SRC_FILES`，
+它要么 `cp $(TARGET_BOOTANIMATION)`，要么跑生成器。所以这三行 cp 只是把一个
+正确的文件放到一个没人看的地方，然后**检查那个副本**——检查通过，产出的却是生成
+器写的那个。这是最坏的一种测试：它测的不是要出货的东西。
+
+### 47.5 改了三处
+
+| 文件 | 改动 |
+|---|---|
+| `BoardConfigCommon.mk` | `TARGET_SCREEN_HEIGHT := 960` / `TARGET_SCREEN_WIDTH := 540`。不是为了好看：生成器把这两个直接喂给整数比较，空了就产出 `"  60"` |
+| `lineage-common.mk` | `TARGET_BOOTANIMATION := $(LINEAGE_COMMON_PATH)/prebuilt/media/bootanimation.zip`。非空即跳过生成器，`cp` 原样安装 stock 4.4 那份 |
+| `.github/workflows/lineage.yml` | 步骤 10 改名 `Check the boot animation`，删掉死的 cp，改为断言变量已定义、文件存在、desc.txt 首行三数字；verify 里先 `test -f` 再 `head -n 3 \| cat -A` 把内容打出来，最后才判 |
+
+verify 的判据一个字没改——它本来就是对的。改的只是失败时能不能看懂：
+`unzip -p` 对缺失成员静默，一个裸 `exit 1` 要花 90 分钟重新构建才知道为什么。
+
+### 47.6 这一轮的教训
+
+一个"检查通过"的绿灯，只有在它检查的是**出货的那份文件**时才有意义。
+步骤 10 检查的是副本，verify 检查的是产物——两者矛盾了五次，而每次都是产物那边对。
+

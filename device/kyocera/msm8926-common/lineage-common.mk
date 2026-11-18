@@ -22,6 +22,30 @@
 # would silently expand to the empty string.
 LINEAGE_COMMON_PATH := device/kyocera/msm8926-common
 
+# ------------------------------------------------------------- boot animation
+#
+# Point the build at the stock 4.4 animation instead of letting vendor/cm
+# generate one.  bootanimation/Android.mk reads
+#
+#     ifeq ($(TARGET_BOOTANIMATION),)
+#       TARGET_BOOTANIMATION := $(TARGET_GENERATED_BOOTANIMATION)
+#     endif
+#
+# so anything non-empty here skips generate-bootanimation.sh, ImageMagick and
+# bootanimation.tar entirely, and `cp $(TARGET_BOOTANIMATION) $@` installs the
+# file verbatim into system/media.  What this tree wants is the animation the
+# phone shipped with: 540x960, a single JPEG, fps 1, `p 0 0` loop, copied out
+# of the stock system image.
+#
+# The generated path was actively harmful.  Until TARGET_SCREEN_WIDTH/HEIGHT
+# were set (BoardConfigCommon.mk), the generator produced a desc.txt whose
+# first line was ` 60`, bootanimation's sscanf saw one field instead of three,
+# fps stayed 0, and movie() divided by it about 90 ms after eglInitialize.
+# The workflow's "Verify the package" step has been failing on exactly that
+# file since fix76 -- it was the only thing standing between a build and a
+# phone stuck on the bootloader splash.
+TARGET_BOOTANIMATION := $(LINEAGE_COMMON_PATH)/prebuilt/media/bootanimation.zip
+
 # AOSP telephony base first, so vendor/cm/config/common_full_phone.mk
 # (inherited by the per-device product makefile) can override it.
 $(call inherit-product, $(SRC_TARGET_DIR)/product/aosp_base_telephony.mk)
