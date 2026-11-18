@@ -302,9 +302,13 @@ usbviaen() {
 #                     through wakeUpFromPowerKey() -> wakeUp(3 args) -> plain
 #                     wakeUp().  So on this ROM the setting cannot veto a power
 #                     key press at all; nothing is wrong with the sensor.
-#                     This report therefore stops asking for "Not waking up" and
-#                     records the raw evdev trace instead: KEY_POWER edges and
-#                     ABS_DISTANCE values, on the same clock.
+#                     fix83 put kcprox in front of the framework to do the veto
+#                     the framework never did, and fix83's dump shows it working:
+#                     armed on screen-off, covered at 0..2, presses swallowed,
+#                     release + press waking normally, the fourth press forced
+#                     through.  The per-sample "prox: newest=" line and the
+#                     kcprox block below are what proves it, so the raw evdev
+#                     trace this section used to ask for is gone.
 #
 # The display state is sampled every 15 s for five minutes, because the state
 # that matters only exists while the sensor is being covered, and the report says
@@ -315,12 +319,10 @@ A=$(adspdev)
 # driver was told to sample and stayed silent".
 LI=$(for d in /sys/class/input/input*; do [ "$(cat $d/name 2>/dev/null)" = light ] && echo "$d"; done | head -n1)
 PX=$(for d in /sys/class/input/input*; do [ "$(cat $d/name 2>/dev/null)" = proximity ] && echo "$d"; done | head -n1)
-# Event nodes by name.  getevent is used as a *second* reader: every open fd on
-# an evdev node gets its own copy of the event stream, so tracing does not take
-# anything away from the framework.  The power key is not on gpio-keys on this
-# device -- EventHub logs 'qpnp_pon' as a separate device (event1) and
-# 'gpio-keys' (event11) carries the volume keys -- so all three are traced and
-# the report says which one a press came from.
+# Event nodes by name, for the one-line "nodes:" summary and for -i below.
+# The power key is not on gpio-keys on this device -- EventHub logs 'qpnp_pon'
+# as a separate device (event1) and 'gpio-keys' (event11) carries the volume
+# keys -- which is why kcprox grabs qpnp_pon and why the report names both.
 evnode() {
     for d in /sys/class/input/input*; do
         [ "$(cat $d/name 2>/dev/null)" = "$1" ] || continue
@@ -502,29 +504,20 @@ done <"$R1"
 # cover the first five minutes; the file can be pulled once "timeline done"
 # appears.
 #
-# Alongside the samples, the raw evdev stream of the power key and of the
-# proximity sensor is recorded for the same five minutes (timeout-bounded so it
-# can never outlive the script).  That trace answers the two questions the
-# dumpsys samples cannot:
-#   * the prox value when the phone is covered -- 4 is "clear", 0..2 is covered;
-#   * whether a power key press even reaches the framework while covered.
-EVLOG=/data/local/tmp/kc_input.log
-: >"$EVLOG" 2>/dev/null
-EVPID=
-if [ -n "$EVP" ]; then
-    # set -- drops the empty ones: getevent treats a bare "" as a device name
-    # and refuses to start, which would leave the whole trace empty.
-    set -- $EVK $EVP $EVG
-    timeout 400 getevent -lt "$@" >"$EVLOG" 2>&1 &
-    EVPID=$!
-fi
+# This used to also record the raw evdev stream of the power key and the
+# proximity sensor for the same five minutes, as a second reader on the same
+# nodes.  It never produced a single event: toybox's getevent prints its usage
+# and exits when given an explicit device path together with -lt, and the only
+# thing that ended up in /data/local/tmp/kc_input.log was that usage text.  The
+# question it was meant to answer -- what distance is reported while covered --
+# is answered by the per-sample "prox: newest=" line below, straight from the
+# driver's own ring buffer.  Removed in fix84.
 {
     sec "sensor timeline"
     echo "  每 15 秒采样一次，共 20 次（到开机后约 5 分钟）。"
     echo "  现在去 设置 -> 显示 打开「自适应亮度」，然后用手完全遮住屏幕上方"
     echo "  听筒左边的光感，保持 20 秒以上再松开。"
     echo "  距离传感器：盖住听筒（压住光感）后连按三次电源键，每次间隔 2 秒。"
-    echo "  同时在录 evdev：prox=$EVP key=$EVK gpio=$EVG -> $EVLOG"
 } >>"$R1" 2>/dev/null
 i=1
 while [ $i -le 20 ]; do
@@ -532,17 +525,6 @@ while [ $i -le 20 ]; do
     dispblock "$((i*15))" >>"$R1" 2>/dev/null
     i=$((i+1))
 done
-[ -n "$EVPID" ] && kill "$EVPID" 2>/dev/null
-{
-    sec "input trace"
-    echo "  prox=$EVP key=$EVK gpio=$EVG  lines=$(wc -l <"$EVLOG" 2>/dev/null)"
-    echo "  KEY_POWER: $(grep -c 'KEY_POWER.*DOWN' "$EVLOG" 2>/dev/null) down / $(grep -c 'KEY_POWER.*UP' "$EVLOG" 2>/dev/null) up"
-    echo "  ABS_DISTANCE: $(grep -c 'ABS_DISTANCE' "$EVLOG" 2>/dev/null) events"
-    echo "  -- ABS_DISTANCE (00000004 = clear, 00000000 = covered) --"
-    grep 'ABS_DISTANCE' "$EVLOG" 2>/dev/null | tail -n 40
-    echo "  -- KEY_POWER edges --"
-    grep 'KEY_POWER' "$EVLOG" 2>/dev/null | tail -n 30
-} >>"$R1" 2>/dev/null
 {
     sec "timeline done"
     echo "  采样结束。文件可以取了。"

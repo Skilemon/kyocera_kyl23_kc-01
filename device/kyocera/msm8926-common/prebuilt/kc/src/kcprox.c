@@ -257,6 +257,26 @@ static int screen_is_on(void)
 /* key injection                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Discard whatever the power key node queued while the screen was on.
+ *
+ * evdev keeps one queue per open fd, and this process holds the key node open
+ * from start to exit while only reading it inside the grab window.  So the
+ * press that put the screen to sleep -- and every other key pressed during that
+ * screen-on period -- is still sitting in the buffer when the grab lands.  The
+ * first poll after arming would read it as a fresh press: with the sensor
+ * clear, that reinjects KEY_POWER and the panel comes straight back on.
+ *
+ * fix83's log has exactly that, twice: "screen off -> armed" and
+ * "power: ... -> wake" in the same millisecond, once swallowing the press and
+ * once undoing the sleep.  Drain after grabbing, before anyone can look.
+ */
+static void drain_events(int fd)
+{
+    struct input_event ev[64];
+    while (read(fd, ev, sizeof ev) > 0)
+        ;
+}
+
 static int ufd = -1;
 
 static int uinput_setup(void)
@@ -432,10 +452,12 @@ int main(int argc, char **argv)
                     logline("cannot enable %s: %s", proxfile, strerror(errno));
             }
             if (!grabbed) {
-                if (ioctl(kfd, EVIOCGRAB, 1) == 0)
+                if (ioctl(kfd, EVIOCGRAB, 1) == 0) {
                     grabbed = 1;
-                else
+                    drain_events(kfd);
+                } else {
                     logline("EVIOCGRAB failed: %s", strerror(errno));
+                }
             }
             swallowed = 0;
             if (!armed) {
@@ -472,10 +494,21 @@ int main(int argc, char **argv)
                     continue;
                 if (ev[i].value < 0)     /* the driver's -1 dummy value */
                     continue;
-                near = (ev[i].value <= KCPROX_NEAR_MAX);
-                have_prox = 1;
-                prox_ts = now;
-                logline("prox=%d -> %s", ev[i].value, near ? "covered" : "clear");
+                /* One line per transition, not per sample.  The HAL enables the
+                 * sensor at its own poll rate and the driver reports levels
+                 * 0..4, so a hand held near the earpiece flips covered/clear
+                 * several times a second; logging each of those turned a
+                 * 90-second test into 40 lines of noise with the four that
+                 * mattered buried in it. */
+                {
+                    int was = have_prox ? near : -1;
+                    near = (ev[i].value <= KCPROX_NEAR_MAX);
+                    have_prox = 1;
+                    prox_ts = now;
+                    if (near != was)
+                        logline("prox: %s (%d)",
+                                near ? "covered" : "clear", ev[i].value);
+                }
             }
         }
 

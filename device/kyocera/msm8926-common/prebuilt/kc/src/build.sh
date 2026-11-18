@@ -85,11 +85,17 @@ ${HOSTCC:-gcc} -DIGNORE_SILENCE_SIZE -Itinyalsa/include -o /tmp/kc_cfgchk /tmp/k
 #
 # kcbtnled (fix24) was the first static ARM binary on this device, so the shape
 # is known to run: bionic's linker is not involved at all.
-OUT=${OUT:-../bin}
+#
+# BINDIR, not OUT: OUT was already defaulted to ../lib for the two HAL libraries
+# above, so `OUT=${OUT:-../bin}` here expanded to ../lib and silently built
+# kcprox into the wrong directory.  A prebuilt is what ships, so nothing failed
+# loudly -- the binary simply appeared in ../lib and `ls ../bin/kcprox` kept
+# showing the previous build.
+BINDIR=${BINDIR:-../bin}
 $CC -static -O2 -D_TIME_BITS=32 -D_FILE_OFFSET_BITS=32 \
     -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-    -o "$OUT/kcprox" kcprox.c
-arm-linux-gnueabi-strip "$OUT/kcprox" 2>/dev/null || true
+    -o "$BINDIR/kcprox" kcprox.c
+arm-linux-gnueabi-strip "$BINDIR/kcprox" 2>/dev/null || true
 echo "--- built ---"
-ls -l "$OUT/kcprox"
-file "$OUT/kcprox"
+ls -l "$BINDIR/kcprox"
+file "$BINDIR/kcprox"

@@ -6130,3 +6130,118 @@ verify 的判据一个字没改——它本来就是对的。改的只是失败�
 一个"检查通过"的绿灯，只有在它检查的是**出货的那份文件**时才有意义。
 步骤 10 检查的是副本，verify 检查的是产物——两者矛盾了五次，而每次都是产物那边对。
 
+## 48. fix83 验收：距离感应成立，顺手关掉这一轮的仪表
+
+### 48.1 kcprox.log 逐项对照
+
+fix83 刷入后的日志一共 67 行，每个设计点都在里面：
+
+```
+[53.517] start dry=0 key=/dev/input/event1 prox=/dev/input/event7
+         proxctl=.../enable_ps_sensor uinput=1
+[68.581] screen off -> armed (near=0, grabbed=1)
+[70.754] prox=2 -> covered
+[72.315] power: covered (age=1510ms) -> swallowed 1/3
+[73.279] power: covered (age=2475ms) -> swallowed 2/3
+[74.396] prox=4 -> clear
+[74.578] power: clear -> wake (age=182ms, swallowed so far 2)
+[75.100] screen on  -> released (swallowed=0)
+```
+
+| 设计点 | 证据 |
+|---|---|
+| 抓对了节点 | `key=/dev/input/event1` 是 qpnp_pon，不是 gpio-keys |
+| uinput 可用 | `uinput=1`，EventHub 建出 `kcprox-vkeys`（event14） |
+| 熄屏才 arm | 亮屏期间一行 `prox=` 都没有 |
+| 遮挡判据 | 驱动 `ps_lv` 0/1/2 都进 covered，3/4 退出 |
+| 吞键 | `swallowed 1/3`、`2/3`，屏幕保持黑 |
+| 松手放行 | `prox=4 -> clear` 后按，`power: clear -> wake`，1 秒内亮屏 |
+| 安全网 | `power: covered but limit reached -> wake`，第 4 次强制放行 |
+| 计数器复位 | 每次 `screen on -> released` 后 `swallowed=0` |
+
+用户实测"熄屏遮挡按电源键无法唤醒"，与日志一致。**这一项结案。**
+
+### 48.2 但日志里有两个毛病
+
+**一、每次读数都记一行。** 传感器按 HAL 的 poll 周期上报，手靠近听筒边缘时 0→2→3→4 来回跳：
+
+```
+[126.363] prox=2 -> covered
+[126.466] prox=0 -> covered
+[126.670] prox=1 -> covered
+[126.676] prox=2 -> covered
+[126.779] prox=3 -> clear
+[126.983] prox=2 -> covered
+[126.985] prox=4 -> clear
+```
+
+六行，信息量是"遮挡了一下"。67 行里这样的占一半，真正要看的那四行（swallow/wake）被埋掉。改成**只在 covered↔clear 翻转时写一行**，措辞也从 `prox=2 -> covered` 变成 `prox: covered (2)`。
+
+**二、熄屏那一下的按键被当成了唤醒请求。**
+
+```
+[125.968] screen off -> armed (near=0, grabbed=1)
+[125.968] power: clear -> wake (age=5011ms, swallowed so far 0)
+[127.370] screen on  -> released (swallowed=0)
+```
+
+同一毫秒。原因在 evdev 的队列模型：**每个 fd 一条独立队列**，而 kcprox 从启动起就把电源键节点开着，只在 grab 窗口里读。于是亮屏期间按过的每一个键——包括刚把屏幕按灭的那一下——都还躺在缓冲区里。grab 之后第一次 poll 读到的就是它，距离值是旧的（age=5011ms），判 clear，注入，屏幕又亮了。
+
+这个 bug 的表现是"偶尔按电源键熄屏，1 秒后自己亮回来"。129.183 那一次同样成立，只是那会儿盖着传感器，被吞掉了，所以没有可见后果。
+
+修法：grab 成功后先把队列读空再进循环（fd 本来就是 O_NONBLOCK，`read` 到 EAGAIN 为止）。
+
+### 48.3 这一轮的仪表可以拆了
+
+**`kcadsp.sh` 里的 evdev 旁路录制从来没工作过。** fix83 的 dump 里 `/data/local/tmp/kc_input.log` 是 13 行 getevent 的 usage：
+
+```
+Usage: getevent [-t] [-n] [-s switchmask] ...
+```
+
+toybox 的 getevent 在 `-lt` 加显式设备路径时会打 usage 退出。上一轮写这段时以为"空变量会被当设备名"，用 `set --` 包了一层，但真正的问题不是空变量。整段连同 400 秒的后台进程一起删掉——它要回答的问题（遮挡时距离是多少）已经由每条采样的 `prox: newest=` 直接给出，数据来自驱动自己的 ring buffer，比旁路录制更可靠。
+
+`sensors` 段保留 `Sensor List` / `-- holders --` / `-- prox ring --` / `caps:` / `nodes:` / `-- kcprox --`：这些都是只跑一次的快照，几行输出，以后回归时是第一手证据。
+
+### 48.4 build.sh 里一个静默的路径 bug
+
+`OUT=${OUT:-../lib}` 在第 49 行给两个 HAL 库用，第 88 行又写了一次 `OUT=${OUT:-../bin}` 给 kcprox。`${X:-default}` 在 X 已赋值时取 X，所以 kcprox 一直被构建到 **`../lib`**，而 `KC_BINS` 装的是 `../bin`。
+
+出货的是 prebuilt，所以没有任何东西失败——`../bin/kcprox` 只是继续保留上一次构建的结果，`ls` 看着一切正常。本地改完代码重新构建、打包，拿到的是旧二进制。改成独立的 `BINDIR`。
+
+### 48.5 CI 产物核对
+
+两个 product 都 success，产物下载后逐层验过（kc01 走 GitHub artifact API 拿 SAS，分段并行过 gh-proxy）：
+
+| 检查 | kc01 | kyl23 |
+|---|---|---|
+| artifact 大小 | 384,187,657 | 384,190,094 |
+| SHA256 | 与日志 digest 一致 `92847bb2…` | — |
+| OTA 结构 | boot.img / system.new.dat / system.transfer.list / file_contexts.bin | 同 |
+| `system.new.dat` 块数 | 184,286（= transfer.list 的 new 合计） | 184,286 |
+| `system.transfer.list` | v4，`cmd n,start,end,...` 成对 range，合计 359,418 块 = 分区大小 | 同 |
+| `/vendor/bin/kcprox` | 0755，472,152 B，`a6338f8d…`（与 repo 一致） | 同 |
+| `/vendor/bin/kcadsp.sh` | 0755，`1c5e7373…` | — |
+| `/etc/init/kyl23-extra.rc` | 0644，`6d08d70d…` | 同 |
+| `/media/bootanimation.zip` desc.txt | `540 960 1` | 同 |
+| boot.img 内核 | 5,734,616 B，page 2048 | 同 |
+| build.prop | `ro.product.model=KC-01`，7.1.2，lcd 240 | `miraie KYL23` |
+
+`e2fsck -fn` 只有一条 `Padding at end of inode bitmap is not set`，这是 block-based OTA 还原的固有差异（未分配的位图尾部在安装时由 update_engine 补），不影响启动。
+
+### 48.6 SELinux：现在还只是"permissive 下能跑"
+
+logcat 里 kcprox 每做一件事都留一条 denied：
+
+```
+scontext=u:r:init:s0 tcontext=u:object_r:unlabeled:s0  { execute }
+scontext=u:r:init:s0 tcontext=u:object_r:uhid_device:s0 { write ioctl }
+scontext=u:r:init:s0 tcontext=u:object_r:input_device:s0 { ioctl }     <- EVIOCGRAB
+scontext=u:r:init:s0 tcontext=u:object_r:shell_data_file:s0 { create append }
+```
+
+`permissive=1` 所以全部放行。它跑在 `init` 域（rc 里没写 seclabel），文件是 `unlabeled`（system.img 注入时没有 restorecon）。**一旦转 enforcing，`EVIOCGRAB` 会失败，kcprox 会退化成"抓不住键"**——而它抓不住时不会有害（不吞、不注入），只是距离感应又没了。
+
+这是 §44 之后一直挂着的"剩余 15 个域"的一部分，修它要动 boot 里的 file_contexts，和重打 boot 一起做。
+
+
