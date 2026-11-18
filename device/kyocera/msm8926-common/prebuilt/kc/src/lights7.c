@@ -23,6 +23,20 @@
  *   notifications  -> amber
  *   attention      -> amber
  *   keyboard, bluetooth, wifi -> nothing on this board
+ *   flashlight     -> torch-light              (0..255)
+ *
+ * flashlight was missing until fix84 and that is a real user-visible bug, not
+ * a completeness exercise: nothing in the ROM could turn the LED on.  The node
+ * itself is fine -- drivers/media/platform/msm/camera_v2/sensor/flash/
+ * msm_led_torch.c registers "torch-light" and its brightness_set() is a plain
+ * led_trigger_event(), so any 0..255 value lights it.  The factory 4.4 HAL
+ * (kc_lights.default.so) knows the same path; only this rewrite forgot it.
+ *
+ * The quick-settings tile is a separate path: 7.1's FlashlightController goes
+ * through CameraManager.setTorchMode(), i.e. the camera HAL, and this device's
+ * camera HAL is 4.4 (no set_torch_mode field at all), so that route is dead on
+ * this port regardless.  This handler is what makes every LightsManager client
+ * -- Tasker, the torch widgets, `service call lights` -- work again.
  */
 
 #include <stdint.h>
@@ -214,6 +228,20 @@ static int light_none(struct light_device_t *dev, const struct light_state_t *st
     return 0;
 }
 
+/* torch-light takes 0..255 through led_trigger_event(), so the colour's max
+ * component is the right value -- the framework sends 0xFFFFFFFF for "on" and
+ * 0 for "off", i.e. 255 and 0 after this. */
+static int light_flashlight(struct light_device_t *dev, const struct light_state_t *state)
+{
+    int v;
+
+    (void)dev;
+    if (!state)
+        return -1;
+    v = state_is_on(state) ? max_component(state->color) : 0;
+    return write_int("/sys/class/leds/torch-light/brightness", v);
+}
+
 /* ------------------------------------------------------------------ */
 /* module                                                              */
 /* ------------------------------------------------------------------ */
@@ -244,6 +272,8 @@ static int open_light(const struct hw_module_t *module, const char *id, struct h
         fn = light_battery;
     else if (str_eq(id, "notifications") || str_eq(id, "attention"))
         fn = light_amber;
+    else if (str_eq(id, "flashlight"))
+        fn = light_flashlight;
     else if (str_eq(id, "bluetooth") || str_eq(id, "wifi"))
         fn = light_none;
     else

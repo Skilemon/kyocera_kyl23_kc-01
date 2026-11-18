@@ -6257,3 +6257,169 @@ scontext=u:r:init:s0 tcontext=u:object_r:shell_data_file:s0 { create append }
 这是 §44 之后一直挂着的"剩余 15 个域"的一部分，修它要动 boot 里的 file_contexts，和重打 boot 一起做。
 
 
+## 49. fix84：仪表收摊，顺手把闪光灯和 GPS 的两条断链找出来
+
+这一轮不是修一个 bug，是回答三个问题：哪些诊断已经可以撤、闪光灯为什么不亮、GPS 为什么
+看得见卫星却拿不到位置。前两个在代码里查到了底，第三个只剩下一个必须上机才能分辨的分叉。
+
+### 49.1 诊断的账：哪些是哨兵，哪些是化石
+
+判断标准只有一条——**它记录的问题还会不会回来**。会回来的留一行哨兵，不会回来的删掉。
+按这个标准过一遍：
+
+| 位置 | 记什么 | 结论 |
+|---|---|---|
+| `kcadsp.sh` summary | ADSP/USB/serial/声卡/日志存储/adsprpcd 各一行 | 留。每行一次系统调用 |
+| `kcadsp.sh` subsys+boot | adsp/modem/wcnss 状态、`boot_adsp` 请求次数 | 留。ADSP 抢在 audioserver 前面起来这件事没有别的证据 |
+| `kcadsp.sh` audio | cards / start-exit 计数 / 忙的 PCM / tinyalsa 指纹 | 留 4 行。声音已修，但这 4 行是唯一能一眼看出"又坏了"的地方 |
+| `kcadsp.sh` sensors | Sensor List / holders / 两条 ring / caps / psdrv / kcprox 日志 | 留。一次快照，几行输出 |
+| `kcadsp.sh` display | 每次采样 5 个 dumpsys（power、display、window policy、window、sensorservice），20 次 | **砍到 3 个 dumpsys × 4 次** |
+| `kcadsp.sh` timeline | 5 分钟 20 次采样 | **砍到 1 分钟 4 次** |
+| `kcstate.sh` | 408 行健康报告：按键背光/WiFi/audio/camera/baseband | **停用自启** |
+| `kccam.sh` | 相机时间线 | 留。相机还没修 |
+| `kctail.sh` / `kclogcat` | 高信号 logcat / 全量落盘 | 留。这是 dump 的原料 |
+| `kcshut.sh` / `kchalt.sh` | 关机记录 / 关机执行 | 留。前者便宜，后者是功能 |
+| `kcdiag` / `kcdiag2` | kcboot 的板级诊断，写 /cache/kc_diag.txt | 留。oneshot，一次几毫秒 |
+
+两处真正动手砍掉的：
+
+**`kcstate.sh` 停自启**。它每 150 秒跑一遍、跑 7 遍、持续 15 分钟，每遍都 `dmesg`、
+`logcat -b radio`、拷 sqlite、抓相机日志。而它覆盖的五件事里三件已经修完（按键背光、
+WiFi、音频），剩下相机有 `kccam.sh` 专线、基带有 summary 里的 RIL 状态。等于每开机一次
+做七遍没人看的功课。脚本留着（`KC_BINS` 里还在），只是不再自己起来。
+
+**`dispblock` 从 5 个 dumpsys 降到 3 个**。`dumpsys window` 和 `dumpsys window policy`
+当初是为了看 `mProximitySensorEnabled` 和 PWM 的 `Not waking up`——距离感应在 fix83 之后
+走的是 kcprox，这两条早就不再有信息量。自动亮度也一样：46 行 ABC block 换成 9 个关键字
+段，足够看出 `mAmbientLux` 在动、`mScreenAutoBrightness` 在跟。采样从 20 次降到 4 次，
+一次开机的 dumpsys 调用从 100 次降到 12 次。
+
+省下来的位置给了两个新段：`gps` 和 `camera`（见下）。
+
+### 49.2 闪光灯：两条点亮路径，两条都断了
+
+`/sys/class/leds/torch-light/brightness` 是存在的，内核里注册它的是
+`drivers/media/platform/msm/camera_v2/sensor/flash/msm_led_torch.c`：
+
+```c
+static struct led_classdev msm_torch_led = { .name = "torch-light", ... };
+static void msm_led_torch_brightness_set(struct led_classdev *led_cdev,
+                                         enum led_brightness value)
+{ led_trigger_event(torch_trigger, value); }
+```
+
+也就是说这个节点是个纯粹的 `led_trigger_event`，写 0..255 就亮，不挑写入者。硬件和驱动
+都没问题。断的是上面两层：
+
+**第一层，自己的 lights HAL。** `lights7.c` 是 fix77 重写的，当时只搬了背光、按键、电池、
+通知这四个，`open_light()` 的 if-else 链里没有 `flashlight` 这一支——框架
+`LightsManager` 来要 `flashlight` 时直接拿到 -1，等于这个 ROM 里根本没有手电筒设备。
+原厂 4.4 的 `kc_lights.default.so` 里那条 `torch-light` 路径是有的，重写时漏了。
+fix84 补上：
+
+```c
+static int light_flashlight(...) {
+    v = state_is_on(state) ? max_component(state->color) : 0;
+    return write_int("/sys/class/leds/torch-light/brightness", v);
+}
+```
+
+**第二层，快捷磁贴走的根本不是 lights。** 7.1 的 `FlashlightController` 用
+`CameraManager.setTorchMode()`，也就是相机 HAL。而这个 ROM 的相机 HAL 从开机起就没加载
+成功过，就在 logcat 第 590 行：
+
+```
+E HAL: load: module=/vendor/lib/hw/camera.msm8226.so
+E HAL: dlopen failed: /system/vendor/lib/libmmcamera_faceproc.so: has text relocations
+E CameraService: Could not load camera HAL module: -22 (Invalid argument)
+```
+
+bionic 从 5.0 起拒绝带 `DF_TEXTREL` 的 .so，`libmmcamera_faceproc.so` 是这套 blob 里
+**唯一**一个带这个标志的库（`readelf -d` 扫过全部 40 多个）。而 `camera.msm8226.so` 对它的
+依赖只是 `DT_NEEDED` 里的一行——把两个库的符号表对了一遍，camera 需要的 275 个未定义符号
+里，faceproc 能提供的交集只有 `malloc`/`memcpy`/`sqrt` 这类 libc/libm 符号，**没有一个
+是 faceproc 独有的**。也就是说这行依赖在链接上是空的，删掉不影响任何符号解析。
+
+fix84 用 `patchelf --remove-needed libmmcamera_faceproc.so` 去掉了它。文件大小一字节没变，
+段表偏移逐项相同，SONAME 不变，只有 `.dynamic` 里少一个 `DT_NEEDED`。
+
+要诚实的地方：**这只能让 HAL 加载成功，不等于相机就好了**。4.4 的 `camera_module_t` 里没有
+`set_torch_mode` 这个字段（它是 6.0 才加的），所以即使 HAL 起来了，7.1 的
+`setTorchMode()` 也很可能返回 `INVALID_OPERATION`。快捷磁贴能不能亮，要刷上去才知道；
+但 `LightsManager` 那条路（第三方手电筒 app、`service call lights`、Tasker）现在是通的。
+
+### 49.3 GPS：卫星看得见，位置出不来——三种可能，先分清是哪一种
+
+fix83 的 logcat 里 GPS 只出现在开机那一秒：
+
+```
+E LocSvc_eng   : W/set_server called before init. save the address, type: 3,
+                 hostname: supl.google.com, port: 7275
+E LocSvc_api_v02: I/locClientOpen:2189]: Service instance id is -1
+E LocSvc_api_v02: I/---> locClientSendReq line 2333 QMI_LOC_REG_EVENTS_REQ_V02
+E LocSvc_api_v02: I/---> locClientSupportMsgCheck line 2433 QMI_LOC_GET_SUPPORTED_MSGS_REQ_V02
+```
+
+`locClientOpen` 报 `Service instance id is -1`，但紧接着 `QMI_LOC_REG_EVENTS_REQ_V02` 和
+`QMI_LOC_GET_SUPPORTED_MSGS_REQ_V02` 都发出去了。前者是第一个探测实例（`IzatApiV02` 问
+batching 支持）失败，后者才是真正的客户端。**能报出卫星，说明这条 QMI LOC 链路是通的**——
+SV 报告正是从这里上来的。
+
+所以"有卫星、无位置"只剩三种解释：
+
+1. **没有星历**。这是冷启动的正常状态：卫星信号能跟踪（CN0 有值），但解调一份星历要
+   30 秒/颗、凑齐一套要 12.5 分钟，室内或窗边基本凑不齐。而这份 `gps.conf` 里
+   `XTRA_SERVER_1/2/3` **全部被注释掉**，`NTP_SERVER=time.gpsonextra.net` 是早已停服的域名，
+   `SUPL_HOST` 也是注释的（framework 侧倒是塞了 `supl.google.com:7275`，但那条路要网络
+   定位 provider，而 `LocationManagerService` 开机就报 `no network location provider found`）。
+   等于**没有任何一条能加速首次定位的通道**。
+2. **QMI LOC 服务实例没 attach**。`-1` 如果出现在真正的客户端上，引擎就只能上报 SV、
+   不能上报位置。
+3. **GPS 周数翻转（WNRO）**。2019-04-06 之后，4.4 时代的 loc 引擎如果没有处理 10-bit 周数
+   回绕，解算出的日期会错 19.6 年，星历有效期判断随之失效。很多 2013-2015 的高通设备
+   在 2019 年之后彻底定不了位，就是这个原因，而且症状恰好是"看得见卫星、没有位置"。
+
+这三条不能靠猜。`kcadsp.sh` 新增的 `gps` 段就是为此：`/dev/gss` 在不在、gps.conf 里
+XTRA/SUPL 各几条、`dumpsys location` 的 provider 状态和最后位置、以及 logcat 里最近
+18 条 `LocSvc`/`locClient`。测法是：打开任意 GPSTest/地图，等它列出卫星后**保持一分钟**，
+再执行一次 `sh /vendor/bin/kcadsp.sh`（pidfile 在退出时删了，可以重跑），把新报告带回来。
+
+如果日志里出现 `LOC_EVENT_POSITION_REPORT` 却没有 `GnssLocationProvider` 的
+`locationReceived`，那是第 3 类里的上报问题；如果连 position report 都没有，就是第 1 或
+第 2 类，看 `locClientOpen` 的实例号就能分开。
+
+### 49.4 重打 boot：路已经探通，但没有这一轮出货
+
+转 enforcing 要在 ramdisk 的 `sepolicy` 里补域，而那份文件是编译好的二进制（310,272 B，
+1154 个 type、13,874 条规则、63 个 class）。这一轮把工具链跑通了：
+
+```
+checkpolicy -b -C -M -o pol.cil sepolicy     # 二进制 -> CIL，1.2 MB
+secilc -m -M true -c 30 -o pol.new pol.cil   # CIL -> 二进制
+```
+
+往返之后规则数**一条不少（13,874）**，只有 3 个 `typeattributeset` 被剪掉
+（`data_file_type`、`qti_debugfs_domain`、`rmt_placeholder`）——这三个属性没有被任何 allow
+规则引用，属于死代码。也就是说 `checkpolicy`/`secilc` 这条链可以作为补域的手段。
+
+但这一轮不出 boot 包，原因是顺序问题：**先补域、再逐个 enforcing**，而不是一次把
+`androidboot.selinux` 改成 enforcing。补域本身要动三样东西（`sepolicy` 加
+`kcprox`/`qmuxd`/`adsprpcd` 等域、`file_contexts.bin` 给 `/vendor/bin/*` 打标签、
+rc 里给每个 service 写 `seclabel`），而 `file_contexts.bin` 是二进制格式，反编译比
+sepolicy 麻烦一档——AOSP 的 `sefcontext_compile` 只负责文本到二进制，没有反向工具。
+这一步单独做一轮，做完仍保持 permissive，确认没有回归之后再谈 enforcing。
+
+### 49.5 fix84 交付
+
+只刷 system，boot 保持 fix72 的 #25 内核。镜像里换了五个文件：
+
+| 路径 | 变化 |
+|---|---|
+| `/vendor/lib/hw/lights.default.so` | 新增 `flashlight` 分支 -> `torch-light` |
+| `/vendor/lib/hw/camera.msm8226.so` | 去掉 `DT_NEEDED libmmcamera_faceproc.so` |
+| `/vendor/bin/kcprox` | 重新构建（源码未变） |
+| `/vendor/bin/kcadsp.sh` | 砍采样、加 `gps`/`camera` 段 |
+| `/etc/init/kyl23-extra.rc` | 停用 `kcstate` 自启 |
+
+看三件事：`grep -c flashlight /vendor/lib/hw/lights.default.so` 至少为 1；
+logcat 里 `Could not load camera HAL module` 消失；`dumpsys location` 的 gps 段有内容。

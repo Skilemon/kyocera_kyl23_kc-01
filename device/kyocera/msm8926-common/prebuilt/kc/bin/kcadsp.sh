@@ -338,40 +338,28 @@ EVG=$(evnode gpio-keys)
 dispblock() {
     echo "-- t+$1 s (up=$(up)) --"
     timeout 10 dumpsys power 2>/dev/null |
-        grep -E 'mWakefulness=|mScreenBrightnessSetting=|mScreenBrightnessModeSetting=|mScreenBrightnessOverrideFromWindowManager=|mTemporaryScreenBrightnessSettingOverride=' |
-        head -n 6
-    # The whole Automatic Brightness Controller block, not a hand-picked subset.
-    # fix81's report asked for a dozen fields and left out exactly the ones that
-    # decide the question -- mRecentLightSamples, mBrighteningLuxThreshold,
-    # mDarkeningLuxThreshold, the two debounce configs -- so a frozen
-    # mAmbientLux could not be attributed to the filter or to the sensor.
+        grep -E 'mWakefulness=|mScreenBrightnessSetting=|mScreenBrightnessModeSetting=' |
+        head -n 3
+    # Only the ABC fields that decide whether the closed loop is running.  This
+    # used to print 46 lines of the block plus four more dumpsys calls (window
+    # policy, window, display extras, sensorservice) per sample -- five calls
+    # every 15 s for five minutes, on a phone with two cores.  Auto-brightness
+    # has been confirmed working since fix82, so what is left is a regression
+    # sentinel: config on, sensor enabled, lux moving.
     _ds=/data/local/tmp/.kcdisp.$$
     timeout 10 dumpsys display >"$_ds" 2>/dev/null
-    grab_from "$_ds" "Automatic Brightness Controller" "mDozing=" 46
-    grep -E 'mProximitySensor=|mProximitySensorEnabled=|mScreenBrightness=|mPowerState=|mBrightnessRampRateFast=' \
-        "$_ds" 2>/dev/null | head -n 5 | cut -c1-190
+    grep -E 'mUseSoftwareAutoBrightnessConfig=|mScreenAutoBrightness=|mAmbientLux=|mAmbientLuxValid=|mLightSensorEnabled=|mBrighteningLuxThreshold=|mDarkeningLuxThreshold=|mRecentLightSamples=' \
+        "$_ds" 2>/dev/null | head -n 9 | cut -c1-150
     rm -f "$_ds"
-    timeout 10 dumpsys window policy 2>/dev/null |
-        grep -iE 'proxim|mAwake=|mScreenOnEarly=' | head -n 8
-    timeout 10 dumpsys window 2>/dev/null |
-        grep -iE 'proxim' | head -n 6
-    # PWM's "Not waking up" is the only direct proof that a power key press was
-    # vetoed by the sensor; it goes to logcat, not to kmsg.
-    echo "proxwake: $(grep -c 'Not waking up' "$LC" 2>/dev/null) x 'Not waking up' in logcat"
-    echo "setting: mode=$(settings get system screen_brightness_mode 2>/dev/null) prox=$(settings get system proximity_on_wake 2>/dev/null) bright=$(settings get system screen_brightness 2>/dev/null)"
+    echo "setting: mode=$(settings get system screen_brightness_mode 2>/dev/null) bright=$(settings get system screen_brightness 2>/dev/null)"
     echo "leds:    lcd=$(cat /sys/class/leds/lcd-backlight/brightness 2>/dev/null) button=$(cat /sys/class/leds/button-backlight/brightness 2>/dev/null)"
-    echo "input:   light=$LI en=$(cat "$LI/enable_als_sensor" 2>/dev/null) poll=$(cat "$LI/als_poll_delay" 2>/dev/null) | prox=$PX en=$(cat "$PX/enable_ps_sensor" 2>/dev/null)"
-    # Owner is the whole point: the HAL writes these as uid 1000, and 0660
-    # root:root is what made every write EACCES before fix81.
-    echo "perm:    $(stat -c '%U:%G %a' "$LI/enable_als_sensor" 2>/dev/null) $(stat -c '%U:%G %a' "$PX/enable_ps_sensor" 2>/dev/null) $(stat -c '%U:%G %a' /dev/psals_sensor 2>/dev/null)"
-    # One sensor dump, three questions.  The ring is printed in full once (in
-    # the sensors section); here only the newest sample of each ring, because a
-    # timeline of "what the framework last knew" is what the samples are for.
-    # "4" is what the driver reports with nothing in front of the phone and
-    # 0..2 is covered -- that mapping is the whole near/far question.
+    echo "input:   light=$LI en=$(cat "$LI/enable_als_sensor" 2>/dev/null) | prox=$PX en=$(cat "$PX/enable_ps_sensor" 2>/dev/null)"
+    # One sensor dump, two numbers: what the framework last knew.  The rings
+    # themselves are printed once, in the sensors section; per sample only the
+    # newest entry, because a timeline is the point here.
     _ss=/data/local/tmp/.kcss.$$
     timeout 8 dumpsys sensorservice >"$_ss" 2>/dev/null
-    echo "kcprox:  svc=$(getprop init.svc.kcprox 2>/dev/null) last=[$(tail -n 1 /data/local/tmp/kcprox.log 2>/dev/null | cut -c1-130)]"
+    echo "kcprox:  svc=$(getprop init.svc.kcprox 2>/dev/null) last=[$(tail -n 1 /data/local/tmp/kcprox.log 2>/dev/null | cut -c1-120)]"
     # Sample lines only: the ring block runs into the next section, so the last
     # line of grab_ring is not necessarily a sample.  fix83's report printed
     # "prox: newest=SFH7776 Light Sensor (handle=..., connections=1)" -- a
@@ -457,6 +445,57 @@ dispblock() {
     dispblock 0
     echo
     echo "load:    $(grep -c 'find symbol HMI' "$LC" 2>/dev/null) x 'couldn't find symbol HMI' (must be 0)"
+
+    # GPS.  The symptom being chased is "satellites are visible but there is no
+    # position", and that shape has exactly three explanations worth telling
+    # apart, in this order:
+    #
+    #   1. the engine never started      -> no /dev/gss, or locClientOpen failed
+    #   2. the engine runs, no ephemeris  -> SV list has CN0 but no fix; needs
+    #      12.5 min of clean sky, or XTRA, and this gps.conf has every
+    #      XTRA_SERVER line commented out
+    #   3. the engine has a fix and the framework drops it -> rare, and the
+    #      only reason to look at dumpsys location
+    #
+    # The logcat lines below are the engine's own words: locClientOpen's
+    # "Service instance id is -1" means the QMI LOC client did not attach to an
+    # instance, and every position fix shows up as a LOC_EVENT_POSITION_REPORT
+    # or a GnssLocationProvider locationReceived.  Nothing here is sampled --
+    # one snapshot per report, and the report can be re-run after a GPS session
+    # by hand (the pidfile is removed at exit).
+    sec gps
+    echo "dev:     $([ -e /dev/gss ] && echo yes || echo NO) $(stat -c '%U:%G %a' /dev/gss 2>/dev/null)"
+    echo "conf:    $(ls -l /system/etc/gps.conf /vendor/etc/gps.conf 2>/dev/null | wc -l) file(s), xtra_servers=$(grep -c '^XTRA_SERVER' /system/etc/gps.conf 2>/dev/null) supl=[$(grep '^SUPL_HOST' /system/etc/gps.conf 2>/dev/null)]"
+    echo "state:   $(ls /data/misc/gpsone_d/ 2>/dev/null | tr '\n' ' ')"
+    echo "mode:    $(settings get secure location_mode 2>/dev/null) providers=[$(settings get secure location_providers_allowed 2>/dev/null)]"
+    _dl=/data/local/tmp/.kcloc.$$
+    timeout 12 dumpsys location >"$_dl" 2>/dev/null
+    grab_from "$_dl" "Location Manager State" "Passive" 24
+    echo "  -- fixes --"
+    grep -E "last location=|Last Known|gps:|gnss:" "$_dl" 2>/dev/null | head -n 6 | cut -c1-170
+    rm -f "$_dl"
+    echo "  -- engine log (last 18) --"
+    grep -a -E "LocSvc|GnssLocationProvider|locClient" "$LC" 2>/dev/null | tail -n 18 | cut -c1-170
+
+    # Camera and the torch.  7.1's CameraService refuses to load this device's
+    # HAL, and the reason is one line in logcat that is very easy to miss:
+    #
+    #   E HAL: load: module=/vendor/lib/hw/camera.msm8226.so
+    #   E HAL: dlopen failed: /system/vendor/lib/libmmcamera_faceproc.so:
+    #          has text relocations
+    #
+    # bionic has rejected DF_TEXTREL libraries since 5.0, and every camera
+    # function -- preview, shutter, flash, and setTorchMode for the flashlight
+    # tile -- sits behind that dlopen.  Only one library in the whole blob set
+    # has the flag (libmmcamera_faceproc.so), and camera.msm8226.so imports no
+    # symbol that is unique to it, so fix84 builds the HAL without that DT_NEEDED
+    # entry.  These four lines say whether it took.
+    sec camera
+    echo "hal:     $(ls -l /vendor/lib/hw/camera.msm8226.so 2>/dev/null | sed 's/^.* \([0-9]*\) /\1 /') md5=$(md5sum /vendor/lib/hw/camera.msm8226.so 2>/dev/null | cut -c1-32)"
+    echo "torch:   $(cat /sys/class/leds/torch-light/brightness 2>/dev/null) (node $([ -e /sys/class/leds/torch-light ] && echo present || echo MISSING))"
+    echo "lights:  $(grep -ac flashlight /vendor/lib/hw/lights.default.so 2>/dev/null) x 'flashlight' in the HAL (must be >= 1)"
+    echo "  -- camera log (last 8) --"
+    grep -a -E "Could not load camera HAL|has text relocations|camera.msm8226|CameraService" "$LC" 2>/dev/null | tail -n 8 | cut -c1-170
 } >"$T" 2>&1
 
 writereport() {
@@ -501,12 +540,17 @@ while IFS= read -r l; do
 done <"$R1"
 
 # ---- 6. the sensor timeline ----------------------------------------------
-# The report above is written within a minute of boot_completed.  The test --
-# open Settings, turn adaptive brightness on, cover the sensor -- happens after
-# that, and fix80's dump was pulled only 70 s into it, so the file ended up with
-# two samples and the interesting minute was missing.  Twenty samples 15 s apart
-# cover the first five minutes; the file can be pulled once "timeline done"
-# appears.
+# The report above is written within a minute of boot_completed.  It used to
+# sample every 15 s for twenty samples (five minutes) because the interesting
+# state only existed while somebody was covering a sensor, and fix80's dump was
+# pulled 70 s into the test.  Both sensor questions are settled now:
+# auto-brightness works (fix82) and the proximity veto works (fix83), so what
+# is left is four samples over one minute -- enough to see a regression, not
+# enough to cost five dumpsys calls every 15 s for five minutes.
+#
+# The report can be re-run by hand at any time: the pidfile is removed on exit,
+# which is what makes "open a GPS app, wait a minute, run kcadsp.sh again"
+# work for the gps section above.
 #
 # This used to also record the raw evdev stream of the power key and the
 # proximity sensor for the same five minutes, as a second reader on the same
@@ -518,13 +562,15 @@ done <"$R1"
 # driver's own ring buffer.  Removed in fix84.
 {
     sec "sensor timeline"
-    echo "  每 15 秒采样一次，共 20 次（到开机后约 5 分钟）。"
-    echo "  现在去 设置 -> 显示 打开「自适应亮度」，然后用手完全遮住屏幕上方"
-    echo "  听筒左边的光感，保持 20 秒以上再松开。"
-    echo "  距离传感器：盖住听筒（压住光感）后连按三次电源键，每次间隔 2 秒。"
+    echo "  每 15 秒采样一次，共 4 次（到开机后约 1 分钟）。"
+    echo "  亮度与距离都已在上几轮确认过，这里只留一段回归哨兵："
+    echo "  打开「自适应亮度」并遮一下光感，应能看到 mAmbientLux 变化、"
+    echo "  mScreenAutoBrightness 跟随；盖住听筒时 prox: newest 应落到 0..2。"
+    echo "  GPS 请另外测：进任意地图/GPSTest 等到搜到卫星后保持 1 分钟，"
+    echo "  再执行一次 sh /vendor/bin/kcadsp.sh，报告里的 gps 段会记下引擎状态。"
 } >>"$R1" 2>/dev/null
 i=1
-while [ $i -le 20 ]; do
+while [ $i -le 4 ]; do
     sleep 15
     dispblock "$((i*15))" >>"$R1" 2>/dev/null
     i=$((i+1))

@@ -888,12 +888,27 @@ service kchalt /vendor/bin/kchalt.sh
 on property:sys.shutdown.requested=*
     start kchalt
 
-service kcstate /vendor/bin/kcstate-boot.sh
-    seclabel u:r:init:s0
-    class late_start
-    user root
-    group root system
-    oneshot
+# kcstate is gone as of fix84.  It was the fix13..fix34 health report: a
+# 400-line snapshot of key backlight, WiFi, audio, camera and baseband, taken
+# seven times over the first fifteen minutes (kcstate-boot.sh: +45 s, then
+# every 150 s).  Three of those five subjects have since been fixed and are not
+# coming back as questions -- the key backlight is a settings bug that no longer
+# exists, WiFi associates and stays associated, audio plays -- and the two that
+# remain (camera, baseband) have their own dedicated channels: kccam.sh mirrors
+# the camera timeline into kmsg, and kcadsp.sh's summary carries the modem/RIL
+# state.  What was left was seven dmesg dumps, seven radio logs and seven
+# sqlite copies per boot, for a report nobody read.
+#
+# The scripts are still installed (KC_BINS) so the report can be run by hand if
+# a question about those subsystems ever comes back; only the automatic start
+# is gone.
+#
+# service kcstate /vendor/bin/kcstate-boot.sh
+#     seclabel u:r:init:s0
+#     class late_start
+#     user root
+#     group root system
+#     oneshot
 
 # ---------------------------------------------------------------------------
 # Board diagnostics.  kcboot is a static binary because the shell probe that

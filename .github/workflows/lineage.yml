@@ -228,6 +228,37 @@ jobs:
             patch -p1 --forward --batch < "$p"
           done
 
+      - name: Strip the one TEXTREL dependency from the camera HAL
+        run: |
+          set -ex
+          cd "$ROM"
+          # bionic has refused libraries carrying DF_TEXTREL since 5.0, and the
+          # refusal happens inside dlopen() of *any* library that needs them:
+          #
+          #   E HAL: load: module=/vendor/lib/hw/camera.msm8226.so
+          #   E HAL: dlopen failed: /system/vendor/lib/libmmcamera_faceproc.so:
+          #          has text relocations
+          #   E CameraService: Could not load camera HAL module: -22
+          #
+          # libmmcamera_faceproc.so is the only object in this blob set with the
+          # flag (readelf -d over all of them), and camera.msm8226.so imports no
+          # symbol that is unique to it -- the intersection of its 275 undefined
+          # symbols with faceproc's exports is malloc/memcpy/sqrt and friends,
+          # i.e. libc.  So the DT_NEEDED entry is dropped; nothing that matters
+          # to the linker changes, and every camera function (preview, shutter,
+          # flash) stops dying at load time.
+          #
+          # The blobs are a release asset, so this has to happen here rather
+          # than in the device tree.  Idempotent: a blob that is already fixed
+          # is left alone.
+          HAL=vendor/kyocera/msm8926-common/proprietary/vendor/lib/hw/camera.msm8226.so
+          if readelf -d "$HAL" | grep -q libmmcamera_faceproc; then
+            command -v patchelf >/dev/null || sudo apt-get install -y -qq patchelf
+            patchelf --remove-needed libmmcamera_faceproc.so "$HAL"
+          fi
+          ! readelf -d "$HAL" | grep -q libmmcamera_faceproc
+          readelf -d "$HAL" | grep -c NEEDED
+
       - name: Check the boot animation
         run: |
           set -ex
