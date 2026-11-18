@@ -6203,6 +6203,18 @@ toybox 的 getevent 在 `-lt` 加显式设备路径时会打 usage 退出。上�
 
 `sensors` 段保留 `Sensor List` / `-- holders --` / `-- prox ring --` / `caps:` / `nodes:` / `-- kcprox --`：这些都是只跑一次的快照，几行输出，以后回归时是第一手证据。
 
+但 fix83 的 `kcaudio.txt` 说明这段里还有三个自己坏掉的地方，一起修：
+
+| 现象 | 原因 | 现在 |
+|---|---|---|
+| `-- holders --` 空白 | 抓的是 `Sensors by connection`，那是 4.4 的标题；14.1 的 dumpsys 用 `Active sensors:` + `Previous Registrations:` | 改抓 `Active sensors:`，关键是那句 `0 active connections` |
+| `caps:` 空白 | `getevent -i <path>` 和 `-lt` 一样打 usage，这台机器的 toybox 不认设备路径 | 改读 `/proc/bus/input/devices` 里 proximity 的 `B: ABS=` 能力位（0x10 = ABS_DISTANCE） |
+| `prox: newest=SFH7776 Light Sensor (handle=...)` | `grab_ring` 的最后一个非空行撞上了下一段的标题，`tail -n 1` 取到的是标题不是样本 | 先 `grep -E '[0-9]+ \(ts='` 只留样本行再取最后一条 |
+
+第二条同时也是 `kc_input.log` 只装着 usage 的真正原因——不是 `-lt` 的组合问题，是**任何显式设备路径**都会让它打 usage。上一轮把它归因于"空变量被当设备名"，判断错了。
+
+修完之后这三行才第一次真的有内容。`-- prox ring --` 本身是好的，fix83 的 7 条读数（4,4,3,2,1,0,4）就是遮挡过程最直接的证据。
+
 ### 48.4 build.sh 里一个静默的路径 bug
 
 `OUT=${OUT:-../lib}` 在第 49 行给两个 HAL 库用，第 88 行又写了一次 `OUT=${OUT:-../bin}` 给 kcprox。`${X:-default}` 在 X 已赋值时取 X，所以 kcprox 一直被构建到 **`../lib`**，而 `KC_BINS` 装的是 `../bin`。

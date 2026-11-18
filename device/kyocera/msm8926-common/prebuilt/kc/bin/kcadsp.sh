@@ -372,8 +372,12 @@ dispblock() {
     _ss=/data/local/tmp/.kcss.$$
     timeout 8 dumpsys sensorservice >"$_ss" 2>/dev/null
     echo "kcprox:  svc=$(getprop init.svc.kcprox 2>/dev/null) last=[$(tail -n 1 /data/local/tmp/kcprox.log 2>/dev/null | cut -c1-130)]"
-    echo "prox:    newest=$(grab_ring "$_ss" 'Proximity Sensor: last' 12 | tail -n 1 | sed 's/, wall=[^)]*//; s/^[[:space:]]*//; s/[[:space:]]*$//' | tr -s ' \t' ' ')"
-    echo "lux:     newest=$(grab_ring "$_ss" 'Light Sensor: last' 8 | tail -n 1 | sed 's/, wall=[^)]*//; s/^[[:space:]]*//; s/[[:space:]]*$//' | tr -s ' \t' ' ')"
+    # Sample lines only: the ring block runs into the next section, so the last
+    # line of grab_ring is not necessarily a sample.  fix83's report printed
+    # "prox: newest=SFH7776 Light Sensor (handle=..., connections=1)" -- a
+    # heading, not a distance -- because tail -n 1 landed on the boundary.
+    echo "prox:    newest=$(grab_ring "$_ss" 'Proximity Sensor: last' 12 | grep -E '[0-9]+ \(ts=' | tail -n 1 | sed 's/, wall=[^)]*//; s/^[[:space:]]*//; s/[[:space:]]*$//' | tr -s ' \t' ' ')"
+    echo "lux:     newest=$(grab_ring "$_ss" 'Light Sensor: last' 8 | grep -E '[0-9]+ \(ts=' | tail -n 1 | sed 's/, wall=[^)]*//; s/^[[:space:]]*//; s/[[:space:]]*$//' | tr -s ' \t' ' ')"
     rm -f "$_ss"
 }
 
@@ -417,12 +421,13 @@ dispblock() {
     _ss=/data/local/tmp/.kcss2.$$
     timeout 15 dumpsys sensorservice >"$_ss" 2>/dev/null
     grab_after "$_ss" "Sensor List" 12 | cut -c1-170
-    # Who holds the proximity sensor right now.  If PMS armed its check, the
-    # system_server connection lists the PS handle as active; if it did not, the
-    # PS only shows up while a test app holds it.  This is the one place where
-    # "armed but idle" and "never armed" look different.
+    # Who holds the proximity sensor right now.  "Sensors by connection" is the
+    # 4.4-era heading; 14.1's dumpsys has "Active sensors:" and "Previous
+    # Registrations:" instead, which is why fix83's holders block came out
+    # empty.  What matters is the connection count: 0 active connections while
+    # proximity_on_wake=1 is the framework agreeing it never asked for it.
     echo "-- holders --"
-    grab_after "$_ss" "Sensors by connection" 16
+    grab_after "$_ss" "Active sensors:" 8
     # The full proximity ring, not one line of it.  fix82 printed only the
     # oldest entry of "last N events" (4.00) and that single number cannot
     # distinguish "far, as it should be" from "stuck".  The sequence 4..4,0..0,4
@@ -434,11 +439,10 @@ dispblock() {
     grep -m1 'Light Sensor: last' "$_ss" 2>/dev/null | sed 's/^[[:space:]]*//'
     grab_ring "$_ss" "Light Sensor: last" 8
     rm -f "$_ss"
-    # The evdev side of the same numbers: min/max of ABS_DISTANCE as the kernel
-    # publishes them.  The HAL takes maxRange from here, and the framework's
-    # near test is "distance < 5 AND distance < maxRange", so this bound decides
-    # whether value 4 (nothing in front) counts as far.
-    echo "caps:    $(getevent -i "$EVP" 2>/dev/null | grep -i 'ABS_DISTANCE' | tr -s ' \t' ' ')"
+    # What the node advertises, from /proc rather than `getevent -i`: this
+    # toybox build prints its usage for -i (and for -lt) when handed a device
+    # path, which is why fix83's caps line was blank.  Bit 0x10 is ABS_DISTANCE.
+    echo "caps:    $(grep -A6 'Name="proximity"' /proc/bus/input/devices 2>/dev/null | grep -m1 'B: ABS=' | tr -s ' ' ' ')"
     echo "nodes:   key=$EVK prox=$EVP"
     echo "psdrv:   $(dmesg 2>/dev/null | grep 'ABS_DISTANCE' | tail -n 6 | sed 's/^.*\] //' | tr '\n' '|')"
     echo "kcsensor: $(dmesg 2>/dev/null | grep -m1 'kcsensor:')"
