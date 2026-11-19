@@ -6423,3 +6423,178 @@ sepolicy 麻烦一档——AOSP 的 `sefcontext_compile` 只负责文本到二�
 
 看三件事：`grep -c flashlight /vendor/lib/hw/lights.default.so` 至少为 1；
 logcat 里 `Could not load camera HAL module` 消失；`dumpsys location` 的 gps 段有内容。
+
+## 50. fix85：三处地址、一个 HAL 壳
+
+### 50.1 captive portal 探测地址
+
+WiFi 图标上的 × 不是联不上网，是 `NetworkMonitor` 的连通性探测没通过。7.1 的
+探测只有 HTTP 一条：连上之后请求 `http://connectivitycheck.gstatic.com/generate_204`，
+期望 204，其余一律判成"有网无互联网"。这个地址在 `services.jar` 的 `classes.dex` 里
+是**硬编码常量**，`framework-res.apk` 里没有，所以改不了资源，只能改 dex。
+
+原位替换（新串更短，用 0 填充尾部），然后必须重算 dex 头的两个校验字段，否则 ART
+在 `DexFile::Verify` 里直接拒绝：
+
+```
+signature  = sha1(dex[0x20:])
+checksum   = adler32(dex[0x0c:])
+```
+
+改成 `http://cp.cloudflare.com/`（25 字节，原 49）。7.1 没有 HTTPS 探测分支，所以
+"同时支持 HTTPS"在 7.1 上无对象——Cloudflare 的 HTTP 端点回 204，够了。
+
+`services.jar` 没有 `boot-services.oat`（`/framework/arm` 只有 boot-framework 等），
+所以改 dex 立刻生效；代价是 `/data/dalvik-cache` 里的旧 oat 校验不匹配，首次开机要
+重新编译 services，开机慢 1–2 分钟，属于正常现象。
+
+### 50.2 系统 NTP
+
+`config_ntpServer` = `2.android.pool.ntp.org`，在 `framework-res.apk` 的
+`resources.arsc` 里，只有一个实例。`NtpTrustedTime` 直接读这个资源，7.1 没有任何
+settings 覆盖路径，所以只能改资源表。
+
+替换是**等长**的（22 → 12 字节，余下填 0），资源池的偏移表不动，APK 的文件大小不变。
+改完必须更新 zip 里 `resources.arsc` 的 CRC32（local header 和 central directory 两处），
+否则 `ZipFile` 解压时报 CRC 错。META-INF 原样保留：系统 APK 走
+`JarFile(file, false)`（verify=false），只取证书不校验内容，签名校验比的是证书指纹，
+证书没变就不会触发 `PackageManagerService` 的签名变更保护。
+
+### 50.3 相机 HAL 壳，为了磁贴
+
+7.1 的手电筒磁贴只有一条路：
+
+```
+SystemUI -> CameraManager.setTorchMode -> CameraService::setTorchMode
+         -> camera_module_t.set_torch_mode()
+```
+
+而 `CameraService` 在 `set_torch_mode == NULL` 时直接返回 `INVALID_OPERATION`。
+4.4 的 `camera_module_t` 没有这个字段（dump `HMI` 可见表到 `open_legacy` 就结束，
++136..+148 全 0），所以上面任何一层都救不了。
+
+做法是把 blob 改名 `camera.msm8226.real.so`，换上一个同 SONAME 的壳：
+
+- 导出符号名是 **`HMI`**，不是 `HAL_MODULE_INFO_SYM`——`hardware.h` 里
+  `HAL_MODULE_INFO_SYM_AS_STR` 的字面值就是 `"HMI"`，这也是 4.4 blob 里那个
+  176 字节符号的名字；
+- 构造函数 `dlopen` 真库，只拷前 136 字节（`hw_module_t` + `get_number_of_cameras`
+  + `get_camera_info`，这是两代布局唯一一致的部分），其余填 0 并挂上自己的
+  `set_torch_mode`；
+- `set_torch_mode` 写 `torch-light`，失败退 `led:flash_torch`；
+- 加载失败时 `HMI` 保持 tag=0，不是 `HARDWARE_MODULE_TAG`，CameraService 拒绝
+  这个模块——相机 app 报"无法连接"，但 mediaserver 不会崩。这和装壳之前的表现
+  一致，不是新增故障面。
+
+回滚是改一个名字：`mv camera.msm8226.real.so camera.msm8226.so`。
+
+### 50.4 gps.conf 与 /data/gps
+
+四行改动，各自对应一个观测：
+
+| 行 | 原值 | 新值 | 理由 |
+|---|---|---|---|
+| `XTRA_SERVER_1..3` | 注释 | gpsonextra 三个源 | 冷启动 12.5 分钟的 almanac 可以下载替代 |
+| `NTP_SERVER` | `time.gpsonextra.net` | `pool.ntp.org` | 与系统时间同源，便于指向内网服务器 |
+| `INTERMEDIATE_POS` | 0 | 1 | 让引擎在收敛过程中先报粗略位置 |
+| `ACCURACY_THRES` | 注释 | 0 | 不设阈值，任何位置都放行 |
+
+另外 init 里加 `mkdir /data/gps 0770 system system`：XTRA 客户端要把下载结果写到
+这里，目录不存在时写入静默失败，于是每次都是冷启动。这解释了为什么 `/data/gps`
+在 fix84 上根本不存在。
+
+### 50.5 fix85 交付
+
+只刷 system，boot 保持 fix72 的 #25 内核。七个文件：
+
+| 路径 | 变化 |
+|---|---|
+| `/framework/services.jar` | 探测地址 -> cp.cloudflare.com |
+| `/framework/framework-res.apk` | `config_ntpServer` -> pool.ntp.org |
+| `/vendor/lib/hw/camera.msm8226.so` | 7.1 布局的壳，补 set_torch_mode |
+| `/vendor/lib/hw/camera.msm8226.real.so` | 原 blob，改名（新增文件） |
+| `/vendor/lib/hw/lights.default.so` | 手电筒双节点兜底 |
+| `/etc/init/kyl23-extra.rc` | torch 权限、`/data/gps` |
+| `/etc/gps.conf` | XTRA、NTP、INTERMEDIATE_POS |
+
+## 51. 手电筒：22 秒的相机打开，以及一次反汇编误判
+
+### 51.1 磁贴走的不是 lights HAL
+
+7.1 的快捷磁贴只有一条路：`CameraManager.setTorchMode` →
+`CameraService::setTorchMode` → `CameraFlashlight::setTorchMode`。它跟
+`lights.default.so` 没有任何关系，`LIGHT_ID_*` 那一族里根本没有手电筒。
+所以给 lights HAL 加 `flashlight` 分支解决不了磁贴，只对走 `ILightsManager`
+的第三方 app 有意义。
+
+### 51.2 版本门槛的真实形状
+
+`CameraFlashlight::createFlashlightControl()`（cm-14.1）是三分支，不是两分支：
+
+| 条件 | 控制器 | 后果 |
+|---|---|---|
+| `module_api >= 2.4` | `ModuleFlashControl` | 调 `camera_module_t + 148` 的 `set_torch_mode` |
+| `deviceVersion >= 3.0` | `CameraDeviceClientFlashControl` | 走 Camera3 |
+| 其余 | `CameraHardwareInterfaceFlashControl` | 打开相机、读参数、`flash-mode=torch` |
+
+我们的 blob 是 `module_api 1.0 / hal_api 1.0`，`deviceVersion` 取默认值
+`1.0`，所以落进第三行——**有兜底，不是失败**。
+
+上一轮我只看反汇编，把 `0x5bc78` 当成"返回 NULL 的失败出口"，据此断言"磁贴
+必然失败、必须套壳"。实际上那个分支是：
+
+```
+5bc78:  movs r0, #76          ; sizeof(CameraHardwareInterfaceFlashControl)
+5bc7a:  blx  operator new
+5bc84:  blx  CameraHardwareInterfaceFlashControl::ctor
+```
+
+教训：`bcc` 的目标是成功路径还是失败路径，不能靠"它长得像出口"来判断，要去
+那个地址读两条指令。这一次的代价是一个 8.6 MB 的无用 so、一次差点刷进去的
+固件，以及用户一晚上的时间。
+
+### 51.3 但兜底路径在这颗 blob 上不能用
+
+设备实测（fix84，logcat，点磁贴三次）：
+
+```
+23:54:40.742  CameraFlashlight: Opening camera 0
+23:55:03.032  CameraFlashlight: Destroying camera 0     <- 22.3 s
+23:55:07.039  onTorchStatusChangedLocked: cameraId=0, newStatus=1  (AVAILABLE_OFF)
+23:55:07.043  onTorchStatusChangedLocked: cameraId=0, newStatus=0  (NOT_AVAILABLE)
+```
+
+`Opening`/`Destroying` 是 `CameraHardwareInterface` 构造与析构里的日志，中间
+22 秒说明这条路在 4.4 blob 上**打开相机就要 22 秒，而且最后仍然失败**。失败
+之后状态回退成 `NOT_AVAILABLE`，磁贴图标闪一下又弹回去。
+
+更麻烦的是那 22 秒里相机是开着的，此时任何 app 去 `open` 都拿不到设备，屏幕
+上就是黑的。用户看到的"相机打不开了、一直黑屏"和"磁贴点了不亮"是同一件事的
+两个症状。
+
+### 51.4 改法：绕开相机，直接写节点
+
+`0003-camera-drive-the-torch-node-directly.patch` 在 `CameraFlashlight.cpp` 里
+加 `KcSysfsFlashControl`，条件放在第三个分支**之前**：
+
+```cpp
+} else if (mCameraModule->getModuleApiVersion() < CAMERA_MODULE_API_VERSION_2_0) {
+    mFlashControl = new KcSysfsFlashControl();
+}
+```
+
+只认 api < 2.0，所以 2.0~2.3 的设备仍走原来的 HAL1 路径，不被牵连。
+`hasFlashUnit` 只对 `cameraId == "0"` 返回 true，避免前摄也冒出一个死的手电筒
+图标。`setTorchMode` 写 255/0，跟 stock 一致（这个节点吃 0..255，写 1 只有微弱
+亮度）。
+
+### 51.5 权限要给两个 uid
+
+节点是 `root:root 0644`，而写它的有两个进程：
+
+- `lights.default.so` 跑在 system_server 里，uid 1000；
+- `CameraFlashlight` 跑在 mediaserver 里，uid 1013，组 media。
+
+一个 owning group 盖不住两个 uid，所以 init 里用 `chmod 0666`，两个节点都在
+`on boot` 和 `sys.boot_completed=1` 各设一次（`led:flash_torch` 由相机 blob
+稍后注册）。

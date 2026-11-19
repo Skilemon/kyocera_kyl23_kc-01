@@ -1,0 +1,91 @@
+--- a/frameworks/av/services/camera/libcameraservice/CameraFlashlight.cpp
++++ b/frameworks/av/services/camera/libcameraservice/CameraFlashlight.cpp
+@@ -18,6 +18,10 @@
+ #define ATRACE_TAG ATRACE_TAG_CAMERA
+ // #define LOG_NDEBUG 0
+ 
++#include <fcntl.h>
++#include <string.h>
++#include <unistd.h>
++
+ #include <utils/Log.h>
+ #include <utils/Trace.h>
+ #include <cutils/properties.h>
+@@ -33,6 +37,66 @@
+ namespace android {
+ 
+ /////////////////////////////////////////////////////////////////////
++// Kyocera KC-01 (msm8226): the camera HAL is a 4.4 blob reporting
++// CAMERA_MODULE_API_VERSION_1_0 / CAMERA_DEVICE_API_VERSION_1_0.
++//
++// For a module below 2.4 and a device below 3.0, upstream falls back to
++// CameraHardwareInterfaceFlashControl, which opens the camera, reads every
++// supported parameter and only then sets flash-mode=torch.  Measuring that on
++// this blob: "Opening camera 0" at T+0.07s, "Destroying camera 0" at T+22.3s,
++// and the torch status still ends up AVAILABLE_OFF.  Nothing lights up, and
++// for those 22 seconds the camera is held open, so an app that tries to
++// preview in the meantime just shows a black screen.
++//
++// The torch in this device is a plain LED behind /sys/class/leds, the same
++// node stock 4.4 writes, so drive it directly instead of going through the
++// camera pipeline.  The kernel picks whichever of the two names it has.
++/////////////////////////////////////////////////////////////////////
++namespace {
++
++class KcSysfsFlashControl : public FlashControlBase {
++public:
++    KcSysfsFlashControl() {}
++
++    virtual status_t hasFlashUnit(const String8& cameraId, bool *hasFlash) {
++        // Only the rear camera has the LED.  Reporting one for the front
++        // sensor would put a second, dead torch in the QS panel.
++        if (hasFlash != NULL) {
++            *hasFlash = (cameraId == String8("0"));
++        }
++        return OK;
++    }
++
++    virtual status_t setTorchMode(const String8& cameraId, bool enabled) {
++        (void)cameraId;
++        static const char *kPaths[] = {
++            "/sys/class/leds/torch-light/brightness",
++            "/sys/class/leds/led:flash_torch/brightness",
++        };
++        // The node takes 0..255, not 0..1: stock writes 255 and that is the
++        // current that was verified to light the LED.
++        const char *value = enabled ? "255" : "0";
++        size_t len = strlen(value);
++
++        for (size_t i = 0; i < sizeof(kPaths) / sizeof(kPaths[0]); i++) {
++            int fd = open(kPaths[i], O_WRONLY);
++            if (fd < 0) {
++                continue;
++            }
++            ssize_t written = write(fd, value, len);
++            close(fd);
++            if (written == (ssize_t)len) {
++                return OK;
++            }
++        }
++        ALOGE("%s: no writable torch node", __FUNCTION__);
++        return INVALID_OPERATION;
++    }
++};
++
++}  // namespace
++
++/////////////////////////////////////////////////////////////////////
+ // CameraFlashlight implementation begins
+ // used by camera service to control flashflight.
+ /////////////////////////////////////////////////////////////////////
+@@ -87,6 +151,10 @@
+             }
+ 
+             mFlashControl = flashControl;
++        } else if (mCameraModule->getModuleApiVersion() <
++                CAMERA_MODULE_API_VERSION_2_0) {
++            // See the comment above KcSysfsFlashControl.
++            mFlashControl = new KcSysfsFlashControl();
+         } else {
+             mFlashControl =
+                     new CameraHardwareInterfaceFlashControl(*mCameraModule,

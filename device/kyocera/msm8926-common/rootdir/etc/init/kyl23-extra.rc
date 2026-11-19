@@ -205,8 +205,26 @@
 # constructors, nothing that can fail.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Torch.  msm_led_torch registers "torch-light" and the camera blob adds
+# "led:flash_torch" once it has claimed the LED.  The kernel creates both with
+# root:root 0644, so nothing running below them can write either one, and every
+# torch request is dropped with EACCES.  On the device, `echo 255 > .../brightness`
+# lights the LED as root and fails as shell, which is exactly this.
+#
+# 0666 rather than a group, because two different uids write here: the lights
+# HAL runs inside system_server (uid 1000), and CameraFlashlight -- which is
+# what the Quick Settings tile actually reaches -- runs inside mediaserver
+# (uid 1013, group media).  A single owning group cannot cover both.
+# A second pass at boot_completed covers the camera node, which does not exist
+# yet when this block runs.
+# ---------------------------------------------------------------------------
 on boot
     setprop wifi.interface wlan0
+    chown system system /sys/class/leds/torch-light/brightness
+    chmod 0666 /sys/class/leds/torch-light/brightness
+    chown system system /sys/class/leds/led:flash_torch/brightness
+    chmod 0666 /sys/class/leds/led:flash_torch/brightness
 
 # ---------------------------------------------------------------------------
 # Modem remote filesystem.  rfs_access serves the modem's EFS requests
@@ -587,6 +605,10 @@ on property:sys.boot_completed=1
 # still off does it fall back to `pm`, twice at most.
 on property:sys.boot_completed=1
     exec -- /system/etc/kcbt.sh post
+    chown system system /sys/class/leds/torch-light/brightness
+    chmod 0666 /sys/class/leds/torch-light/brightness
+    chown system system /sys/class/leds/led:flash_torch/brightness
+    chmod 0666 /sys/class/leds/led:flash_torch/brightness
 
 # ---------------------------------------------------------------------------
 # Bluetooth core bring-up: the address the controller does not have.
@@ -720,6 +742,14 @@ on post-fs-data
     # oops); with it every prima teardown turns into a reboot loop.  Let the
     # oops kill the offending thread instead, and keep the log we need.
     write /proc/sys/kernel/panic_on_oops 0
+
+    # XTRA cache.  loc_eng's XTRA client stores the downloaded almanac here;
+    # with no directory the write fails silently and every start pays the full
+    # 12.5 minutes of a cold almanac download from the sky.  That is the whole
+    # difference between "satellites visible for two minutes, no fix" and a fix
+    # in under a minute.  Owned by system because the HAL runs inside
+    # system_server.
+    mkdir /data/gps 0770 system system
 
     # PRODUCT_COPY_FILES in the device makefile installs everything 0644, so
     # the helpers arrive without the execute bit on a ROM built from source

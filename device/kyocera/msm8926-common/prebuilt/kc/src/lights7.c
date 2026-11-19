@@ -234,12 +234,23 @@ static int light_none(struct light_device_t *dev, const struct light_state_t *st
 static int light_flashlight(struct light_device_t *dev, const struct light_state_t *state)
 {
     int v;
+    int rc;
 
     (void)dev;
     if (!state)
         return -1;
     v = state_is_on(state) ? max_component(state->color) : 0;
-    return write_int("/sys/class/leds/torch-light/brightness", v);
+
+    /* Two nodes reach the same die: torch-light, which msm_led_torch
+     * registers, and led:flash_torch, the trigger the camera blob installs
+     * once it has claimed the LED.  Both light when written by hand, and
+     * which of them exists depends on whether the camera HAL got that far,
+     * so fall back rather than assume.  Never write both -- they are two
+     * views of one device and a double write is a double current step. */
+    rc = write_int("/sys/class/leds/torch-light/brightness", v);
+    if (rc != 0)
+        rc = write_int("/sys/class/leds/led:flash_torch/brightness", v);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
