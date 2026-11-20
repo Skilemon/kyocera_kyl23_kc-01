@@ -6598,3 +6598,82 @@ SystemUI -> CameraManager.setTorchMode -> CameraService::setTorchMode
 一个 owning group 盖不住两个 uid，所以 init 里用 `chmod 0666`，两个节点都在
 `on boot` 和 `sys.boot_completed=1` 各设一次（`led:flash_torch` 由相机 blob
 稍后注册）。
+
+## 52. fix86：`findFlashUnits()` 是被 `-EBUSY` 打断的，不是缓存"忘了写"
+
+上一轮把"每次点磁贴都要重新探测两台相机"归因于缓存没生效，说得含糊。拿到全量
+日志后可以精确到行：缓存不是写失败，是**根本没走到写的那一步**。
+
+### 52.1 `PID -1` 是手电筒探测的签名
+
+```
+15:00:29.159  connect call (PID -1 "com.android.camera2", camera ID 1)
+```
+
+`CameraFlashlight` 调 `connectLegacy` 时传的 pid 就是 -1；包名是 CameraService
+用 `getRecentCallingPackage()` 兜底取的最近一次 binder 调用者，所以它列出
+`com.android.camera2`，但发起者不是那个进程。整份日志里没有任何一条真实 pid 的
+connect，相机 app 一次都没连上过。
+
+### 52.2 22 秒是三段固定开销
+
+| 探测 | Opening | OPEN_CAMERA | STOP_PREVIEW | Destroying | 合计 |
+|---|---|---|---|---|---|
+| camera 1 | 29.318 | +4.01 | +10.39 | +8.01 | 22.40 s |
+| camera 0 | 55.857 | +4.00 | +10.35 | +8.00 | 22.35 s |
+| camera 0 | 28.629 | +4.01 | +10.42 | +8.03 | 22.45 s |
+
+三段分别是 sensor 上电 4 秒、`QCameraParameters::init` 申请 1 MB ION 参数缓冲
+10.4 秒、收尾释放 8 秒。全程 `PROFILE_START_PREVIEW` 一次都没有——HAL1 兜底路径
+只读参数、不开流，却仍然把设备占满 22 秒。
+
+### 52.3 真正的原因
+
+```cpp
+res = mFlashControl->hasFlashUnit(id, &hasFlash);
+if (res == -EUSERS || res == -EBUSY) {
+    return res;                        // 提前返回
+}
+...
+mFlashlightMapInitialized = true;      // 永远执行不到
+```
+
+`CameraHardwareInterfaceFlashControl::hasFlashUnit()` 在相机被占用时返回
+`-EBUSY`。一旦命中，`findFlashUnits()` 直接返回，`mFlashlightMapInitialized`
+留在 false。之后 `setTorchMode()` 第一行就判断这个标志并 `return NO_INIT`，
+CameraService 收到 `NO_INIT` 就再调一次 `findFlashUnits()`——死循环。点几次，
+卡几轮 22 秒，一次都不会亮。
+
+`KcSysfsFlashControl::hasFlashUnit()` 是纯字符串比较，返回 `OK`，所以循环一定
+跑完、标志一定置 true。这一点比"少开一次相机"更重要：它把这个死循环从根上拆掉。
+
+### 52.4 fix86 的六处改动
+
+基于 fix84（不是 fix85），相机壳 `camera.msm8226.so` / `.real.so` 全部不带。
+
+| 路径 | 改动 | md5 |
+|---|---|---|
+| `/lib/libcameraservice.so` | `KcSysfsFlashControl` | `32df088584018373bbd8f82bf19ff35e` |
+| `/framework/services.jar` | 探测地址 → `cp.cloudflare.com` | `93e6451c1069edc72276191c820dc607` |
+| `/framework/framework-res.apk` | `config_ntpServer` → `pool.ntp.org` | `4d335395e3b5da9f14ca65ed2466dcd2` |
+| `/vendor/lib/hw/lights.default.so` | 双节点回退，不双写 | `c1e1934f50a423ebcf445ee0ed3dc002` |
+| `/etc/init/kyl23-extra.rc` | torch 0666、`mkdir /data/gps` | `6b435dac1c2de634dbddb27bce69b62a` |
+| `/etc/gps.conf` | XTRA、NTP、`INTERMEDIATE_POS` | `a75e85078c071af5c5b0f776a803057c` |
+
+### 52.5 从 CI 产物里拿 so
+
+这个树的 ROM zip 里 `system.new.dat` 是**未压缩**的（没有 `.br`），transfer
+list 是版本 4，操作数是 RangeSet 的**端点对**而不是块号列表：
+
+```
+new 2,0,1024              一个区间，[0, 1024)
+new 4,2048,2766,2767,3073 两个区间，[2048,2766) 和 [2767,3073)
+```
+
+按块号逐个解析不会报错，只会把 97% 的文件系统留成空洞，然后 debugfs 报
+`A block group is missing an inode table`。校验办法是数一下 `new` 覆盖的块数，
+必须等于 `system.new.dat` 的字节数除以 4096：这里是 184287，一个不差。
+
+`system.transfer.list` 头部的 `total_blocks`（195688）不是文件系统大小，
+`new` + `zero` 的区间总数 359418 才是；镜像自然长到 1,472,176,128 字节。
+
